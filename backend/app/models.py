@@ -7,6 +7,7 @@ class AuditRun(Base):
     __tablename__ = "audit_runs"
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String(255), nullable=False)
+    source_files = Column(Text, nullable=True)
     row_count = Column(Integer, default=0)
     finding_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -17,6 +18,7 @@ class Finding(Base):
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(Integer, ForeignKey("audit_runs.id"), nullable=False)
     transaction_id = Column(String(100), nullable=True)
+    source_file = Column(String(255), nullable=True)
     finding_type = Column(String(80), nullable=False)
     risk_level = Column(String(20), nullable=False)
     amount = Column(Float, nullable=True)
