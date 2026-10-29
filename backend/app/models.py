@@ -1,7 +1,8 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey, JSON
 from sqlalchemy.orm import relationship
 from .database import Base
+
 
 class AuditRun(Base):
     __tablename__ = "audit_runs"
@@ -12,6 +13,8 @@ class AuditRun(Base):
     finding_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     findings = relationship("Finding", back_populates="run", cascade="all, delete-orphan")
+    transactions = relationship("TransactionRecord", back_populates="audit_run", cascade="all, delete-orphan")
+
 
 class Finding(Base):
     __tablename__ = "findings"
@@ -80,3 +83,56 @@ class ReconciliationResult(Base):
     note = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     run = relationship("ReconciliationRun", back_populates="results")
+
+
+class TransactionRecord(Base):
+    __tablename__ = "transaction_records"
+    id = Column(Integer, primary_key=True, index=True)
+    audit_run_id = Column(Integer, ForeignKey("audit_runs.id"), nullable=True)
+    transaction_id = Column(String(100), nullable=True)
+    date = Column(String(10), nullable=True)
+    amount = Column(Float, nullable=True)
+    signed_amount = Column(Float, nullable=True)
+    direction = Column(String(20), nullable=True)
+    type = Column(String(50), nullable=True)
+    vendor = Column(String(255), nullable=True)
+    description = Column(Text, nullable=True)
+    category = Column(String(80), nullable=True)
+    account = Column(String(100), nullable=True)
+    upi_ref = Column(String(255), nullable=True)
+    reference = Column(String(255), nullable=True)
+    source_file = Column(String(255), nullable=True)
+    source_row = Column(Integer, nullable=True)
+    duplicate_key = Column(String(512), nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    audit_run = relationship("AuditRun", back_populates="transactions")
+
+
+class InvestigationRun(Base):
+    __tablename__ = "investigation_runs"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=True)
+    task_type = Column(String(80), nullable=True)
+    status = Column(String(40), nullable=True)
+    input_state = Column(JSON, nullable=True)
+    output_state = Column(JSON, nullable=True)
+    timeline = Column(JSON, nullable=True)
+    errors = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class InvestigationCase(Base):
+    __tablename__ = "investigation_cases"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    severity = Column(String(20), nullable=True)
+    status = Column(String(40), nullable=True)
+    audit_run_id = Column(Integer, ForeignKey("audit_runs.id"), nullable=True)
+    transaction_id = Column(String(100), nullable=True)
+    source_file = Column(String(255), nullable=True)
+    source_row = Column(Integer, nullable=True)
+    reviewer_notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))

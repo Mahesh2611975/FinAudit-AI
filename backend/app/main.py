@@ -12,8 +12,10 @@ from .audit_engine import detect_findings
 from .csv_normalizer import normalize_files, safe_filename
 from .database import Base, engine, get_db
 from .llm import explain_finding
-from .models import AuditRun, Finding, ReconciliationResult, ReconciliationRun
+from .models import AuditRun, Finding, ReconciliationResult, ReconciliationRun, TransactionRecord, InvestigationRun, InvestigationCase
 from .reconciliation import ReconciliationError, reconcile_files
+from .category import categorize_transaction
+from .finance_utils import money_to_decimal, round_currency
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_FILES = 20
@@ -122,6 +124,36 @@ async def create_audit(
     db.flush()
     for item in findings:
         db.add(Finding(run_id=run.id, **item))
+    # Persist normalized transactions for analytics
+    for _, row in normalized.frame.iterrows():
+        try:
+            cat, _ = categorize_transaction(
+                description=str(row.get("description") or ""),
+                vendor=str(row.get("vendor") or ""),
+                upi_ref=str(row.get("upi_ref") or ""),
+            )
+        except Exception:
+            cat = "Uncategorized"
+        db.add(
+            TransactionRecord(
+                audit_run_id=run.id,
+                transaction_id=str(row.get("transaction_id") or "") or None,
+                date=str(row.get("date") or "") or None,
+                amount=float(row.get("amount")) if row.get("amount") is not None else None,
+                signed_amount=float(row.get("signed_amount")) if row.get("signed_amount") is not None else None,
+                direction=str(row.get("direction") or "") or None,
+                type=str(row.get("type") or "") or None,
+                vendor=str(row.get("vendor") or "") or None,
+                description=str(row.get("description") or "") or None,
+                category=cat,
+                account=str(row.get("account") or "") or None,
+                upi_ref=str(row.get("upi_ref") or "") or None,
+                reference=str(row.get("upi_ref") or "") or None,
+                source_file=str(row.get("source_file") or "") or None,
+                source_row=int(row.get("source_row")) if row.get("source_row") is not None else None,
+                duplicate_key=str(row.get("duplicate_key") or "") or None,
+            )
+        )
     db.commit()
     db.refresh(run)
     return {
@@ -441,3 +473,263 @@ def export_reconciliation(reconciliation_id: int, db: Session = Depends(get_db))
             )
         },
     )
+
+
+# Analytics endpoints
+@app.get("/api/analytics/monthly/summary")
+def analytics_monthly_summary(year: int, month: int, db: Session = Depends(get_db)):
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=400, detail="month must be between 1 and 12")
+    prefix = f"{year:04d}-{month:02d}"
+    txns = db.query(TransactionRecord).filter(TransactionRecord.date.like(f"{prefix}%")).all()
+    from decimal import Decimal
+
+    total_spend = Decimal("0")
+    total_received = Decimal("0")
+    count = 0
+    outgoing = []
+    for t in txns:
+        count += 1
+        amt = money_to_decimal(t.amount)
+        if t.direction == "debit" or (t.signed_amount is not None and float(t.signed_amount) < 0) or amt > 0 and t.direction != "credit":
+            # treat as spend if debit or negative signed; be careful not to double count
+            pass
+        # normalize
+        if t.direction == "credit" or (t.signed_amount is not None and float(t.signed_amount) > 0 and amt >= 0 and t.direction == "credit"):
+            total_received += abs(amt)
+        elif t.direction == "debit":
+            total_spend += abs(amt)
+            outgoing.append(abs(float(amt)))
+        else:
+            if amt < 0:
+                total_spend += abs(amt)
+                outgoing.append(abs(float(amt)))
+            elif amt > 0:
+                total_received += amt
+    net = total_received - total_spend
+    avg_out = sum(outgoing) / len(outgoing) if outgoing else 0
+    largest = max(outgoing) if outgoing else 0
+    return {
+        "year": year,
+        "month": month,
+        "total_spend": float(round_currency(total_spend)),
+        "total_received": float(round_currency(total_received)),
+        "net_cash_flow": float(round_currency(net)),
+        "transaction_count": count,
+        "average_outgoing": float(round(avg_out, 2)),
+        "largest_expense": float(round(largest, 2)),
+    }
+
+
+@app.get("/api/analytics/monthly/categories")
+def analytics_monthly_categories(year: int, month: int, db: Session = Depends(get_db)):
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=400, detail="month must be between 1 and 12")
+    prefix = f"{year:04d}-{month:02d}"
+    txns = db.query(TransactionRecord).filter(TransactionRecord.date.like(f"{prefix}%")).all()
+    from decimal import Decimal
+    buckets = {}
+    for t in txns:
+        cat = t.category or "Uncategorized"
+        if cat == "Transfers":
+            continue  # do not count internal transfers as consumption by default
+        amt = money_to_decimal(t.amount)
+        if t.direction == "debit" or (t.signed_amount is not None and float(t.signed_amount) < 0):
+            buckets[cat] = buckets.get(cat, Decimal("0")) + abs(amt)
+        elif t.direction == "credit":
+            continue
+        else:
+            if amt < 0:
+                buckets[cat] = buckets.get(cat, Decimal("0")) + abs(amt)
+            else:
+                continue
+    result = [{"category": k, "amount": float(round_currency(v))} for k, v in buckets.items()]
+    result.sort(key=lambda x: x["amount"], reverse=True)
+    return result
+
+
+@app.get("/api/analytics/transactions")
+def analytics_transactions(year: int | None = None, month: int | None = None, category: str | None = None, q: str | None = None, limit: int = 200, db: Session = Depends(get_db)):
+    query = db.query(TransactionRecord)
+    if year and month:
+        if month < 1 or month > 12:
+            raise HTTPException(status_code=400, detail="month must be between 1 and 12")
+        query = query.filter(TransactionRecord.date.like(f"{year:04d}-{month:02d}%"))
+    if category:
+        query = query.filter(TransactionRecord.category == category)
+    if q:
+        like = f"%{q.lower()}%"
+        query = query.filter((TransactionRecord.description.ilike(like)) | (TransactionRecord.vendor.ilike(like)) | (TransactionRecord.transaction_id.ilike(like)))
+    txns = query.order_by(TransactionRecord.id.desc()).limit(min(limit, 1000)).all()
+    return [
+        {
+            "id": t.id,
+            "transaction_id": t.transaction_id,
+            "date": t.date,
+            "amount": t.amount,
+            "signed_amount": t.signed_amount,
+            "direction": t.direction,
+            "vendor": t.vendor,
+            "description": t.description,
+            "category": t.category,
+            "account": t.account,
+            "upi_ref": t.upi_ref,
+            "source_file": t.source_file,
+            "source_row": t.source_row,
+            "audit_run_id": t.audit_run_id,
+        }
+        for t in txns
+    ]
+
+
+@app.get("/api/analytics/monthly/comparison")
+def analytics_monthly_comparison(year: int, month: int, db: Session = Depends(get_db)):
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=400, detail="month must be between 1 and 12")
+    from decimal import Decimal
+
+    def month_stats(y, m):
+        prefix = f"{y:04d}-{m:02d}"
+        txns = db.query(TransactionRecord).filter(TransactionRecord.date.like(f"{prefix}%")).all()
+        spend = Decimal("0")
+        recv = Decimal("0")
+        for t in txns:
+            amt = money_to_decimal(t.amount)
+            if t.direction == "debit":
+                spend += abs(amt)
+            elif t.direction == "credit":
+                recv += abs(amt)
+            else:
+                if amt < 0:
+                    spend += abs(amt)
+                elif amt > 0:
+                    recv += amt
+        return {"spend": float(round_currency(spend)), "received": float(round_currency(recv)), "net": float(round_currency(recv - spend))}
+
+    cur = month_stats(year, month)
+    if month == 1:
+        prev = month_stats(year - 1, 12)
+    else:
+        prev = month_stats(year, month - 1)
+    return {"current": cur, "previous": prev}
+
+
+@app.get("/api/analytics/export.csv")
+def analytics_export_csv(year: int | None = None, month: int | None = None, db: Session = Depends(get_db)):
+    query = db.query(TransactionRecord)
+    if year and month:
+        if month < 1 or month > 12:
+            raise HTTPException(status_code=400, detail="month must be between 1 and 12")
+        query = query.filter(TransactionRecord.date.like(f"{year:04d}-{month:02d}%"))
+    txns = query.order_by(TransactionRecord.id.asc()).all()
+    output = StringIO()
+    cols = ["transaction_id", "date", "amount", "direction", "vendor", "description", "category", "account", "source_file", "source_row"]
+    rows = []
+    for t in txns:
+        rows.append({
+            "transaction_id": t.transaction_id,
+            "date": t.date,
+            "amount": t.amount,
+            "direction": t.direction,
+            "vendor": t.vendor,
+            "description": t.description,
+            "category": t.category,
+            "account": t.account,
+            "source_file": t.source_file,
+            "source_row": t.source_row,
+        })
+    pd.DataFrame(rows, columns=cols).to_csv(output, index=False)
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=finaudit_analytics.csv"})
+
+
+# Multi-agent endpoints
+from .agents.orchestrator import MultiAgentOrchestrator
+
+_orch = MultiAgentOrchestrator()
+
+
+@app.post("/api/agents/run")
+def run_agents(payload: dict, db: Session = Depends(get_db)):
+    try:
+        result = _orch.run(payload, persist=True)
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/agents/runs")
+def list_agent_runs(limit: int = 50, db: Session = Depends(get_db)):
+    runs = db.query(InvestigationRun).order_by(InvestigationRun.id.desc()).limit(min(limit, 200)).all()
+    return [
+        {
+            "id": r.id,
+            "name": r.name,
+            "task_type": r.task_type,
+            "status": r.status,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            "timeline": r.timeline,
+            "errors": r.errors,
+        }
+        for r in runs
+    ]
+
+
+@app.get("/api/agents/runs/{run_id}")
+def get_agent_run(run_id: int, db: Session = Depends(get_db)):
+    r = db.query(InvestigationRun).filter(InvestigationRun.id == run_id).first()
+    if not r:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return {
+        "id": r.id,
+        "name": r.name,
+        "task_type": r.task_type,
+        "status": r.status,
+        "input_state": r.input_state,
+        "output_state": r.output_state,
+        "timeline": r.timeline,
+        "errors": r.errors,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+    }
+
+
+@app.post("/api/cases")
+def create_case(payload: dict, db: Session = Depends(get_db)):
+    case = InvestigationCase(
+        title=payload.get("title") or "Investigation Case",
+        description=payload.get("description"),
+        severity=payload.get("severity") or "medium",
+        status=payload.get("status") or "open",
+        audit_run_id=payload.get("audit_run_id"),
+        transaction_id=payload.get("transaction_id"),
+        source_file=payload.get("source_file"),
+        source_row=payload.get("source_row"),
+        reviewer_notes=payload.get("reviewer_notes"),
+    )
+    db.add(case)
+    db.commit()
+    db.refresh(case)
+    return {"id": case.id, "title": case.title, "status": case.status, "severity": case.severity}
+
+
+@app.get("/api/cases")
+def list_cases(limit: int = 50, db: Session = Depends(get_db)):
+    cases = db.query(InvestigationCase).order_by(InvestigationCase.id.desc()).limit(min(limit, 200)).all()
+    return [
+        {
+            "id": c.id,
+            "title": c.title,
+            "description": c.description,
+            "severity": c.severity,
+            "status": c.status,
+            "audit_run_id": c.audit_run_id,
+            "transaction_id": c.transaction_id,
+            "source_file": c.source_file,
+            "source_row": c.source_row,
+            "reviewer_notes": c.reviewer_notes,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+        }
+        for c in cases
+    ]
