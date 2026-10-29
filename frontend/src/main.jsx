@@ -1,1380 +1,1273 @@
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
-  ShieldCheck,
-  Upload,
-  FileSearch,
   Activity,
   AlertTriangle,
-  CircleDollarSign,
-  Download,
+  ArrowLeftRight,
+  BarChart3,
   BrainCircuit,
-  RefreshCw,
-  ArrowLeft,
-  FileText,
-  Search,
-  Sparkles,
+  CheckCircle2,
+  ChevronRight,
+  CircleDollarSign,
   Clock3,
+  Download,
+  FileSearch,
+  FileText,
+  Filter,
+  LayoutDashboard,
   Menu,
-  ArrowLeftRight
+  RefreshCw,
+  Search,
+  Settings,
+  ShieldCheck,
+  Upload,
+  Users
 } from 'lucide-react';
+import {
+  Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis
+} from 'recharts';
 import './style.css';
 
 const API = (
   import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
 ).replace(/\/$/, '');
 
-function App() {
-  const [activeView, setActiveView] = useState('overview');
-  const [files, setFiles] = useState([]);
-  const [audit, setAudit] = useState(null);
-  const [audits, setAudits] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [historyLoading, setHistoryLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [warnings, setWarnings] = useState([]);
-  const [explanations, setExplanations] = useState({});
-  const [selectedFindingId, setSelectedFindingId] = useState('');
-  const [assistantQuestion, setAssistantQuestion] = useState('');
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+const NAV_ITEMS = [
+  { id: 'overview', label: 'Overview', icon: LayoutDashboard },
+  { id: 'monitoring', label: 'Monitoring', icon: Activity },
+  { id: 'investigations', label: 'Investigations', icon: FileSearch },
+  { id: 'cases', label: 'Cases', icon: Users },
+  { id: 'reconciliation', label: 'Bank Reconciliation', icon: ArrowLeftRight },
+  { id: 'reports', label: 'Reports', icon: BarChart3 },
+  { id: 'compliance', label: 'Compliance', icon: ShieldCheck },
+  { id: 'settings', label: 'Settings', icon: Settings }
+];
 
-  const findings = audit?.findings || [];
-  const selectedFinding = findings.find(
-    (finding) => String(finding.id) === String(selectedFindingId)
+const RECON_STEPS = [
+  'Select Files',
+  'Review & Match',
+  'Resolve Exceptions',
+  'Reconcile',
+  'Complete'
+];
+
+const RISK_COLORS = {
+  high: '#ef4444',
+  medium: '#f59e0b',
+  low: '#22c55e'
+};
+
+const fmtCurrency = (amount) =>
+  new Intl.NumberFormat('en-IN', {
+    style: 'currency',
+    currency: 'INR',
+    maximumFractionDigits: 2
+  }).format(Number(amount) || 0);
+
+const fmtNumber = (value) => new Intl.NumberFormat('en-IN').format(Number(value) || 0);
+
+function formatDateTime(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
+function StatusBadge({ status }) {
+  const label = String(status || '').replaceAll('_', ' ');
+  if (status === 'matched' || status === 'reconciled') {
+    return <span className="badge badge-matched">{label}</span>;
+  }
+  if (status === 'suggested') {
+    return <span className="badge badge-suggested">{label}</span>;
+  }
+  if (status === 'unmatched' || status === 'bank_only' || status === 'ledger_only') {
+    return <span className="badge badge-unmatched">{label}</span>;
+  }
+  if (status === 'amount_mismatch' || status === 'date_mismatch') {
+    return <span className="badge badge-mismatch">{label}</span>;
+  }
+  if (status === 'ambiguous') {
+    return <span className="badge badge-info">{label}</span>;
+  }
+  if (status === 'high') {
+    return <span className="badge badge-high">{label}</span>;
+  }
+  if (status === 'medium') {
+    return <span className="badge badge-medium">{label}</span>;
+  }
+  if (status === 'low') {
+    return <span className="badge badge-low">{label}</span>;
+  }
+  return <span className="badge badge-neutral">{label}</span>;
+}
+
+function PlaceholderPage({ title, description, icon: Icon }) {
+  return (
+    <section className="panel placeholder-panel">
+      <div className="empty-icon">
+        <Icon size={28} />
+      </div>
+      <h2>{title}</h2>
+      <p>{description}</p>
+      <span className="kpi-subtle">
+        This section is not implemented in the current codebase. UI structure is
+        in place for future expansion.
+      </span>
+    </section>
   );
+}
 
-  const highRisk = findings.filter(
-    (finding) => finding.risk_level === 'high'
-  ).length;
+function OverviewPage({ audits, reconciliations, loading, onAuditCreated, onNavigateInvestigations }) {
+  const latestAudit = audits?.[0];
+  const latestRecon = reconciliations?.[0];
+  const findings = latestAudit?.findings || [];
+  const reconSummary = latestRecon?.summary || {};
+  const [uploadFile, setUploadFile] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState('');
+  const [uploadSuccess, setUploadSuccess] = useState('');
+  const fileInputRef = React.useRef(null);
 
-  const flaggedAmount = findings.reduce(
-    (total, finding) => total + (Number(finding.amount) || 0),
+  const totalTransactions = audits?.reduce(
+    (sum, item) => sum + (Number(item.row_count) || 0),
     0
   );
+  const totalFindings = audits?.reduce(
+    (sum, item) => sum + (Number(item.finding_count) || 0),
+    0
+  );
+  const unmatched = (reconSummary.bank_unmatched_total || 0) + (reconSummary.ledger_unmatched_total || 0);
+  const totalRows = reconSummary.bank_total + reconSummary.ledger_total;
+  const reconciledCount = reconSummary.matched_count || 0;
+  const reconciliationRate =
+    totalRows > 0 ? Math.round((reconciledCount / totalRows) * 100) : null;
 
-  const fmt = (amount) =>
-    new Intl.NumberFormat('en-IN', {
-      style: 'currency',
-      currency: 'INR',
-      maximumFractionDigits: 2
-    }).format(Number(amount) || 0);
-
-  async function loadAudits() {
-    setHistoryLoading(true);
-
-    try {
-      const response = await fetch(`${API}/api/audits`);
-
-      if (!response.ok) {
-        throw new Error('Could not load audit history.');
-      }
-
-      const data = await response.json();
-      setAudits(Array.isArray(data) ? data : []);
-    } catch (err) {
-      console.error('Audit history error:', err);
-    } finally {
-      setHistoryLoading(false);
+  const riskBuckets = [
+    {
+      name: 'High',
+      value: findings.filter((item) => item.risk_level === 'high').length,
+      color: RISK_COLORS.high
+    },
+    {
+      name: 'Medium',
+      value: findings.filter((item) => item.risk_level === 'medium').length,
+      color: RISK_COLORS.medium
+    },
+    {
+      name: 'Low',
+      value: findings.filter((item) => item.risk_level === 'low').length,
+      color: RISK_COLORS.low
     }
+  ];
+  const riskData = riskBuckets.filter((item) => item.value > 0);
+  if (riskData.length === 0 && findings.length === 0) {
+    riskData.push({ name: 'No data', value: 1, color: '#475569' });
   }
 
-  useEffect(() => {
-    loadAudits();
-  }, []);
+  const trendData = (audits || [])
+    .slice(0, 6)
+    .reverse()
+    .map((item, index) => ({
+      name: `Run ${index + 1}`,
+      rows: Number(item.row_count) || 0,
+      findings: Number(item.finding_count) || 0
+    }));
 
-  async function runAudit() {
-    if (files.length === 0) {
-      setError('Please select at least one CSV file first.');
+  const reconStatusData = [
+    {
+      name: 'Matched',
+      value: reconSummary.matched_count || 0,
+      color: '#22c55e'
+    },
+    {
+      name: 'Unmatched',
+      value:
+        (reconSummary.bank_only_count || 0) +
+        (reconSummary.ledger_only_count || 0),
+      color: '#f59e0b'
+    },
+    {
+      name: 'Mismatch',
+      value:
+        (reconSummary.amount_mismatch_count || 0) +
+        (reconSummary.date_mismatch_count || 0),
+      color: '#ef4444'
+    },
+    {
+      name: 'Ambiguous',
+      value: reconSummary.ambiguous_count || 0,
+      color: '#a78bfa'
+    }
+  ].filter((item) => item.value > 0);
+  if (reconStatusData.length === 0) {
+    reconStatusData.push({ name: 'No data', value: 1, color: '#475569' });
+  }
+
+  return (
+    <>
+      <div className="kpi-grid">
+        <article className="kpi-card">
+          <div className="kpi-top">
+            <div className="kpi-label">
+              <span>Transactions analyzed</span>
+              <strong>{totalTransactions ? fmtNumber(totalTransactions) : '—'}</strong>
+            </div>
+            <div className="kpi-icon blue">
+              <FileSearch size={20} />
+            </div>
+          </div>
+          <span className="kpi-subtle">
+            {audits?.length ? `${audits.length} audit run(s)` : 'No audit runs yet'}
+          </span>
+        </article>
+
+        <article className="kpi-card">
+          <div className="kpi-top">
+            <div className="kpi-label">
+              <span>Flagged findings</span>
+              <strong>{totalFindings ? fmtNumber(totalFindings) : '—'}</strong>
+            </div>
+            <div className="kpi-icon amber">
+              <AlertTriangle size={20} />
+            </div>
+          </div>
+          <span className="kpi-subtle">Rule-based exceptions requiring review</span>
+        </article>
+
+        <article className="kpi-card">
+          <div className="kpi-top">
+            <div className="kpi-label">
+              <span>Unmatched transactions</span>
+              <strong>{unmatched ? fmtCurrency(unmatched) : '—'}</strong>
+            </div>
+            <div className="kpi-icon cyan">
+              <CircleDollarSign size={20} />
+            </div>
+          </div>
+          <span className="kpi-subtle">
+            {latestRecon ? 'From latest reconciliation run' : 'No reconciliation run yet'}
+          </span>
+        </article>
+
+        <article className="kpi-card">
+          <div className="kpi-top">
+            <div className="kpi-label">
+              <span>Reconciliation rate</span>
+              <strong>{reconciliationRate == null ? '—' : `${reconciliationRate}%`}</strong>
+            </div>
+            <div className="kpi-icon green">
+              <CheckCircle2 size={20} />
+            </div>
+          </div>
+          <span className="kpi-subtle">
+            {reconciledCount ? `${fmtNumber(reconciledCount)} matched result(s)` : 'No matches yet'}
+          </span>
+        </article>
+      </div>
+
+      <div className="quick-actions">
+        <button
+          className="action-card"
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              fileInputRef.current?.click();
+            }
+          }}
+          aria-label="Upload statement CSV for audit"
+        >
+          <div className="icon-wrap">
+            <Upload size={20} />
+          </div>
+          <div>
+            <strong>Upload statement</strong>
+            <span>Run a transaction audit from the overview workspace</span>
+          </div>
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".csv,text/csv"
+          style={{ display: 'none' }}
+          onChange={(event) => {
+            const selected = event.target.files?.[0] || null;
+            setUploadError('');
+            setUploadSuccess('');
+            if (selected && !selected.name.toLowerCase().endsWith('.csv')) {
+              setUploadError('Please select a .csv file.');
+              setUploadFile(null);
+              event.target.value = '';
+              return;
+            }
+            setUploadFile(selected);
+            event.target.value = '';
+          }}
+        />
+        {uploadFile && (
+          <div
+            className="panel"
+            style={{
+              gridColumn: '1 / -1',
+              padding: '14px 18px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 12,
+              flexWrap: 'wrap'
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <FileText size={18} />
+              <span>{uploadFile.name}</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <button
+                className="secondary-btn"
+                type="button"
+                onClick={() => {
+                  setUploadFile(null);
+                  setUploadError('');
+                  setUploadSuccess('');
+                }}
+                disabled={uploading}
+              >
+                Cancel
+              </button>
+              <button
+                className="primary-btn"
+                type="button"
+                disabled={uploading}
+                onClick={async () => {
+                  if (!uploadFile) {
+                    setUploadError('Select a .csv file to upload.');
+                    return;
+                  }
+                  setUploading(true);
+                  setUploadError('');
+                  setUploadSuccess('');
+                  try {
+                    const formData = new FormData();
+                    formData.append('files', uploadFile);
+                    const response = await fetch(`${API}/api/audits`, {
+                      method: 'POST',
+                      body: formData
+                    });
+                    const data = await response.json();
+                    if (!response.ok) {
+                      const detail = Array.isArray(data.detail)
+                        ? data.detail.join(' ')
+                        : data.detail;
+                      throw new Error(detail || 'Audit upload failed.');
+                    }
+                    setUploadSuccess(
+                      `Audit #${data.audit_id || data.id} created with ${data.finding_count} finding(s).`
+                    );
+                    setUploadFile(null);
+                    await onAuditCreated?.();
+                    if (onNavigateInvestigations) {
+                      onNavigateInvestigations();
+                    }
+                  } catch (err) {
+                    setUploadError(err.message || 'Could not connect to the backend.');
+                  } finally {
+                    setUploading(false);
+                  }
+                }}
+              >
+                {uploading ? (
+                  <>
+                    <RefreshCw size={16} className="spin" />
+                    Uploading...
+                  </>
+                ) : (
+                  <>
+                    <Upload size={16} />
+                    Run Audit
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        )}
+        {uploadError && (
+          <div className="error-box" style={{ gridColumn: '1 / -1' }}>
+            {uploadError}
+          </div>
+        )}
+        {uploadSuccess && (
+          <div
+            className="warning-box"
+            style={{ gridColumn: '1 / -1', color: '#86efac', borderColor: 'rgba(34,197,94,0.4)', background: 'rgba(34,197,94,0.16)' }}
+          >
+            {uploadSuccess}
+          </div>
+        )}
+        <button className="action-card" type="button" onClick={() => document.dispatchEvent(new CustomEvent('finaudit:navigate', { detail: 'reconciliation' }))}>
+          <div className="icon-wrap">
+            <ArrowLeftRight size={20} />
+          </div>
+          <div>
+            <strong>Start reconciliation</strong>
+            <span>Match bank and ledger CSV files</span>
+          </div>
+        </button>
+        <button className="action-card" type="button" onClick={() => document.dispatchEvent(new CustomEvent('finaudit:navigate', { detail: 'investigations' }))}>
+          <div className="icon-wrap">
+            <FileSearch size={20} />
+          </div>
+          <div>
+            <strong>Inspect findings</strong>
+            <span>Review exceptions from the latest audit</span>
+          </div>
+        </button>
+      </div>
+
+      <div className="dashboard-grid">
+        <section className="chart-card">
+          <div className="section-header">
+            <div>
+              <h2>Transaction activity trend</h2>
+              <p>Rows reviewed and findings per recent audit run</p>
+            </div>
+          </div>
+          {trendData.length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-icon">
+                <BarChart3 size={24} />
+              </div>
+              <strong>No activity yet</strong>
+              <span>Run an audit to see trend data.</span>
+            </div>
+          ) : (
+            <div className="chart-wrap">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={trendData}>
+                  <defs>
+                    <linearGradient id="rows" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.28} />
+                      <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
+                    </linearGradient>
+                    <linearGradient id="findings" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.24} />
+                      <stop offset="95%" stopColor="#f59e0b" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid stroke="rgba(148,163,184,0.14)" vertical={false} />
+                  <XAxis dataKey="name" stroke="#64748b" fontSize={11} />
+                  <YAxis stroke="#64748b" fontSize={11} />
+                  <Tooltip
+                    contentStyle={{
+                      background: 'rgba(15,23,42,0.96)',
+                      border: '1px solid rgba(148,163,184,0.28)',
+                      borderRadius: 10,
+                      color: '#e8ecf8'
+                    }}
+                  />
+                  <Area type="monotone" dataKey="rows" stroke="#3b82f6" fill="url(#rows)" strokeWidth={2} />
+                  <Area type="monotone" dataKey="findings" stroke="#f59e0b" fill="url(#findings)" strokeWidth={2} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </section>
+
+        <div style={{ display: 'grid', gap: 18 }}>
+          <section className="chart-card">
+            <div className="section-header">
+              <div>
+                <h2>Risk distribution</h2>
+                <p>Findings by risk level from latest audit</p>
+              </div>
+            </div>
+            {findings.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-icon">
+                  <ShieldCheck size={24} />
+                </div>
+                <strong>No findings</strong>
+                <span>Run an audit to populate risk distribution.</span>
+              </div>
+            ) : (
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)', gap: 16, alignItems: 'center' }}>
+                <div className="chart-wrap" style={{ height: 220 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie data={riskData} dataKey="value" innerRadius={58} outerRadius={84} paddingAngle={4}>
+                        {riskData.map((entry) => (
+                          <Cell key={entry.name} fill={entry.color} />
+                        ))}
+                      </Pie>
+                      <Tooltip
+                        contentStyle={{
+                          background: 'rgba(15,23,42,0.96)',
+                          border: '1px solid rgba(148,163,184,0.28)',
+                          borderRadius: 10,
+                          color: '#e8ecf8'
+                        }}
+                      />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                  {riskBuckets.map((item) => (
+                    <div key={item.name} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                        <span style={{ width: 8, height: 8, borderRadius: '50%', background: item.color }} />
+                        <span>{item.name} risk</span>
+                      </div>
+                      <span style={{ color: 'var(--dash-text-primary)' }}>{fmtNumber(item.value)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </section>
+
+          <section className="chart-card">
+            <div className="section-header">
+              <div>
+                <h2>Reconciliation status</h2>
+                <p>Breakdown from latest reconciliation run</p>
+              </div>
+            </div>
+            {!latestRecon ? (
+              <div className="empty-state">
+                <div className="empty-icon">
+                  <ArrowLeftRight size={24} />
+                </div>
+                <strong>No reconciliation data</strong>
+                <span>Start a reconciliation to see status breakdown.</span>
+              </div>
+            ) : (
+              <div className="chart-wrap" style={{ height: 220 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={reconStatusData}>
+                    <CartesianGrid stroke="rgba(148,163,184,0.14)" vertical={false} />
+                    <XAxis dataKey="name" stroke="#64748b" fontSize={11} />
+                    <YAxis stroke="#64748b" fontSize={11} allowDecimals={false} />
+                    <Tooltip
+                      contentStyle={{
+                        background: 'rgba(15,23,42,0.96)',
+                        border: '1px solid rgba(148,163,184,0.28)',
+                        borderRadius: 10,
+                        color: '#e8ecf8'
+                      }}
+                    />
+                    <Bar dataKey="value" radius={[8, 8, 0, 0]}>
+                      {reconStatusData.map((entry) => (
+                        <Cell key={entry.name} fill={entry.color} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </section>
+        </div>
+      </div>
+
+      <div className="dashboard-grid">
+        <section className="table-card">
+          <div className="section-header">
+            <div>
+              <h2>Recent audit findings</h2>
+              <p>Latest exceptions from the most recent audit run</p>
+            </div>
+          </div>
+          {findings.length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-icon">
+                <FileSearch size={24} />
+              </div>
+              <strong>No findings available</strong>
+              <span>Upload transaction CSV files and run an audit.</span>
+            </div>
+          ) : (
+            <div className="data-table-wrap">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Finding</th>
+                    <th>Transaction</th>
+                    <th>Source file</th>
+                    <th>Amount</th>
+                    <th>Risk</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {findings.slice(0, 6).map((finding) => (
+                    <tr key={finding.id}>
+                      <td className="table-primary">{finding.summary}</td>
+                      <td>{finding.transaction_id || '—'}</td>
+                      <td>{finding.source_file || '—'}</td>
+                      <td>{fmtCurrency(finding.amount)}</td>
+                      <td>
+                        <StatusBadge status={finding.risk_level} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+
+        <section className="table-card">
+          <div className="section-header">
+            <div>
+              <h2>Recent reconciliation runs</h2>
+              <p>Saved reconciliations from the backend</p>
+            </div>
+          </div>
+          {(reconciliations || []).length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-icon">
+                <ArrowLeftRight size={24} />
+              </div>
+              <strong>No reconciliations yet</strong>
+              <span>Match a bank statement and ledger to get started.</span>
+            </div>
+          ) : (
+            <div className="data-table-wrap">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Files</th>
+                    <th>Matched</th>
+                    <th>Difference</th>
+                    <th>Created</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {reconciliations.slice(0, 6).map((item) => (
+                    <tr key={item.id}>
+                      <td className="table-primary">
+                        {(item.files || [item.bank_file, item.ledger_file])
+                          .filter(Boolean)
+                          .join(' ↔ ')}
+                      </td>
+                      <td>{fmtNumber(item.summary?.matched_count || 0)}</td>
+                      <td>{fmtCurrency(item.summary?.difference || 0)}</td>
+                      <td>{formatDateTime(item.created_at)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      </div>
+    </>
+  );
+}
+
+function ReconciliationPage({
+  reconciliation,
+  setReconciliation,
+  history,
+  loadHistory
+}) {
+  const [bankFile, setBankFile] = useState(null);
+  const [ledgerFile, setLedgerFile] = useState(null);
+  const [tolerance, setTolerance] = useState(3);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [warnings, setWarnings] = useState([]);
+  const [filter, setFilter] = useState('all');
+
+  const results = reconciliation?.results || [];
+  const summary = reconciliation?.summary || {};
+  const step = reconciliation ? 3 : bankFile && ledgerFile ? 1 : 0;
+
+  const filtered = useMemo(() => {
+    if (filter === 'all') return results;
+    if (filter === 'unmatched') {
+      return results.filter((item) =>
+        ['bank_only', 'ledger_only'].includes(item.status)
+      );
+    }
+    return results.filter((item) => item.status === filter);
+  }, [results, filter]);
+
+  const chooseFile = (side, event) => {
+    const selected = event.target.files?.[0] || null;
+    if (selected && !selected.name.toLowerCase().endsWith('.csv')) {
+      setError(
+        `${side === 'bank' ? 'Bank statement' : 'Accounting ledger'} must be a .csv file.`
+      );
+      return;
+    }
+    setError('');
+    if (side === 'bank') {
+      setBankFile(selected);
+    } else {
+      setLedgerFile(selected);
+    }
+  };
+
+  const runReconciliation = async () => {
+    if (!bankFile || !ledgerFile) {
+      setError('Select both a bank statement CSV and an accounting ledger CSV.');
       return;
     }
 
     setLoading(true);
     setError('');
     setWarnings([]);
-    setAudit(null);
-    setSelectedFindingId('');
-    setExplanations({});
+    setReconciliation(null);
+    setFilter('all');
 
     try {
       const formData = new FormData();
-      files.forEach((selectedFile) => {
-        formData.append('files', selectedFile);
-      });
+      formData.append('bank_file', bankFile);
+      formData.append('ledger_file', ledgerFile);
+      formData.append('date_tolerance_days', String(tolerance));
 
-      const response = await fetch(`${API}/api/audits`, {
+      const response = await fetch(`${API}/api/reconciliations`, {
         method: 'POST',
         body: formData
       });
-
       const data = await response.json();
 
       if (!response.ok) {
         const detail = Array.isArray(data.detail)
           ? data.detail.join(' ')
           : data.detail;
-
-        throw new Error(detail || 'Audit upload failed.');
+        throw new Error(detail || 'Reconciliation failed.');
       }
 
-      setAudit(data);
+      setReconciliation(data);
       setWarnings(Array.isArray(data.warnings) ? data.warnings : []);
-
-      if (data.findings?.length) {
-        setSelectedFindingId(String(data.findings[0].id));
-      }
-
-      await loadAudits();
+      await loadHistory?.();
     } catch (err) {
-      setError(
-        err.message ||
-          'Could not connect to the backend. Make sure FastAPI is running.'
-      );
+      setError(err.message || 'Could not connect to the backend.');
     } finally {
       setLoading(false);
     }
-  }
+  };
 
-  async function explainFinding(id, question = '') {
-    if (!id) {
-      setError('Select a finding to investigate.');
-      return;
-    }
+  const exportHref = reconciliation
+    ? `${API}/api/reconciliations/${reconciliation.reconciliation_id}/export.csv`
+    : null;
 
-    setExplanations((previous) => ({
-      ...previous,
-      [id]: {
-        ...previous[id],
-        loading: true,
-        error: ''
-      }
-    }));
+  return (
+    <>
+      <div className="breadcrumb">
+        <span>Bank Reconciliation</span>
+        <ChevronRight size={14} />
+        <span className="breadcrumb-current">Workspace</span>
+      </div>
 
-    try {
-      // The existing backend endpoint explains a stored finding.
-      // No unsupported general chat endpoint is assumed here.
-      const response = await fetch(
-        `${API}/api/findings/${id}/explain`,
-        { method: 'POST' }
-      );
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(
-          data.detail || 'Could not explain this finding.'
-        );
-      }
-
-      setExplanations((previous) => ({
-        ...previous,
-        [id]: {
-          loading: false,
-          data,
-          error: ''
-        }
-      }));
-
-      if (question) {
-        setAssistantQuestion(question);
-      }
-    } catch (err) {
-      setExplanations((previous) => ({
-        ...previous,
-        [id]: {
-          ...previous[id],
-          loading: false,
-          error: err.message || 'AI explanation failed.'
-        }
-      }));
-    }
-  }
-
-  function navigate(view) {
-    setActiveView(view);
-    setMobileMenuOpen(false);
-    setError('');
-  }
-
-  function NavItem({ view, icon: Icon, children }) {
-    return (
-      <button
-        type="button"
-        className={`nav ${activeView === view ? 'active' : ''}`}
-        onClick={() => navigate(view)}
-        aria-current={activeView === view ? 'page' : undefined}
-      >
-        <Icon size={17} />
-        <span>{children}</span>
-      </button>
-    );
-  }
-
-  function FindingCard({ finding }) {
-    const explanation = explanations[finding.id];
-    const isLoading = Boolean(explanation?.loading);
-
-    return (
-      <article className="finding" key={finding.id}>
-        <div className="finding-icon">
-          <AlertTriangle size={18} />
+      <header className="page-header">
+        <div>
+          <h1>Bank Statement Reconciliation</h1>
+          <p>
+            Match transactions between your bank statement and accounting ledger.
+            Reference matches are preferred; ambiguous or uncertain matches are
+            surfaced for review.
+          </p>
         </div>
+        {exportHref && (
+          <a className="secondary-btn" href={exportHref}>
+            <Download size={16} />
+            Export CSV
+          </a>
+        )}
+      </header>
 
-        <div className="finding-body">
-          <div className="finding-title-row">
-            <b>{finding.summary}</b>
-            <span className={`risk ${finding.risk_level}`}>
-              {finding.risk_level} risk
-            </span>
-          </div>
-
-          <p>{finding.evidence}</p>
-
-          <div className="finding-meta">
-            <span>Ref: {finding.transaction_id || 'N/A'}</span>
-            {finding.source_file && (
-              <span>File: {finding.source_file}</span>
-            )}
-            <span>
-              {String(finding.finding_type || '').replaceAll('_', ' ')}
-            </span>
-            <span>{fmt(finding.amount)}</span>
-          </div>
-
-          {explanation?.data && (
-            <div className="ai-answer">
-              <div className="ai-answer-title">
-                <BrainCircuit size={16} />
-                AI investigation notes
-                {explanation.data.fallback ? (
-                  <span className="muted">
-                    (Fallback explanation)
-                  </span>
-                ) : (
-                  <span className="muted">
-                    · {explanation.data.model || 'AI model'}
-                  </span>
-                )}
-              </div>
-
-              <p>{explanation.data.answer}</p>
-
-              <div className="sources">
-                Retrieved sources:{' '}
-                {(explanation.data.retrieved_sources || [])
-                  .map((source) => source.source)
-                  .join(', ') || 'No sources returned'}
-              </div>
-
-              {explanation.data.fallback && (
-                <p className="error-text">
-                  The response used the backend fallback. Verify
-                  the policy and evidence before making decisions.
-                </p>
-              )}
-            </div>
-          )}
-
-          {explanation?.error && (
-            <p className="error-text">{explanation.error}</p>
-          )}
-
-          <button
-            type="button"
-            className="text-btn"
-            onClick={() => explainFinding(finding.id)}
-            disabled={isLoading}
+      <div className="stepper">
+        {RECON_STEPS.map((label, index) => (
+          <div
+            key={label}
+            className={`step-item ${index === step ? 'active' : ''} ${
+              index < step ? 'completed' : ''
+            }`}
           >
-            {isLoading ? (
-              <>
-                <RefreshCw size={14} className="spin" />
-                Investigating...
-              </>
-            ) : (
-              <>
-                <BrainCircuit size={14} />
-                Explain finding
-              </>
-            )}
-          </button>
-        </div>
-      </article>
-    );
-  }
-
-  function FindingsList({ title = 'Audit findings' }) {
-    return (
-      <section className="findings-panel">
-        <div className="section-heading">
-          <div>
-            <h3>{title}</h3>
-            <p>
-              {audit
-                ? `Audit #${audit.audit_id} · ${
-                    audit.files?.length
-                      ? audit.files.join(', ')
-                      : audit.filename
-                  }`
-                : 'Upload one or more CSVs and run an audit to see findings.'}
-            </p>
+            <div className="step-circle">
+              {index < step ? <CheckCircle2 size={16} /> : index + 1}
+            </div>
+            <span>{label}</span>
           </div>
-
-          {audit && (
-            <a
-              className="secondary-btn"
-              href={`${API}/api/audits/${audit.audit_id}/export.csv`}
-            >
-              <Download size={15} />
-              Export CSV
-            </a>
-          )}
-        </div>
-
-        {!audit && (
-          <div className="empty-state">
-            <FileSearch size={28} />
-            <b>No active investigation</b>
-            <span>
-              Run an audit from Audit overview to investigate
-              flagged transactions.
-            </span>
-            <button
-              type="button"
-              className="secondary-btn"
-              onClick={() => navigate('overview')}
-            >
-              <ArrowLeft size={15} />
-              Go to overview
-            </button>
-          </div>
-        )}
-
-        {audit && findings.length === 0 && (
-          <div className="empty-state">
-            <ShieldCheck size={28} />
-            <b>No exceptions detected</b>
-            <span>
-              The configured rules did not flag any rows.
-              This does not guarantee that all transactions are correct.
-            </span>
-          </div>
-        )}
-
-        {findings.map((finding) => (
-          <FindingCard key={finding.id} finding={finding} />
         ))}
-      </section>
-    );
-  }
+      </div>
 
-  function Overview() {
-    return (
-      <>
-        <section className="welcome">
-          <div>
-            <div className="welcome-kicker">
-              FINANCIAL CONTROL CENTER
-            </div>
-            <h2>See the signals behind your numbers.</h2>
-            <p>
-              Upload transaction data to run explainable audit
-              checks and investigate exceptions with AI.
-            </p>
-          </div>
-
-          <div className="welcome-art">
-            <div className="orbit orbit-one" />
-            <div className="orbit orbit-two" />
-            <ShieldCheck size={72} />
-          </div>
-        </section>
-
-        <section className="upload-panel">
-          <div className="section-heading">
+      <div className="rec-grid">
+        <section className="panel upload-card">
+          <div className="section-header">
             <div>
-              <h3>Run a new audit</h3>
-              <p>CSV format · Up to 5 MB per file · Multiple files supported</p>
+              <h2>Bank Statement</h2>
+              <p>Upload the CSV extract from your bank</p>
             </div>
-            <span className="step-tag">01 / INGEST</span>
           </div>
-
-          <label className="dropzone">
+          <label className="dropzone-light">
             <input
               type="file"
               accept=".csv,text/csv"
-              multiple
-              onChange={(event) => {
-                const selected = Array.from(
-                  event.target.files || []
-                ).filter((selectedFile) =>
-                  selectedFile.name.toLowerCase().endsWith('.csv')
-                );
-                setFiles(selected);
-                setError(
-                  event.target.files?.length && selected.length === 0
-                    ? 'Please choose one or more .csv files.'
-                    : ''
-                );
-              }}
+              onChange={(event) => chooseFile('bank', event)}
             />
-
-            <div className="upload-icon">
+            <div className="dropzone-icon">
               <Upload size={22} />
             </div>
-
-            <b>
-              {files.length
-                ? `${files.length} CSV file${
-                    files.length === 1 ? '' : 's'
-                  } selected`
-                : 'Choose transaction CSV files'}
-            </b>
-
-            <span>
-              {files.length
-                ? `${(
-                    files.reduce(
-                      (total, selectedFile) =>
-                        total + selectedFile.size,
-                      0
-                    ) / 1024
-                  ).toFixed(1)} KB total`
-                : 'Select one or more CSV files from your computer'}
+            <strong>{bankFile ? bankFile.name : 'Drop or browse bank CSV'}</strong>
+            <span className="kpi-subtle">
+              Accepts date, amount, debit, credit, reference, narration
             </span>
-
-            {files.length > 0 && (
-              <div className="selected-files">
-                {files.map((selectedFile) => (
-                  <span
-                    className="selected-file"
-                    key={`${selectedFile.name}-${selectedFile.size}-${selectedFile.lastModified}`}
-                  >
-                    <FileText size={13} />
-                    {selectedFile.name}
-                  </span>
-                ))}
-              </div>
-            )}
-
-            <small>
-              Supports bank CSVs with date, type, amount, account,
-              recipient, upi_ref, balance_after, source_sms — or
-              the original transaction_id, date, vendor, amount,
-              description format.
-            </small>
           </label>
+        </section>
 
-          <div className="upload-actions">
-            <span className="privacy-note">
-              <ShieldCheck size={15} />
-              Processed by your configured backend. Bank data is not
-              sent to an external LLM during upload.
+        <section className="panel upload-card">
+          <div className="section-header">
+            <div>
+              <h2>Accounting Ledger</h2>
+              <p>Upload the CSV extract from your ledger</p>
+            </div>
+          </div>
+          <label className="dropzone-light">
+            <input
+              type="file"
+              accept=".csv,text/csv"
+              onChange={(event) => chooseFile('ledger', event)}
+            />
+            <div className="dropzone-icon">
+              <FileText size={22} />
+            </div>
+            <strong>{ledgerFile ? ledgerFile.name : 'Drop or browse ledger CSV'}</strong>
+            <span className="kpi-subtle">
+              Column mapping is applied independently per file
             </span>
-
-            <button
-              type="button"
-              className="primary-btn"
-              onClick={runAudit}
-              disabled={files.length === 0 || loading}
-            >
-              {loading ? (
-                <>
-                  <RefreshCw size={16} className="spin" />
-                  Analyzing...
-                </>
-              ) : (
-                <>
-                  <Activity size={16} />
-                  Run audit
-                </>
-              )}
-            </button>
-          </div>
-
-          {error && <div className="error-box">{error}</div>}
-          {warnings.length > 0 && (
-            <div className="warning-box">{warnings.join(' ')}</div>
-          )}
+          </label>
         </section>
+      </div>
 
-        <section className="kpi-grid">
-          <div className="kpi">
-            <div className="kpi-top">
-              <span>Transactions reviewed</span>
-              <div className="kpi-icon blue">
-                <FileSearch size={18} />
-              </div>
-            </div>
-            <strong>{audit ? audit.row_count : '—'}</strong>
-            <small>Rows in latest audit</small>
-          </div>
-
-          <div className="kpi">
-            <div className="kpi-top">
-              <span>Exceptions detected</span>
-              <div className="kpi-icon amber">
-                <AlertTriangle size={18} />
-              </div>
-            </div>
-            <strong>{audit ? findings.length : '—'}</strong>
-            <small>Rule-based flags for review</small>
-          </div>
-
-          <div className="kpi">
-            <div className="kpi-top">
-              <span>High-risk flags</span>
-              <div className="kpi-icon red">
-                <ShieldCheck size={18} />
-              </div>
-            </div>
-            <strong>{audit ? highRisk : '—'}</strong>
-            <small>Not a fraud determination</small>
-          </div>
-
-          <div className="kpi">
-            <div className="kpi-top">
-              <span>Flagged amount total</span>
-              <div className="kpi-icon green">
-                <CircleDollarSign size={18} />
-              </div>
-            </div>
-            <strong className="amount">
-              {audit ? fmt(flaggedAmount) : '—'}
-            </strong>
-            <small>May include overlapping findings</small>
-          </div>
-        </section>
-
-        <FindingsList />
-
-        <section className="history-panel">
-          <div className="section-heading">
-            <div>
-              <h3>Recent audit runs</h3>
-              <p>Saved audit history from your backend.</p>
-            </div>
-            <button
-              type="button"
-              className="secondary-btn"
-              onClick={loadAudits}
-              disabled={historyLoading}
-            >
-              <RefreshCw
-                size={14}
-                className={historyLoading ? 'spin' : ''}
-              />
-              Refresh
-            </button>
-          </div>
-
-          {historyLoading && <p>Loading audit history...</p>}
-
-          {!historyLoading && audits.length === 0 && (
-            <p className="history-empty">
-              No saved runs found, or the API is unavailable.
-            </p>
-          )}
-
-          {audits.slice(0, 5).map((item) => (
-            <div className="history-row" key={item.id ?? item.audit_id}>
-              <div className="history-file">
-                <div className="file-icon">CSV</div>
-                <div>
-                  <b>{item.filename}</b>
-                  <small>
-                    Audit #{item.id ?? item.audit_id}
-                    {item.created_at
-                      ? ` · ${new Date(item.created_at).toLocaleString()}`
-                      : ''}
-                  </small>
-                </div>
-              </div>
-
-              <div className="history-count">
-                {item.row_count} rows · {item.finding_count} findings
-              </div>
-            </div>
-          ))}
-        </section>
-      </>
-    );
-  }
-
-  function Investigations() {
-    return (
-      <>
-        <section className="page-intro">
-          <div className="eyebrow">WORKSPACE / INVESTIGATIONS</div>
-          <h2>Investigate audit exceptions</h2>
-          <p>
-            Review transaction evidence, assess risk, and request
-            AI-assisted explanations.
-          </p>
-        </section>
-        <FindingsList title="Investigation findings" />
-      </>
-    );
-  }
-
-  function Assistant() {
-    const explanation = selectedFindingId
-      ? explanations[selectedFindingId]
-      : null;
-
-    function askAboutFinding(event) {
-      event.preventDefault();
-
-      if (!selectedFinding) {
-        setError('Select a finding before requesting an explanation.');
-        return;
-      }
-
-      if (!assistantQuestion.trim()) {
-        explainFinding(selectedFinding.id);
-        return;
-      }
-
-      // The current API accepts no question body.
-      // Keep the question visible, but use the supported finding
-      // explanation endpoint instead of inventing a chat API.
-      explainFinding(selectedFinding.id, assistantQuestion.trim());
-    }
-
-    return (
-      <>
-        <section className="page-intro">
-          <div className="eyebrow">WORKSPACE / AI ASSISTANT</div>
-          <h2>AI audit assistant</h2>
-          <p>
-            Get an evidence-based explanation of a finding using
-            the configured AI and retrieved policy sources.
-          </p>
-        </section>
-
-        <section className="upload-panel assistant-panel">
-          <div className="section-heading">
-            <div>
-              <h3>
-                <Sparkles size={18} /> Investigate a finding
-              </h3>
-              <p>Select a finding from your most recent audit.</p>
-            </div>
-          </div>
-
-          {!audit && (
-            <div className="empty-state">
-              <BrainCircuit size={30} />
-              <b>Run an audit first</b>
-              <span>
-                The assistant needs a finding from an audit to
-                generate an explanation.
-              </span>
-              <button
-                type="button"
-                className="primary-btn"
-                onClick={() => navigate('overview')}
-              >
-                Start an audit
-              </button>
-            </div>
-          )}
-
-          {audit && findings.length === 0 && (
-            <div className="empty-state">
-              No findings are available to explain.
-            </div>
-          )}
-
-          {audit && findings.length > 0 && (
-            <form onSubmit={askAboutFinding}>
-              <label className="field-label" htmlFor="finding-select">
-                Select finding
-              </label>
-
-              <select
-                id="finding-select"
-                className="assistant-select"
-                value={selectedFindingId}
-                onChange={(event) =>
-                  setSelectedFindingId(event.target.value)
-                }
-              >
-                {findings.map((finding) => (
-                  <option
-                    key={finding.id}
-                    value={String(finding.id)}
-                  >
-                    {finding.transaction_id} — {finding.summary}
-                  </option>
-                ))}
-              </select>
-
-              {selectedFinding && (
-                <div className="assistant-evidence">
-                  <b>{selectedFinding.summary}</b>
-                  <p>{selectedFinding.evidence}</p>
-                  <span className={`risk ${selectedFinding.risk_level}`}>
-                    {selectedFinding.risk_level} risk
-                  </span>
-                </div>
-              )}
-
-              <label className="field-label" htmlFor="assistant-question">
-                What would you like to investigate?
-              </label>
-
-              <textarea
-                id="assistant-question"
-                className="assistant-textarea"
-                rows={3}
-                value={assistantQuestion}
-                onChange={(event) =>
-                  setAssistantQuestion(event.target.value)
-                }
-                placeholder="Example: What evidence should an auditor verify?"
-              />
-
-              <p className="muted">
-                The current backend generates an explanation for the
-                selected finding. The question above is not sent to
-                the model because the existing endpoint does not
-                accept a question body.
-              </p>
-
-              {error && <div className="error-box">{error}</div>}
-
-              <button
-                type="submit"
-                className="primary-btn"
-                disabled={Boolean(explanation?.loading)}
-              >
-                {explanation?.loading ? (
-                  <>
-                    <RefreshCw size={16} className="spin" />
-                    Investigating...
-                  </>
-                ) : (
-                  <>
-                    <BrainCircuit size={16} />
-                    Explain selected finding
-                  </>
-                )}
-              </button>
-            </form>
-          )}
-
-          {explanation?.error && (
-            <div className="error-box">{explanation.error}</div>
-          )}
-
-          {explanation?.data && (
-            <div className="ai-answer assistant-result">
-              <div className="ai-answer-title">
-                <BrainCircuit size={18} />
-                Investigation explanation
-                <span className="muted">
-                  {explanation.data.model || ''}
-                </span>
-              </div>
-
-              <p>{explanation.data.answer}</p>
-
-              <h4>Retrieved sources</h4>
-
-              {(explanation.data.retrieved_sources || []).length > 0 ? (
-                <ul>
-                  {explanation.data.retrieved_sources.map(
-                    (source, index) => (
-                      <li key={`${source.source}-${index}`}>
-                        <b>{source.source}</b>
-                        {source.score != null &&
-                          ` · relevance ${Number(source.score).toFixed(3)}`}
-                      </li>
-                    )
-                  )}
-                </ul>
-              ) : (
-                <p>No retrieval sources were returned.</p>
-              )}
-
-              {explanation.data.fallback && (
-                <p className="error-text">
-                  A fallback response was returned. Check your Groq
-                  configuration and backend logs if you expected a
-                  generated AI answer.
-                </p>
-              )}
-            </div>
-          )}
-        </section>
-      </>
-    );
-  }
-
-  function Reconciliation() {
-    const [bankFile, setBankFile] = useState(null);
-    const [ledgerFile, setLedgerFile] = useState(null);
-    const [tolerance, setTolerance] = useState(3);
-    const [reconciliation, setReconciliation] = useState(null);
-    const [reconLoading, setReconLoading] = useState(false);
-    const [reconError, setReconError] = useState('');
-    const [reconWarnings, setReconWarnings] = useState([]);
-    const [filter, setFilter] = useState('all');
-    const [reconHistory, setReconHistory] = useState([]);
-    const [reconHistoryLoading, setReconHistoryLoading] = useState(false);
-
-    const statusOptions = [
-      { key: 'matched', label: 'Matched' },
-      { key: 'bank_only', label: 'Bank only' },
-      { key: 'ledger_only', label: 'Ledger only' },
-      { key: 'amount_mismatch', label: 'Amount mismatch' },
-      { key: 'date_mismatch', label: 'Date mismatch' },
-      { key: 'ambiguous', label: 'Ambiguous' }
-    ];
-
-    const results = reconciliation?.results || [];
-    const summary = reconciliation?.summary || {};
-    const visibleResults =
-      filter === 'all'
-        ? results
-        : results.filter((item) => item.status === filter);
-
-    async function loadReconciliationHistory() {
-      setReconHistoryLoading(true);
-      try {
-        const response = await fetch(`${API}/api/reconciliations`);
-        if (!response.ok) {
-          throw new Error('Could not load reconciliation history.');
-        }
-        const data = await response.json();
-        setReconHistory(Array.isArray(data) ? data : []);
-      } catch (err) {
-        console.error('Reconciliation history error:', err);
-      } finally {
-        setReconHistoryLoading(false);
-      }
-    }
-
-    useEffect(() => {
-      loadReconciliationHistory();
-    }, []);
-
-    function chooseFile(side, event) {
-      const selected = event.target.files?.[0] || null;
-      if (selected && !selected.name.toLowerCase().endsWith('.csv')) {
-        setReconError(`${side === 'bank' ? 'Bank statement' : 'Ledger'} must be a .csv file.`);
-        return;
-      }
-      setReconError('');
-      if (side === 'bank') {
-        setBankFile(selected);
-      } else {
-        setLedgerFile(selected);
-      }
-    }
-
-    async function runReconciliation() {
-      if (!bankFile || !ledgerFile) {
-        setReconError('Select both a bank statement CSV and an accounting ledger CSV.');
-        return;
-      }
-
-      setReconLoading(true);
-      setReconError('');
-      setReconWarnings([]);
-      setReconciliation(null);
-      setFilter('all');
-
-      try {
-        const formData = new FormData();
-        formData.append('bank_file', bankFile);
-        formData.append('ledger_file', ledgerFile);
-        formData.append('date_tolerance_days', String(tolerance));
-
-        const response = await fetch(`${API}/api/reconciliations`, {
-          method: 'POST',
-          body: formData
-        });
-        const data = await response.json();
-
-        if (!response.ok) {
-          const detail = Array.isArray(data.detail)
-            ? data.detail.join(' ')
-            : data.detail;
-          throw new Error(detail || 'Reconciliation failed.');
-        }
-
-        setReconciliation(data);
-        setReconWarnings(Array.isArray(data.warnings) ? data.warnings : []);
-        await loadReconciliationHistory();
-      } catch (err) {
-        setReconError(
-          err.message ||
-            'Could not connect to the backend. Make sure FastAPI is running.'
-        );
-      } finally {
-        setReconLoading(false);
-      }
-    }
-
-    async function openReconciliation(id) {
-      setReconLoading(true);
-      setReconError('');
-      try {
-        const response = await fetch(`${API}/api/reconciliations/${id}`);
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.detail || 'Could not load this reconciliation.');
-        }
-        setReconciliation(data);
-        setReconWarnings([]);
-        setFilter('all');
-      } catch (err) {
-        setReconError(err.message || 'Could not load this reconciliation.');
-      } finally {
-        setReconLoading(false);
-      }
-    }
-
-    const money = (value) => (value == null ? '—' : fmt(value));
-    const text = (value) => value || '—';
-
-    return (
-      <>
-        <section className="page-intro">
-          <div className="eyebrow">WORKSPACE / BANK RECONCILIATION</div>
-          <h2>Match the bank statement against your ledger</h2>
-          <p>
-            Upload two CSV files. Reference matches are preferred; remaining
-            rows are matched by amount, direction, and a configurable date
-            tolerance. Uncertain matches are reported, never forced.
-          </p>
-        </section>
-
-        <section className="upload-panel">
-          <div className="section-heading">
-            <div>
-              <h3>New reconciliation</h3>
-              <p>One bank statement and one accounting ledger, up to 5 MB each.</p>
-            </div>
-            <span className="step-tag">02 / RECONCILE</span>
-          </div>
-
-          <div className="recon-upload-grid">
-            <label className="dropzone recon-dropzone">
-              <input
-                type="file"
-                accept=".csv,text/csv"
-                onChange={(event) => chooseFile('bank', event)}
-              />
-              <div className="upload-icon">
-                <Upload size={20} />
-              </div>
-              <b>Bank statement</b>
-              <span>
-                {bankFile ? bankFile.name : 'Choose the bank CSV file'}
-              </span>
-              <small>
-                Supports date, amount, debit, credit, withdrawal, deposit,
-                reference, narration, and related aliases.
-              </small>
-            </label>
-
-            <label className="dropzone recon-dropzone">
-              <input
-                type="file"
-                accept=".csv,text/csv"
-                onChange={(event) => chooseFile('ledger', event)}
-              />
-              <div className="upload-icon">
-                <FileText size={20} />
-              </div>
-              <b>Accounting ledger</b>
-              <span>
-                {ledgerFile ? ledgerFile.name : 'Choose the ledger CSV file'}
-              </span>
-              <small>
-                Column mapping is handled independently for each file, so the
-                two files do not need identical headers.
-              </small>
-            </label>
-          </div>
-
-          <div className="recon-controls">
-            <label className="recon-tolerance">
-              <span>Date tolerance (days)</span>
+      <section className="panel" style={{ padding: '18px 26px', marginBottom: 22 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, color: 'var(--rec-text-secondary)' }}>
+              Date tolerance
               <input
                 type="number"
                 min="0"
                 max="365"
                 value={tolerance}
                 onChange={(event) => setTolerance(event.target.value)}
+                style={{
+                  width: 90,
+                  padding: '8px 10px',
+                  borderRadius: 8,
+                  border: '1px solid var(--rec-border-strong)',
+                  background: 'var(--rec-surface)'
+                }}
               />
+              days
             </label>
+            <span className="kpi-subtle">Used only when no safe reference match exists</span>
+          </div>
+          <button
+            className="primary-btn"
+            type="button"
+            onClick={runReconciliation}
+            disabled={!bankFile || !ledgerFile || loading}
+          >
+            {loading ? (
+              <>
+                <RefreshCw size={16} className="spin" />
+                Matching transactions...
+              </>
+            ) : (
+              <>
+                <ArrowLeftRight size={16} />
+                Review & Match
+              </>
+            )}
+          </button>
+        </div>
+        {error && <div className="error-box">{error}</div>}
+        {warnings.length > 0 && <div className="warning-box">{warnings.join(' ')}</div>}
+      </section>
 
-            <button
-              type="button"
-              className="primary-btn"
-              onClick={runReconciliation}
-              disabled={!bankFile || !ledgerFile || reconLoading}
-            >
-              {reconLoading ? (
-                <>
-                  <RefreshCw size={16} className="spin" />
-                  Reconciling...
-                </>
-              ) : (
-                <>
-                  <ArrowLeftRight size={16} />
-                  Run reconciliation
-                </>
-              )}
-            </button>
+      {reconciliation && (
+        <>
+          <div className="summary-grid">
+            <article className="panel summary-card matched">
+              <div className="summary-card-header">
+                <span className="kpi-label">
+                  <span>Matched</span>
+                </span>
+                <CheckCircle2 size={18} />
+              </div>
+              <strong>{fmtNumber(summary.matched_count || 0)}</strong>
+              <span className="kpi-subtle">{fmtCurrency(summary.matched_total || 0)}</span>
+            </article>
+            <article className="panel summary-card suggested">
+              <div className="summary-card-header">
+                <span className="kpi-label">
+                  <span>Suggested</span>
+                </span>
+                <Search size={18} />
+              </div>
+              <strong>{fmtNumber((summary.amount_mismatch_count || 0) + (summary.date_mismatch_count || 0))}</strong>
+              <span className="kpi-subtle">Needs review (mismatch)</span>
+            </article>
+            <article className="panel summary-card unmatched">
+              <div className="summary-card-header">
+                <span className="kpi-label">
+                  <span>Unmatched</span>
+                </span>
+                <AlertTriangle size={18} />
+              </div>
+              <strong>{fmtNumber((summary.bank_only_count || 0) + (summary.ledger_only_count || 0))}</strong>
+              <span className="kpi-subtle">{fmtCurrency((summary.bank_unmatched_total || 0) + (summary.ledger_unmatched_total || 0))}</span>
+            </article>
+            <article className="panel summary-card reconciled">
+              <div className="summary-card-header">
+                <span className="kpi-label">
+                  <span>Already reconciled</span>
+                </span>
+                <ShieldCheck size={18} />
+              </div>
+              <strong>{fmtNumber(summary.matched_count || 0)}</strong>
+              <span className="kpi-subtle">Difference {fmtCurrency(summary.difference || 0)}</span>
+            </article>
           </div>
 
-          {reconError && <div className="error-box">{reconError}</div>}
-          {reconWarnings.length > 0 && (
-            <div className="warning-box">{reconWarnings.join(' ')}</div>
-          )}
-        </section>
-
-        {reconciliation && (
-          <>
-            <section className="kpi-grid recon-summary-grid">
-              <div className="kpi">
-                <div className="kpi-top">
-                  <span>Bank statement total</span>
-                  <div className="kpi-icon blue">
-                    <FileSearch size={18} />
-                  </div>
-                </div>
-                <strong className="amount">{money(summary.bank_total)}</strong>
-                <small>All bank rows in this run</small>
+          <section className="panel table-card-light">
+            <div className="table-header">
+              <div>
+                <h2>Transactions</h2>
+                <p>
+                  {reconciliation.bank_file} ↔ {reconciliation.ledger_file} ·{' '}
+                  {reconciliation.date_tolerance_days} day tolerance
+                </p>
               </div>
-
-              <div className="kpi">
-                <div className="kpi-top">
-                  <span>Ledger total</span>
-                  <div className="kpi-icon green">
-                    <CircleDollarSign size={18} />
-                  </div>
-                </div>
-                <strong className="amount">{money(summary.ledger_total)}</strong>
-                <small>All ledger rows in this run</small>
-              </div>
-
-              <div className="kpi">
-                <div className="kpi-top">
-                  <span>Matched total</span>
-                  <div className="kpi-icon amber">
-                    <ShieldCheck size={18} />
-                  </div>
-                </div>
-                <strong className="amount">{money(summary.matched_total)}</strong>
-                <small>{summary.matched_count || 0} matched result(s)</small>
-              </div>
-
-              <div className="kpi">
-                <div className="kpi-top">
-                  <span>Reconciliation difference</span>
-                  <div className="kpi-icon red">
-                    <AlertTriangle size={18} />
-                  </div>
-                </div>
-                <strong className="amount">{money(summary.difference)}</strong>
-                <small>Bank total minus ledger total</small>
-              </div>
-            </section>
-
-            <section className="recon-subtotals">
-              <span>Bank unmatched: <b>{money(summary.bank_unmatched_total)}</b></span>
-              <span>Ledger unmatched: <b>{money(summary.ledger_unmatched_total)}</b></span>
-              <span>Ambiguous items: <b>{summary.ambiguous_count || 0}</b></span>
-              <span>Run #{reconciliation.reconciliation_id}</span>
-            </section>
-
-            <section className="findings-panel recon-results-panel">
-              <div className="section-heading">
-                <div>
-                  <h3>Reconciliation results</h3>
-                  <p>
-                    {reconciliation.bank_file} ↔ {reconciliation.ledger_file} ·{' '}
-                    {reconciliation.date_tolerance_days} day tolerance
-                  </p>
-                </div>
-
-                <a
-                  className="secondary-btn"
-                  href={`${API}/api/reconciliations/${reconciliation.reconciliation_id}/export.csv`}
-                >
-                  <Download size={15} />
-                  Export CSV
-                </a>
-              </div>
-
-              <div className="filter-row">
+              <div className="filter-bar" style={{ marginBottom: 0 }}>
                 <button
+                  className={`filter-chip-light ${filter === 'all' ? 'active' : ''}`}
                   type="button"
-                  className={`filter-chip ${filter === 'all' ? 'active' : ''}`}
                   onClick={() => setFilter('all')}
                 >
                   All ({results.length})
                 </button>
-                {statusOptions.map((option) => (
-                  <button
-                    key={option.key}
-                    type="button"
-                    className={`filter-chip ${filter === option.key ? 'active' : ''}`}
-                    onClick={() => setFilter(option.key)}
-                  >
-                    {option.label} ({summary[`${option.key}_count`] || 0})
-                  </button>
-                ))}
-              </div>
-
-              {visibleResults.length === 0 ? (
-                <div className="empty-state">
-                  <ShieldCheck size={28} />
-                  <b>No results in this filter</b>
-                  <span>Choose another status filter to inspect the run.</span>
-                </div>
-              ) : (
-                <div className="recon-table-wrap">
-                  <table className="recon-table">
-                    <thead>
-                      <tr>
-                        <th>Status</th>
-                        <th>Date (B / L)</th>
-                        <th>Amount (B / L)</th>
-                        <th>Reference (B / L)</th>
-                        <th>Description (B / L)</th>
-                        <th>Source row</th>
-                        <th>Note</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {visibleResults.map((item, index) => (
-                        <tr
-                          key={
-                            item.id ||
-                            `${item.bank_source_file}-${item.bank_source_row}-${item.ledger_source_file}-${item.ledger_source_row}-${index}`
-                          }
-                        >
-                          <td>
-                            <span className={`status-badge status-${item.status}`}>
-                              {String(item.status || '').replaceAll('_', ' ')}
-                            </span>
-                          </td>
-                          <td>
-                            <div className="pair-cell">
-                              <span>B: {text(item.bank_date)}</span>
-                              <span>L: {text(item.ledger_date)}</span>
-                            </div>
-                          </td>
-                          <td>
-                            <div className="pair-cell">
-                              <span>B: {money(item.bank_amount)}</span>
-                              <span>L: {money(item.ledger_amount)}</span>
-                            </div>
-                          </td>
-                          <td>
-                            <div className="pair-cell">
-                              <span>B: {text(item.bank_reference)}</span>
-                              <span>L: {text(item.ledger_reference)}</span>
-                            </div>
-                          </td>
-                          <td>
-                            <div className="pair-cell">
-                              <span>B: {text(item.bank_description)}</span>
-                              <span>L: {text(item.ledger_description)}</span>
-                            </div>
-                          </td>
-                          <td>
-                            <div className="source-cell">
-                              {item.bank_source_file && (
-                                <span>
-                                  B: {item.bank_source_file} · row {item.bank_source_row}
-                                </span>
-                              )}
-                              {item.ledger_source_file && (
-                                <span>
-                                  L: {item.ledger_source_file} · row {item.ledger_source_row}
-                                </span>
-                              )}
-                            </div>
-                          </td>
-                          <td className="note-cell">{item.note || '—'}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </section>
-          </>
-        )}
-
-        <section className="history-panel">
-          <div className="section-heading">
-            <div>
-              <h3>Recent reconciliations</h3>
-              <p>Saved runs from your backend.</p>
-            </div>
-            <button
-              type="button"
-              className="secondary-btn"
-              onClick={loadReconciliationHistory}
-              disabled={reconHistoryLoading}
-            >
-              <RefreshCw
-                size={14}
-                className={reconHistoryLoading ? 'spin' : ''}
-              />
-              Refresh
-            </button>
-          </div>
-
-          {reconHistoryLoading && <p>Loading reconciliation history...</p>}
-
-          {!reconHistoryLoading && reconHistory.length === 0 && (
-            <p className="history-empty">No saved reconciliations found.</p>
-          )}
-
-          {reconHistory.slice(0, 5).map((item) => (
-            <div className="history-row" key={item.id}>
-              <div className="history-file">
-                <div className="file-icon">REC</div>
-                <div>
-                  <b>
-                    {item.bank_file} ↔ {item.ledger_file}
-                  </b>
-                  <small>
-                    Run #{item.id}
-                    {item.created_at
-                      ? ` · ${new Date(item.created_at).toLocaleString()}`
-                      : ''}
-                  </small>
-                </div>
-              </div>
-
-              <div className="recon-history-actions">
-                <span className="history-count">
-                  {item.summary?.matched_count || 0} matched ·{' '}
-                  {item.summary?.difference != null
-                    ? fmt(item.summary.difference)
-                    : '—'}{' '}
-                  difference
-                </span>
                 <button
+                  className={`filter-chip-light ${filter === 'matched' ? 'active' : ''}`}
                   type="button"
-                  className="text-btn"
-                  onClick={() => openReconciliation(item.id)}
-                  disabled={reconLoading}
+                  onClick={() => setFilter('matched')}
                 >
-                  Open
+                  Matched ({summary.matched_count || 0})
+                </button>
+                <button
+                  className={`filter-chip-light ${filter === 'unmatched' ? 'active' : ''}`}
+                  type="button"
+                  onClick={() => setFilter('unmatched')}
+                >
+                  Unmatched ({(summary.bank_only_count || 0) + (summary.ledger_only_count || 0)})
+                </button>
+                <button
+                  className={`filter-chip-light ${filter === 'amount_mismatch' ? 'active' : ''}`}
+                  type="button"
+                  onClick={() => setFilter('amount_mismatch')}
+                >
+                  Mismatch ({(summary.amount_mismatch_count || 0) + (summary.date_mismatch_count || 0)})
+                </button>
+                <button
+                  className={`filter-chip-light ${filter === 'ambiguous' ? 'active' : ''}`}
+                  type="button"
+                  onClick={() => setFilter('ambiguous')}
+                >
+                  Ambiguous ({summary.ambiguous_count || 0})
                 </button>
               </div>
             </div>
-          ))}
-        </section>
-      </>
-    );
-  }
 
-  const viewTitles = {
-    overview: {
-      eyebrow: 'AUDIT WORKSPACE / OVERVIEW',
-      title: 'Financial audit intelligence',
-      description: 'Detect exceptions. Investigate evidence. Make better decisions.'
-    },
-    investigations: {
-      eyebrow: 'AUDIT WORKSPACE / INVESTIGATIONS',
-      title: 'Investigations',
-      description: 'Review flagged transactions and supporting evidence.'
-    },
-    reconciliation: {
-      eyebrow: 'AUDIT WORKSPACE / BANK RECONCILIATION',
-      title: 'Bank reconciliation',
-      description: 'Match bank statement transactions to the accounting ledger.'
-    },
-    assistant: {
-      eyebrow: 'AUDIT WORKSPACE / AI ASSISTANT',
-      title: 'AI audit assistant',
-      description: 'Explore explanations and retrieved policy sources.'
+            {filtered.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-icon">
+                  <Filter size={24} />
+                </div>
+                <strong>No transactions in this view</strong>
+                <span>Adjust the filter to review other statuses.</span>
+              </div>
+            ) : (
+              <div className="table-scroll">
+                <table className="rec-table">
+                  <thead>
+                    <tr>
+                      <th>Select</th>
+                      <th>Date</th>
+                      <th>Description</th>
+                      <th>Amount</th>
+                      <th>Reference</th>
+                      <th>Match status</th>
+                      <th>Source</th>
+                      <th>Confidence</th>
+                      <th>Note</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filtered.map((item, index) => {
+                      const bankSide = item.bank_date || item.bank_amount != null;
+                      const ledgerSide = item.ledger_date || item.ledger_amount != null;
+                      const dateValue = item.bank_date || item.ledger_date;
+                      const descriptionValue = item.bank_description || item.ledger_description;
+                      const amountValue = bankSide ? item.bank_amount : item.ledger_amount;
+                      const referenceValue = item.bank_reference || item.ledger_reference;
+                      const sourceFile = item.bank_source_file || item.ledger_source_file;
+                      const sourceRow = item.bank_source_row || item.ledger_source_row;
+                      const confidence =
+                        item.status === 'matched'
+                          ? 'High'
+                          : item.status === 'ambiguous'
+                          ? 'Unavailable'
+                          : ['amount_mismatch', 'date_mismatch'].includes(item.status)
+                          ? 'Low'
+                          : 'N/A';
+
+                      return (
+                        <tr key={item.id || index}>
+                          <td>
+                            <input type="checkbox" disabled title="No backend action to confirm matches in this view" />
+                          </td>
+                          <td className="cell-primary">{dateValue || '—'}</td>
+                          <td>
+                            <div style={{ maxWidth: 260 }}>
+                              <div className="cell-primary">{descriptionValue || '—'}</div>
+                            </div>
+                          </td>
+                          <td className="cell-primary">{amountValue == null ? '—' : fmtCurrency(amountValue)}</td>
+                          <td className="cell-muted">{referenceValue || '—'}</td>
+                          <td>
+                            <StatusBadge status={item.status} />
+                          </td>
+                          <td>
+                            <div className="source-stack">
+                              <span className="cell-primary">{sourceFile || '—'}</span>
+                              <span className="cell-muted">Row {sourceRow || '—'}</span>
+                            </div>
+                          </td>
+                          <td className="cell-muted">{confidence}</td>
+                          <td>
+                            <span className="cell-muted">{item.note || '—'}</span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+        </>
+      )}
+    </>
+  );
+}
+
+function App() {
+  const [activeView, setActiveView] = useState('overview');
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [audits, setAudits] = useState([]);
+  const [reconciliations, setReconciliations] = useState([]);
+  const [reconciliation, setReconciliation] = useState(null);
+  const [loadingOverview, setLoadingOverview] = useState(false);
+
+  const themeClass = activeView === 'reconciliation' ? 'theme-reconciliation' : 'theme-dashboard';
+
+  const loadOverview = async () => {
+    setLoadingOverview(true);
+    try {
+      const [auditRes, reconRes] = await Promise.all([
+        fetch(`${API}/api/audits`),
+        fetch(`${API}/api/reconciliations`)
+      ]);
+      if (auditRes.ok) {
+        const data = await auditRes.json();
+        setAudits(Array.isArray(data) ? data : []);
+      }
+      if (reconRes.ok) {
+        const data = await reconRes.json();
+        setReconciliations(Array.isArray(data) ? data : []);
+      }
+    } catch (err) {
+      console.error('Overview load error:', err);
+    } finally {
+      setLoadingOverview(false);
     }
   };
 
-  const currentTitle = viewTitles[activeView];
+  useEffect(() => {
+    loadOverview();
+  }, []);
+
+  useEffect(() => {
+    const handler = (event) => {
+      if (typeof event.detail === 'string' && NAV_ITEMS.some((item) => item.id === event.detail)) {
+        setActiveView(event.detail);
+        setMobileMenuOpen(false);
+      }
+    };
+    document.addEventListener('finaudit:navigate', handler);
+    return () => document.removeEventListener('finaudit:navigate', handler);
+  }, []);
+
+  const pageTitle = {
+    overview: { eyebrow: 'Dashboard', title: 'Financial Risk Overview', description: 'Monitor audits, findings, and reconciliation activity at a glance.' },
+    monitoring: { eyebrow: 'Monitoring', title: 'Transaction Monitoring', description: 'Track incoming transactions and detection signals.' },
+    investigations: { eyebrow: 'Investigations', title: 'Investigations Workspace', description: 'Review audit findings and evidence.' },
+    cases: { eyebrow: 'Cases', title: 'Case Management', description: 'Manage investigation cases and assignments.' },
+    reconciliation: { eyebrow: 'Reconciliation', title: 'Bank Reconciliation', description: 'Match bank statements to the accounting ledger.' },
+    reports: { eyebrow: 'Reports', title: 'Reports & Exports', description: 'Generate and download compliance reports.' },
+    compliance: { eyebrow: 'Compliance', title: 'Compliance Overview', description: 'Track policy adherence and review checkpoints.' },
+    settings: { eyebrow: 'Settings', title: 'Configuration', description: 'Application and integration settings.' }
+  }[activeView];
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${themeClass}`}>
       <aside className={`sidebar ${mobileMenuOpen ? 'sidebar-open' : ''}`}>
         <div className="brand">
           <div className="brand-mark">
-            <ShieldCheck size={23} />
+            <ShieldCheck size={24} />
           </div>
-          <div>
-            <b>FinAudit<span> AI</span></b>
-            <small>FINANCIAL INTELLIGENCE</small>
+          <div className="brand-text">
+            <b>
+              FinAudit<span> AI</span>
+            </b>
+            <small>Enterprise Risk Platform</small>
           </div>
         </div>
 
-        <div className="side-label">WORKSPACE</div>
-
-        <NavItem view="overview" icon={Activity}>
-          Audit overview
-        </NavItem>
-        <NavItem view="investigations" icon={FileSearch}>
-          Investigations
-        </NavItem>
-        <NavItem view="reconciliation" icon={ArrowLeftRight}>
-          Bank reconciliation
-        </NavItem>
-        <NavItem view="assistant" icon={BrainCircuit}>
-          AI assistant
-        </NavItem>
+        <div className="side-label">Navigation</div>
+        {NAV_ITEMS.map((item) => {
+          const Icon = item.icon;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              className={`nav ${activeView === item.id ? 'active' : ''}`}
+              onClick={() => {
+                setActiveView(item.id);
+                setMobileMenuOpen(false);
+              }}
+            >
+              <Icon size={18} />
+              <span>{item.label}</span>
+            </button>
+          );
+        })}
 
         <div className="sidebar-bottom">
           <div className="local-badge">
-            <span /> API-connected mode
+            <span />
+            API-connected mode
           </div>
-          <small>
-            Prototype · Review findings before taking action.
-          </small>
+          <small>Local-first · Human review required · Findings are investigation leads</small>
         </div>
       </aside>
 
       <main className="main">
         <header className="topbar">
-          <button
-            type="button"
-            className="mobile-menu-btn"
-            onClick={() => setMobileMenuOpen((open) => !open)}
-            aria-label="Toggle navigation"
-          >
-            <Menu size={21} />
-          </button>
-
-          <div>
-            <div className="eyebrow">{currentTitle.eyebrow}</div>
-            <h1>{currentTitle.title}</h1>
-            <p>{currentTitle.description}</p>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 16 }}>
+            <button
+              className="mobile-menu-btn"
+              type="button"
+              onClick={() => setMobileMenuOpen((open) => !open)}
+              aria-label="Toggle navigation"
+            >
+              <Menu size={20} />
+            </button>
+            <div className="topbar-heading">
+              <div className="eyebrow">{pageTitle.eyebrow}</div>
+              <h1>{pageTitle.title}</h1>
+              <p>{pageTitle.description}</p>
+            </div>
           </div>
-
-          <div className="status-pill">
-            <span /> API workspace
+          <div className="topbar-actions">
+            <button className="secondary-btn" type="button" onClick={loadOverview} disabled={loadingOverview}>
+              <RefreshCw size={16} className={loadingOverview ? 'spin' : ''} />
+              Refresh
+            </button>
+            <div className="status-pill">
+              <span />
+              {API.replace('http://', '').replace('https://', '')}
+            </div>
           </div>
         </header>
 
-        {activeView === 'overview' && <Overview />}
-        {activeView === 'investigations' && <Investigations />}
-        {activeView === 'reconciliation' && <Reconciliation />}
-        {activeView === 'assistant' && <Assistant />}
-
-        <footer>
-          FinAudit AI <span>•</span> Audit prototype
-          <span>•</span> Human review required
-        </footer>
+        {activeView === 'overview' && (
+          <OverviewPage
+            audits={audits}
+            reconciliations={reconciliations}
+            loading={loadingOverview}
+            onAuditCreated={loadOverview}
+            onNavigateInvestigations={() => {
+              setActiveView('investigations');
+              setMobileMenuOpen(false);
+            }}
+          />
+        )}
+        {activeView === 'monitoring' && (
+          <PlaceholderPage
+            title="Transaction Monitoring"
+            description="Real-time monitoring views are not implemented in the current backend. Audit runs are the available entry point for review."
+            icon={Activity}
+          />
+        )}
+        {activeView === 'investigations' && (
+          <PlaceholderPage
+            title="Investigations Workspace"
+            description="Use the overview audit findings or the existing assistant workflow to investigate exceptions. Case-level workflow is not yet implemented."
+            icon={FileSearch}
+          />
+        )}
+        {activeView === 'cases' && (
+          <PlaceholderPage
+            title="Case Management"
+            description="Case tracking is not implemented in the current codebase."
+            icon={Users}
+          />
+        )}
+        {activeView === 'reconciliation' && (
+          <ReconciliationPage
+            reconciliation={reconciliation}
+            setReconciliation={setReconciliation}
+            history={reconciliations}
+            loadHistory={loadOverview}
+          />
+        )}
+        {activeView === 'reports' && (
+          <PlaceholderPage
+            title="Reports & Exports"
+            description="Use Audit CSV export or Reconciliation CSV export from their respective workflows."
+            icon={BarChart3}
+          />
+        )}
+        {activeView === 'compliance' && (
+          <PlaceholderPage
+            title="Compliance"
+            description="Compliance policies exist in the RAG layer for explanations, but a compliance dashboard is not implemented."
+            icon={ShieldCheck}
+          />
+        )}
+        {activeView === 'settings' && (
+          <PlaceholderPage
+            title="Settings"
+            description="Configuration is handled via environment variables and existing Vite API configuration."
+            icon={Settings}
+          />
+        )}
       </main>
     </div>
   );
