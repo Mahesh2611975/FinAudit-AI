@@ -156,11 +156,13 @@ def list_audits(db: Session = Depends(get_db)):
     return [
         {
             "id": run.id,
+            "audit_id": run.id,
             "filename": run.filename,
             "files": _files_for_run(run),
             "row_count": run.row_count,
             "finding_count": run.finding_count,
             "created_at": run.created_at.isoformat() if run.created_at else None,
+            "findings": [finding_dict(item) for item in run.findings],
         }
         for run in runs
     ]
