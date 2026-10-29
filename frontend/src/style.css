@@ -187,3 +187,211 @@
   font-size: 13px;
   line-height: 1.6;
 }
+
+/* Bank reconciliation */
+.recon-upload-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.recon-dropzone {
+  min-height: 170px;
+}
+
+.recon-controls {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.recon-tolerance {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: #b7c6e6;
+  font-size: 11px;
+}
+
+.recon-tolerance input {
+  width: 110px;
+  padding: 9px 10px;
+  border: 1px solid #2b4165;
+  border-radius: 8px;
+  background: #0b1425;
+  color: #eaf0ff;
+}
+
+.recon-summary-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.recon-subtotals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin: -8px 0 18px;
+  color: #93a5c9;
+  font-size: 11px;
+}
+
+.recon-subtotals b {
+  color: #dce7ff;
+}
+
+.recon-results-panel {
+  overflow: hidden;
+}
+
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.filter-chip {
+  border: 1px solid #2b3d61;
+  border-radius: 999px;
+  padding: 7px 10px;
+  background: #111d33;
+  color: #b7c6e6;
+  font-size: 10px;
+  text-transform: capitalize;
+  cursor: pointer;
+}
+
+.filter-chip.active {
+  border-color: #7da4ff;
+  color: #ffffff;
+  background: linear-gradient(90deg, #294280, #22325e);
+}
+
+.recon-table-wrap {
+  overflow-x: auto;
+}
+
+.recon-table {
+  width: 100%;
+  min-width: 980px;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.recon-table thead th {
+  text-align: left;
+  padding: 10px 12px;
+  border-bottom: 1px solid #24314d;
+  color: #7f90b5;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  font-size: 9px;
+}
+
+.recon-table tbody td {
+  padding: 12px;
+  border-bottom: 1px solid #202a42;
+  vertical-align: top;
+}
+
+.recon-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.status-badge {
+  display: inline-flex;
+  padding: 5px 8px;
+  border-radius: 6px;
+  text-transform: capitalize;
+  font-size: 9px;
+  letter-spacing: 0.4px;
+}
+
+.status-matched {
+  background: #17372f;
+  color: #81e2b8;
+}
+
+.status-bank_only {
+  background: #3a2c21;
+  color: #ffd18a;
+}
+
+.status-ledger_only {
+  background: #3a2c21;
+  color: #ffd18a;
+}
+
+.status-amount_mismatch {
+  background: #43232e;
+  color: #ff9eae;
+}
+
+.status-date_mismatch {
+  background: #33263d;
+  color: #d7b8ff;
+}
+
+.status-ambiguous {
+  background: #2a3047;
+  color: #c9d5f6;
+}
+
+.pair-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #c7d4f0;
+}
+
+.source-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #8fa0c9;
+}
+
+.note-cell {
+  color: #9aa9c9;
+  line-height: 1.6;
+  max-width: 320px;
+}
+
+.recon-history-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+@media (max-width: 1100px) {
+  .recon-upload-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .recon-summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 700px) {
+  .recon-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .recon-tolerance input {
+    width: 100%;
+  }
+
+  .recon-summary-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .recon-history-actions {
+    flex-direction: column;
+    align-items: flex-start;
+    width: 100%;
+  }
+}
