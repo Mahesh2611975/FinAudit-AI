@@ -136,6 +136,13 @@ def _parse_date(value) -> str | None:
     if isinstance(value, pd.Timestamp):
         return value.date().isoformat()
     text = _text(value)
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", text):
+        try:
+            parsed = pd.to_datetime(text, errors="coerce", format="%Y-%m-%d")
+            if not pd.isna(parsed):
+                return parsed.date().isoformat()
+        except (TypeError, ValueError, OverflowError):
+            pass
     try:
         parsed = pd.to_datetime(text, errors="coerce", dayfirst=True)
     except (TypeError, ValueError, OverflowError):

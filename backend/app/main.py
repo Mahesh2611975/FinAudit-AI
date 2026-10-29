@@ -2,7 +2,7 @@ import json
 from io import BytesIO, StringIO
 
 import pandas as pd
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import inspect, text
@@ -12,7 +12,8 @@ from .audit_engine import detect_findings
 from .csv_normalizer import normalize_files, safe_filename
 from .database import Base, engine, get_db
 from .llm import explain_finding
-from .models import AuditRun, Finding
+from .models import AuditRun, Finding, ReconciliationResult, ReconciliationRun
+from .reconciliation import ReconciliationError, reconcile_files
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_FILES = 20
@@ -213,4 +214,228 @@ def export_audit(audit_id: int, db: Session = Depends(get_db)):
         iter([output.getvalue()]),
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=finaudit_findings_{audit_id}.csv"},
+    )
+
+
+async def _read_upload_csv(upload: UploadFile, label: str) -> tuple[str, pd.DataFrame]:
+    filename = safe_filename(upload.filename)
+    if not filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail=f"{label}: upload a .csv file.")
+    raw = await upload.read()
+    if not raw:
+        raise HTTPException(status_code=422, detail=f"{label}: CSV is empty.")
+    if len(raw) > MAX_FILE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{label}: CSV must be 5 MB or smaller.",
+        )
+    try:
+        frame = pd.read_csv(BytesIO(raw), encoding="utf-8-sig")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{label}: could not read CSV. Check that it is a comma-separated "
+                "UTF-8 file."
+            ),
+        ) from exc
+    return filename, frame
+
+
+def reconciliation_summary(run: ReconciliationRun) -> dict:
+    return {
+        "bank_total": run.bank_total,
+        "ledger_total": run.ledger_total,
+        "matched_total": run.matched_total,
+        "bank_unmatched_total": run.bank_unmatched_total,
+        "ledger_unmatched_total": run.ledger_unmatched_total,
+        "unmatched_total": run.unmatched_total,
+        "difference": run.difference,
+        "result_count": run.result_count,
+        "matched_count": run.matched_count,
+        "bank_only_count": run.bank_only_count,
+        "ledger_only_count": run.ledger_only_count,
+        "amount_mismatch_count": run.amount_mismatch_count,
+        "date_mismatch_count": run.date_mismatch_count,
+        "ambiguous_count": run.ambiguous_count,
+    }
+
+
+def reconciliation_result_dict(item: ReconciliationResult) -> dict:
+    return {
+        "id": item.id,
+        "run_id": item.run_id,
+        "status": item.status,
+        "bank_date": item.bank_date,
+        "bank_amount": item.bank_amount,
+        "bank_direction": item.bank_direction,
+        "bank_reference": item.bank_reference,
+        "bank_description": item.bank_description,
+        "bank_source_file": item.bank_source_file,
+        "bank_source_row": item.bank_source_row,
+        "ledger_date": item.ledger_date,
+        "ledger_amount": item.ledger_amount,
+        "ledger_direction": item.ledger_direction,
+        "ledger_reference": item.ledger_reference,
+        "ledger_description": item.ledger_description,
+        "ledger_source_file": item.ledger_source_file,
+        "ledger_source_row": item.ledger_source_row,
+        "amount_difference": item.amount_difference,
+        "date_difference_days": item.date_difference_days,
+        "note": item.note,
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+    }
+
+
+RECONCILIATION_EXPORT_COLUMNS = [
+    "id",
+    "status",
+    "bank_date",
+    "bank_amount",
+    "bank_direction",
+    "bank_reference",
+    "bank_description",
+    "bank_source_file",
+    "bank_source_row",
+    "ledger_date",
+    "ledger_amount",
+    "ledger_direction",
+    "ledger_reference",
+    "ledger_description",
+    "ledger_source_file",
+    "ledger_source_row",
+    "amount_difference",
+    "date_difference_days",
+    "note",
+]
+
+
+@app.post("/api/reconciliations")
+async def create_reconciliation(
+    bank_file: UploadFile = File(...),
+    ledger_file: UploadFile = File(...),
+    date_tolerance_days: int = Form(3),
+    db: Session = Depends(get_db),
+):
+    if date_tolerance_days < 0 or date_tolerance_days > 365:
+        raise HTTPException(
+            status_code=400,
+            detail="date_tolerance_days must be between 0 and 365.",
+        )
+
+    bank = await _read_upload_csv(bank_file, "Bank statement")
+    ledger = await _read_upload_csv(ledger_file, "Accounting ledger")
+
+    try:
+        outcome = reconcile_files(
+            bank,
+            ledger,
+            date_tolerance_days=date_tolerance_days,
+        )
+    except ReconciliationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors) from exc
+
+    summary = outcome.summary
+    run = ReconciliationRun(
+        bank_filename=bank[0],
+        ledger_filename=ledger[0],
+        date_tolerance_days=date_tolerance_days,
+        bank_total=summary["bank_total"],
+        ledger_total=summary["ledger_total"],
+        matched_total=summary["matched_total"],
+        bank_unmatched_total=summary["bank_unmatched_total"],
+        ledger_unmatched_total=summary["ledger_unmatched_total"],
+        unmatched_total=summary["unmatched_total"],
+        difference=summary["difference"],
+        result_count=summary["result_count"],
+        matched_count=summary["matched_count"],
+        bank_only_count=summary["bank_only_count"],
+        ledger_only_count=summary["ledger_only_count"],
+        amount_mismatch_count=summary["amount_mismatch_count"],
+        date_mismatch_count=summary["date_mismatch_count"],
+        ambiguous_count=summary["ambiguous_count"],
+    )
+    db.add(run)
+    db.flush()
+    for item in outcome.results:
+        db.add(ReconciliationResult(run_id=run.id, **item))
+    db.commit()
+    db.refresh(run)
+
+    return {
+        "reconciliation_id": run.id,
+        "bank_file": run.bank_filename,
+        "ledger_file": run.ledger_filename,
+        "date_tolerance_days": run.date_tolerance_days,
+        "summary": reconciliation_summary(run),
+        "results": [reconciliation_result_dict(item) for item in run.results],
+        "warnings": outcome.warnings,
+    }
+
+
+@app.get("/api/reconciliations")
+def list_reconciliations(db: Session = Depends(get_db)):
+    runs = (
+        db.query(ReconciliationRun)
+        .order_by(ReconciliationRun.id.desc())
+        .limit(50)
+        .all()
+    )
+    return [
+        {
+            "id": run.id,
+            "reconciliation_id": run.id,
+            "bank_file": run.bank_filename,
+            "ledger_file": run.ledger_filename,
+            "files": [run.bank_filename, run.ledger_filename],
+            "date_tolerance_days": run.date_tolerance_days,
+            "summary": reconciliation_summary(run),
+            "created_at": run.created_at.isoformat() if run.created_at else None,
+        }
+        for run in runs
+    ]
+
+
+@app.get("/api/reconciliations/{reconciliation_id}")
+def get_reconciliation(reconciliation_id: int, db: Session = Depends(get_db)):
+    run = (
+        db.query(ReconciliationRun)
+        .filter(ReconciliationRun.id == reconciliation_id)
+        .first()
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Reconciliation not found")
+    return {
+        "reconciliation_id": run.id,
+        "bank_file": run.bank_filename,
+        "ledger_file": run.ledger_filename,
+        "date_tolerance_days": run.date_tolerance_days,
+        "summary": reconciliation_summary(run),
+        "results": [reconciliation_result_dict(item) for item in run.results],
+    }
+
+
+@app.get("/api/reconciliations/{reconciliation_id}/export.csv")
+def export_reconciliation(reconciliation_id: int, db: Session = Depends(get_db)):
+    run = (
+        db.query(ReconciliationRun)
+        .filter(ReconciliationRun.id == reconciliation_id)
+        .first()
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Reconciliation not found")
+
+    rows = [reconciliation_result_dict(item) for item in run.results]
+    output = StringIO()
+    pd.DataFrame(rows, columns=RECONCILIATION_EXPORT_COLUMNS).to_csv(
+        output, index=False
+    )
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=finaudit_reconciliation_{reconciliation_id}.csv"
+            )
+        },
     )
