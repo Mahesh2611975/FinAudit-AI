@@ -8,14 +8,15 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
+from .analytics import AnalyticsInputError, monthly_analysis, monthly_comparison
 from .audit_engine import detect_findings
 from .csv_normalizer import normalize_files, safe_filename
 from .database import Base, engine, get_db
 from .llm import explain_finding
 from .models import AuditRun, Finding, ReconciliationResult, ReconciliationRun, TransactionRecord, InvestigationRun, InvestigationCase
+from .invoice_api import router as invoice_router
 from .reconciliation import ReconciliationError, reconcile_files
 from .category import categorize_transaction
-from .finance_utils import money_to_decimal, round_currency
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_FILES = 20
@@ -31,6 +32,18 @@ def ensure_schema() -> None:
     additions = {
         "audit_runs": {"source_files": "TEXT"},
         "findings": {"source_file": "VARCHAR(255)"},
+        "investigation_runs": {
+            "events": "TEXT",
+            "evidence": "TEXT",
+            "selected_year": "INTEGER",
+            "selected_month": "INTEGER",
+            "audit_run_id": "INTEGER",
+            "reconciliation_id": "INTEGER",
+            "case_id": "INTEGER",
+            "started_at": "DATETIME",
+            "finished_at": "DATETIME",
+            "duration_ms": "INTEGER",
+        },
     }
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
@@ -48,6 +61,7 @@ ensure_schema()
 
 app = FastAPI(title="FinAudit AI", version="1.0.0", description="Local-first financial audit exception analysis with RAG-assisted explanations.")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.include_router(invoice_router)
 
 
 @app.get("/")
@@ -478,74 +492,40 @@ def export_reconciliation(reconciliation_id: int, db: Session = Depends(get_db))
 # Analytics endpoints
 @app.get("/api/analytics/monthly/summary")
 def analytics_monthly_summary(year: int, month: int, db: Session = Depends(get_db)):
-    if month < 1 or month > 12:
-        raise HTTPException(status_code=400, detail="month must be between 1 and 12")
-    prefix = f"{year:04d}-{month:02d}"
-    txns = db.query(TransactionRecord).filter(TransactionRecord.date.like(f"{prefix}%")).all()
-    from decimal import Decimal
-
-    total_spend = Decimal("0")
-    total_received = Decimal("0")
-    count = 0
-    outgoing = []
-    for t in txns:
-        count += 1
-        amt = money_to_decimal(t.amount)
-        if t.direction == "debit" or (t.signed_amount is not None and float(t.signed_amount) < 0) or amt > 0 and t.direction != "credit":
-            # treat as spend if debit or negative signed; be careful not to double count
-            pass
-        # normalize
-        if t.direction == "credit" or (t.signed_amount is not None and float(t.signed_amount) > 0 and amt >= 0 and t.direction == "credit"):
-            total_received += abs(amt)
-        elif t.direction == "debit":
-            total_spend += abs(amt)
-            outgoing.append(abs(float(amt)))
-        else:
-            if amt < 0:
-                total_spend += abs(amt)
-                outgoing.append(abs(float(amt)))
-            elif amt > 0:
-                total_received += amt
-    net = total_received - total_spend
-    avg_out = sum(outgoing) / len(outgoing) if outgoing else 0
-    largest = max(outgoing) if outgoing else 0
+    try:
+        analysis = monthly_analysis(db, year, month)
+    except AnalyticsInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    summary = analysis["summary"]
     return {
         "year": year,
         "month": month,
-        "total_spend": float(round_currency(total_spend)),
-        "total_received": float(round_currency(total_received)),
-        "net_cash_flow": float(round_currency(net)),
-        "transaction_count": count,
-        "average_outgoing": float(round(avg_out, 2)),
-        "largest_expense": float(round(largest, 2)),
+        "total_spend": summary["total_spending"],
+        "total_received": summary["total_credits"],
+        "total_spending": summary["total_spending"],
+        "total_credits": summary["total_credits"],
+        "net_cash_flow": summary["net_cash_flow"],
+        "transaction_count": summary["transaction_count"],
+        "spending_transaction_count": summary["spending_transaction_count"],
+        "credit_transaction_count": summary["credit_transaction_count"],
+        "average_outgoing": summary["average_outgoing"],
+        "largest_expense": summary["largest_expense"],
+        "has_transactions": analysis["has_transactions"],
+        "uncategorized_count": summary["uncategorized_count"],
+        "missing_direction_count": summary["missing_direction_count"],
+        "missing_amount_count": summary["missing_amount_count"],
+        "linked_audit_run_ids": analysis["linked_audit_run_ids"],
+        "data_quality_notes": analysis["data_quality"]["notes"],
     }
 
 
 @app.get("/api/analytics/monthly/categories")
 def analytics_monthly_categories(year: int, month: int, db: Session = Depends(get_db)):
-    if month < 1 or month > 12:
-        raise HTTPException(status_code=400, detail="month must be between 1 and 12")
-    prefix = f"{year:04d}-{month:02d}"
-    txns = db.query(TransactionRecord).filter(TransactionRecord.date.like(f"{prefix}%")).all()
-    from decimal import Decimal
-    buckets = {}
-    for t in txns:
-        cat = t.category or "Uncategorized"
-        if cat == "Transfers":
-            continue  # do not count internal transfers as consumption by default
-        amt = money_to_decimal(t.amount)
-        if t.direction == "debit" or (t.signed_amount is not None and float(t.signed_amount) < 0):
-            buckets[cat] = buckets.get(cat, Decimal("0")) + abs(amt)
-        elif t.direction == "credit":
-            continue
-        else:
-            if amt < 0:
-                buckets[cat] = buckets.get(cat, Decimal("0")) + abs(amt)
-            else:
-                continue
-    result = [{"category": k, "amount": float(round_currency(v))} for k, v in buckets.items()]
-    result.sort(key=lambda x: x["amount"], reverse=True)
-    return result
+    try:
+        analysis = monthly_analysis(db, year, month)
+    except AnalyticsInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return analysis["category_totals"]
 
 
 @app.get("/api/analytics/transactions")
@@ -584,34 +564,10 @@ def analytics_transactions(year: int | None = None, month: int | None = None, ca
 
 @app.get("/api/analytics/monthly/comparison")
 def analytics_monthly_comparison(year: int, month: int, db: Session = Depends(get_db)):
-    if month < 1 or month > 12:
-        raise HTTPException(status_code=400, detail="month must be between 1 and 12")
-    from decimal import Decimal
-
-    def month_stats(y, m):
-        prefix = f"{y:04d}-{m:02d}"
-        txns = db.query(TransactionRecord).filter(TransactionRecord.date.like(f"{prefix}%")).all()
-        spend = Decimal("0")
-        recv = Decimal("0")
-        for t in txns:
-            amt = money_to_decimal(t.amount)
-            if t.direction == "debit":
-                spend += abs(amt)
-            elif t.direction == "credit":
-                recv += abs(amt)
-            else:
-                if amt < 0:
-                    spend += abs(amt)
-                elif amt > 0:
-                    recv += amt
-        return {"spend": float(round_currency(spend)), "received": float(round_currency(recv)), "net": float(round_currency(recv - spend))}
-
-    cur = month_stats(year, month)
-    if month == 1:
-        prev = month_stats(year - 1, 12)
-    else:
-        prev = month_stats(year, month - 1)
-    return {"current": cur, "previous": prev}
+    try:
+        return monthly_comparison(db, year, month)
+    except AnalyticsInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/analytics/export.csv")
@@ -651,6 +607,9 @@ _orch = MultiAgentOrchestrator()
 @app.post("/api/agents/run")
 def run_agents(payload: dict, db: Session = Depends(get_db)):
     try:
+        if payload.get("task_type") == "invoice_audit":
+            from .invoice_api import _invoice_orch
+            return _invoice_orch.run(payload, persist=True)
         result = _orch.run(payload, persist=True)
         return result
     except Exception as exc:
@@ -666,10 +625,19 @@ def list_agent_runs(limit: int = 50, db: Session = Depends(get_db)):
             "name": r.name,
             "task_type": r.task_type,
             "status": r.status,
+            "selected_year": r.selected_year,
+            "selected_month": r.selected_month,
+            "audit_run_id": r.audit_run_id,
+            "reconciliation_id": r.reconciliation_id,
+            "case_id": r.case_id,
+            "duration_ms": r.duration_ms,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "finished_at": r.finished_at.isoformat() if r.finished_at else None,
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "updated_at": r.updated_at.isoformat() if r.updated_at else None,
             "timeline": r.timeline,
             "errors": r.errors,
+            "evidence_count": len(r.evidence or []),
         }
         for r in runs
     ]
@@ -685,10 +653,20 @@ def get_agent_run(run_id: int, db: Session = Depends(get_db)):
         "name": r.name,
         "task_type": r.task_type,
         "status": r.status,
+        "selected_year": r.selected_year,
+        "selected_month": r.selected_month,
+        "audit_run_id": r.audit_run_id,
+        "reconciliation_id": r.reconciliation_id,
+        "case_id": r.case_id,
         "input_state": r.input_state,
         "output_state": r.output_state,
         "timeline": r.timeline,
+        "events": r.events,
+        "evidence": r.evidence,
         "errors": r.errors,
+        "started_at": r.started_at.isoformat() if r.started_at else None,
+        "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+        "duration_ms": r.duration_ms,
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "updated_at": r.updated_at.isoformat() if r.updated_at else None,
     }

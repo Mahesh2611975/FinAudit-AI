@@ -11,3 +11,4 @@ langgraph>=0.2.0
 groq
 python-dotenv
 openpyxl>=3.1.0
+pypdf>=5.0,<7.0
