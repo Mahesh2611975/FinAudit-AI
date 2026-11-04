@@ -1,11 +1,11 @@
 import json
+import os
 from io import BytesIO, StringIO
 
 import pandas as pd
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
 from .analytics import AnalyticsInputError, monthly_analysis, monthly_comparison
@@ -13,55 +13,52 @@ from .audit_engine import detect_findings
 from .csv_normalizer import normalize_files, safe_filename
 from .database import Base, engine, get_db
 from .llm import explain_finding
+from .migrations import backup_sqlite_database, ensure_database_schema, has_pending_schema_changes
 from .models import AuditRun, Finding, ReconciliationResult, ReconciliationRun, TransactionRecord, InvestigationRun, InvestigationCase
 from .invoice_api import router as invoice_router
+from .risk_api import router as risk_router
 from .reconciliation import ReconciliationError, reconcile_files
 from .category import categorize_transaction
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_FILES = 20
 
-Base.metadata.create_all(bind=engine)
+
+def _optional_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+if has_pending_schema_changes(engine, Base.metadata):
+    backup_sqlite_database(engine, label="pre-migration")
+SCHEMA_REPORT = ensure_database_schema(engine, Base.metadata)
 
 
-def ensure_schema() -> None:
-    """Add columns introduced after the initial SQLite database was created."""
-    if engine.dialect.name != "sqlite":
-        return
+def _cors_origins() -> list[str]:
+    configured = os.getenv("FINAUDIT_CORS_ORIGINS", "")
+    origins = [item.strip() for item in configured.split(",") if item.strip()]
+    if origins:
+        return origins
+    return [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+    ]
 
-    additions = {
-        "audit_runs": {"source_files": "TEXT"},
-        "findings": {"source_file": "VARCHAR(255)"},
-        "investigation_runs": {
-            "events": "TEXT",
-            "evidence": "TEXT",
-            "selected_year": "INTEGER",
-            "selected_month": "INTEGER",
-            "audit_run_id": "INTEGER",
-            "reconciliation_id": "INTEGER",
-            "case_id": "INTEGER",
-            "started_at": "DATETIME",
-            "finished_at": "DATETIME",
-            "duration_ms": "INTEGER",
-        },
-    }
-    inspector = inspect(engine)
-    tables = set(inspector.get_table_names())
-    with engine.begin() as connection:
-        for table, columns in additions.items():
-            if table not in tables:
-                continue
-            existing = {column["name"] for column in inspector.get_columns(table)}
-            for name, ddl in columns.items():
-                if name not in existing:
-                    connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
-
-
-ensure_schema()
 
 app = FastAPI(title="FinAudit AI", version="1.0.0", description="Local-first financial audit exception analysis with RAG-assisted explanations.")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=_cors_origins(), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.include_router(invoice_router)
+app.include_router(risk_router)
 
 
 @app.get("/")
@@ -163,6 +160,12 @@ async def create_audit(
                 account=str(row.get("account") or "") or None,
                 upi_ref=str(row.get("upi_ref") or "") or None,
                 reference=str(row.get("upi_ref") or "") or None,
+                channel=str(row.get("channel") or "") or None,
+                country=str(row.get("country") or "") or None,
+                state=str(row.get("state") or "") or None,
+                city=str(row.get("city") or "") or None,
+                latitude=_optional_float(row.get("latitude")),
+                longitude=_optional_float(row.get("longitude")),
                 source_file=str(row.get("source_file") or "") or None,
                 source_row=int(row.get("source_row")) if row.get("source_row") is not None else None,
                 duplicate_key=str(row.get("duplicate_key") or "") or None,

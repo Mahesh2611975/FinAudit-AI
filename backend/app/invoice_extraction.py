@@ -34,6 +34,7 @@ INVOICE_ALIASES = {
     "tax": {"tax_amount", "tax", "gst_amount", "vat_amount"},
     "total": {"total_amount", "total", "invoice_total", "grand_total", "gross_amount", "amount"},
     "paid": {"paid_amount", "amount_paid", "paid"},
+    "paid_minor": {"paid_minor", "amount_paid_minor"},
     "subtotal_minor": {"subtotal_minor", "taxable_amount_minor", "net_amount_minor"},
     "tax_minor": {"tax_minor", "tax_amount_minor", "gst_amount_minor"},
     "total_minor": {"total_minor", "total_amount_minor", "invoice_total_minor"},
@@ -192,7 +193,7 @@ def extract_tabular_invoices(filename: str, raw: bytes) -> list[dict[str, Any]]:
             "subtotal_minor": _first_minor(rows, "subtotal_minor", "subtotal"),
             "tax_minor": _first_minor(rows, "tax_minor", "tax"),
             "total_minor": _first_minor(rows, "total_minor", "total"),
-            "paid_minor": _first_minor(rows, "paid", None),
+            "paid_minor": _first_minor(rows, "paid_minor", "paid"),
             "source_filename": filename,
             "source_rows": [row_number for row_number, _ in rows],
         }
@@ -244,9 +245,19 @@ def extract_tabular_invoices(filename: str, raw: bytes) -> list[dict[str, Any]]:
     return invoices
 
 
+def _minor_units(value: Any) -> int | None:
+    """Parse an explicitly minor-unit column without multiplying by 100."""
+    amount = _decimal(value)
+    if amount is None:
+        return None
+    if amount != amount.to_integral_value():
+        return None
+    return int(amount)
+
+
 def _first_minor(rows: list[tuple[int, dict[str, Any]]], minor_key: str, amount_key: str | None) -> int | None:
     for _, row in rows:
-        value = to_minor(row.get(minor_key)) if minor_key else None
+        value = _minor_units(row.get(minor_key)) if minor_key else None
         if value is None and amount_key:
             value = to_minor(row.get(amount_key))
         if value is not None:

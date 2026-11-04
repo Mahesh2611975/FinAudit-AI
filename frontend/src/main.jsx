@@ -20,6 +20,7 @@ import {
   RefreshCw,
   Search,
   Settings,
+  ShieldAlert,
   ShieldCheck,
   Upload,
   Users,
@@ -52,6 +53,7 @@ import {
   YAxis
 } from 'recharts';
 import './style.css';
+import RiskIntelligence from './RiskIntelligence';
 
 const API = (
   import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
@@ -60,6 +62,7 @@ const API = (
 const NAV_ITEMS = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
   { id: 'analytics', label: 'Financial Analytics', icon: BarChart3 },
+  { id: 'risk-intelligence', label: 'Risk Intelligence', icon: ShieldAlert },
   { id: 'monitoring', label: 'Monitoring', icon: Activity },
   { id: 'investigations', label: 'Investigations', icon: FileSearch },
   { id: 'cases', label: 'Cases', icon: Users },
@@ -1846,6 +1849,7 @@ function App() {
   const pageTitle = {
     overview: { eyebrow: 'Dashboard', title: 'Financial Risk Overview', description: 'Monitor audits, findings, and reconciliation activity at a glance.' },
     analytics: { eyebrow: 'Analytics', title: 'Financial Analytics', description: 'Monthly spending, categories, trends and transaction details from actual data.' },
+    'risk-intelligence': { eyebrow: 'Risk Intelligence', title: 'Financial Risk & Fraud Intelligence', description: 'Deterministic risk scoring, anomaly alerts, channel analytics, trends and geography from stored records.' },
     monitoring: { eyebrow: 'Monitoring', title: 'Audit Activity Monitoring', description: 'Historical audit runs, findings by risk/type, and activity.' },
     investigations: { eyebrow: 'Investigations', title: 'Investigations', description: 'Findings with source evidence and provenance.' },
     cases: { eyebrow: 'Cases', title: 'Investigation Cases', description: 'Create and manage cases linked to findings with status/notes.' },
@@ -1986,6 +1990,9 @@ function App() {
         )}
         {activeView === 'analytics' && (
           <AnalyticsPage />
+        )}
+        {activeView === 'risk-intelligence' && (
+          <RiskIntelligence apiBase={API} />
         )}
         {activeView === 'agents' && (
           <AgentsPage />

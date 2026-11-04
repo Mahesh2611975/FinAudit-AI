@@ -104,6 +104,12 @@ class TransactionRecord(Base):
     source_file = Column(String(255), nullable=True)
     source_row = Column(Integer, nullable=True)
     duplicate_key = Column(String(512), nullable=True)
+    channel = Column(String(60), nullable=True, index=True)
+    country = Column(String(100), nullable=True, index=True)
+    state = Column(String(100), nullable=True, index=True)
+    city = Column(String(100), nullable=True, index=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     audit_run = relationship("AuditRun", back_populates="transactions")
 
@@ -408,3 +414,78 @@ class InvoiceReviewAction(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     discrepancy = relationship("InvoiceDiscrepancy", back_populates="review_actions")
+
+
+# ---------------------------------------------------------------------------
+# Financial risk and fraud intelligence centre.
+# Alerts are deterministic anomaly indicators. They are not fraud convictions.
+# ---------------------------------------------------------------------------
+
+
+class RiskAnalysisRun(Base):
+    __tablename__ = "risk_analysis_runs"
+    id = Column(Integer, primary_key=True, index=True)
+    status = Column(String(30), nullable=False, default="running", index=True)
+    triggered_by = Column(String(80), nullable=True)
+    thresholds = Column(JSON, nullable=True)
+    transaction_count = Column(Integer, default=0)
+    alert_count = Column(Integer, default=0)
+    critical_count = Column(Integer, default=0)
+    high_count = Column(Integer, default=0)
+    medium_count = Column(Integer, default=0)
+    low_count = Column(Integer, default=0)
+    errors = Column(JSON, nullable=True)
+    started_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    finished_at = Column(DateTime, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class RiskAlert(Base):
+    __tablename__ = "risk_alerts"
+    id = Column(Integer, primary_key=True, index=True)
+    alert_code = Column(String(60), nullable=False, unique=True, index=True)
+    fingerprint = Column(String(128), nullable=False, unique=True, index=True)
+    source_type = Column(String(40), nullable=False, index=True)
+    source_record_id = Column(Integer, nullable=True, index=True)
+    transaction_id = Column(String(120), nullable=True, index=True)
+    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True, index=True)
+    vendor_id = Column(Integer, ForeignKey("vendors.id"), nullable=True, index=True)
+    vendor_name = Column(String(255), nullable=True, index=True)
+    risk_category = Column(String(80), nullable=False, index=True)
+    severity = Column(String(20), nullable=False, index=True)
+    risk_score = Column(Integer, nullable=False)
+    amount_value = Column(Float, nullable=True)
+    currency = Column(String(3), nullable=True)
+    channel = Column(String(60), nullable=True, index=True)
+    explanation = Column(Text, nullable=False)
+    evidence = Column(JSON, nullable=True)
+    country = Column(String(100), nullable=True, index=True)
+    state = Column(String(100), nullable=True, index=True)
+    city = Column(String(100), nullable=True, index=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    detected_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    review_status = Column(String(30), nullable=False, default="open", index=True)
+    assigned_to = Column(String(255), nullable=True)
+    reviewer_comments = Column(Text, nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+    last_analysis_run_id = Column(Integer, ForeignKey("risk_analysis_runs.id"), nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    events = relationship("RiskAlertEvent", back_populates="alert", cascade="all, delete-orphan")
+
+
+class RiskAlertEvent(Base):
+    __tablename__ = "risk_alert_events"
+    id = Column(Integer, primary_key=True, index=True)
+    alert_id = Column(Integer, ForeignKey("risk_alerts.id"), nullable=False, index=True)
+    action = Column(String(40), nullable=False)
+    actor = Column(String(255), nullable=True)
+    comment = Column(Text, nullable=True)
+    previous_status = Column(String(30), nullable=True)
+    new_status = Column(String(30), nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+    alert = relationship("RiskAlert", back_populates="events")

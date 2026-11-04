@@ -1,0 +1,3 @@
+receipt_number,purchase_order_number,receipt_date,received_by,status,item_code,quantity_received,quantity_accepted,quantity_rejected
+GR-ACME-1001,PO-ACME-1001,2099-01-09,Warehouse,received,A1,100,100,0
+GR-NORTH-2001,PO-NORTH-2001,2099-01-14,Warehouse,received,B1,20,18,2

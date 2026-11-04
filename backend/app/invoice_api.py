@@ -24,6 +24,7 @@ from .invoice_audit import (
     vendor_analytics,
 )
 from .invoice_extraction import (
+    MAX_INVOICE_FILE_BYTES,
     InvoiceExtractionError,
     extract_invoices,
     store_document,

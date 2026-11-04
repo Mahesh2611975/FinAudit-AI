@@ -34,10 +34,59 @@ CANONICAL_COLUMNS = [
     "upi_ref",
     "balance_after",
     "source_sms",
+    "channel",
+    "country",
+    "state",
+    "city",
+    "latitude",
+    "longitude",
     "source_file",
     "source_row",
     "duplicate_key",
 ]
+
+CHANNEL_ALIASES = {
+    "onlinebanking": "Online Banking",
+    "internetbanking": "Online Banking",
+    "netbanking": "Online Banking",
+    "mobilebanking": "Mobile Banking",
+    "mobileapp": "Mobile Banking",
+    "bankingapp": "Mobile Banking",
+    "atm": "ATM",
+    "atmcash": "ATM",
+    "cashwithdrawal": "ATM",
+    "upi": "UPI",
+    "neft": "NEFT",
+    "rtgs": "RTGS",
+    "imps": "IMPS",
+    "wire": "Wire Transfer",
+    "wiretransfer": "Wire Transfer",
+    "swift": "Wire Transfer",
+    "pos": "POS",
+    "pointofsale": "POS",
+    "cardpos": "POS",
+}
+
+CHANNEL_KEYWORDS = [
+    ("Wire Transfer", ("wire transfer", "wire", "swift")),
+    ("Online Banking", ("online banking", "internet banking", "net banking", "netbanking")),
+    ("Mobile Banking", ("mobile banking", "mobile app", "banking app")),
+    ("UPI", ("upi", "vpa", "gpay", "google pay", "phonepe", "paytm")),
+    ("NEFT", ("neft",)),
+    ("RTGS", ("rtgs",)),
+    ("IMPS", ("imps",)),
+    ("POS", ("pos", "point of sale", "card swipe")),
+    ("ATM", ("atm", "cash withdrawal")),
+]
+
+CHANNEL_COLUMNS = ("channel", "payment_channel", "transaction_channel", "payment_mode", "mode")
+LOCATION_COLUMNS = {
+    "country": ("country", "country_name"),
+    "state": ("state", "state_name", "province", "region"),
+    "city": ("city", "city_name", "town", "location_city"),
+    "latitude": ("latitude", "lat"),
+    "longitude": ("longitude", "lng", "lon", "long"),
+}
 
 CREDIT_TYPES = {
     "credit",
@@ -105,6 +154,52 @@ def _text(value) -> str:
 
 def _is_blank(value) -> bool:
     return _text(value) == ""
+
+
+def _first_value(row, names: tuple[str, ...]) -> str:
+    for name in names:
+        value = _text(row.get(name, ""))
+        if value:
+            return value
+    return ""
+
+
+def _canonical_channel(raw: str) -> str | None:
+    text = _text(raw)
+    if not text:
+        return None
+    key = re.sub(r"[^a-z]", "", text.lower())
+    if key in CHANNEL_ALIASES:
+        return CHANNEL_ALIASES[key]
+    lowered = text.lower()
+    for channel, keywords in CHANNEL_KEYWORDS:
+        if any(keyword in lowered for keyword in keywords):
+            return channel
+    return None
+
+
+def _infer_channel(row) -> str:
+    explicit = _canonical_channel(_first_value(row, CHANNEL_COLUMNS))
+    return explicit or "Unknown"
+
+
+def _location_value(row) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for field, names in LOCATION_COLUMNS.items():
+        raw = _first_value(row, names)
+        if field in {"latitude", "longitude"}:
+            number = _parse_amount(raw) if raw else None
+            if number is None:
+                values[field] = None
+            elif field == "latitude" and -90 <= number <= 90:
+                values[field] = number
+            elif field == "longitude" and -180 <= number <= 180:
+                values[field] = number
+            else:
+                values[field] = None
+        else:
+            values[field] = raw[:100]
+    return values
 
 
 def _parse_amount(value) -> float | None:
@@ -298,6 +393,9 @@ def normalize_files(frames: list[tuple[str, pd.DataFrame]]) -> NormalizationResu
             if not _is_blank(raw_balance) and balance_after is None:
                 warnings.append(f"{source_file}, row {data_row}: invalid balance_after ignored.")
 
+            channel = _infer_channel(row)[:60]
+            location = _location_value(row)
+
             provided_id = _text(row.get("transaction_id", ""))[:100]
             if provided_id:
                 transaction_id = provided_id
@@ -336,6 +434,12 @@ def normalize_files(frames: list[tuple[str, pd.DataFrame]]) -> NormalizationResu
                 "upi_ref": upi_ref,
                 "balance_after": balance_after,
                 "source_sms": source_sms,
+                "channel": channel,
+                "country": location["country"],
+                "state": location["state"],
+                "city": location["city"],
+                "latitude": location["latitude"],
+                "longitude": location["longitude"],
                 "source_file": source_file,
                 "source_row": data_row,
                 "duplicate_key": _duplicate_key(

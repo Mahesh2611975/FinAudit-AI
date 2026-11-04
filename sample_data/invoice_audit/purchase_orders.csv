@@ -1,0 +1,3 @@
+purchase_order_number,vendor_name,order_date,expected_delivery_date,currency,item_code,description,quantity,unit_price,tax_rate,line_total
+PO-ACME-1001,Acme Supplies,2099-01-01,2099-01-10,INR,A1,A4 Paper,100,250,18,25000
+PO-NORTH-2001,Northwind Traders,2099-01-05,2099-01-15,INR,B1,Printer Toner,20,1500,18,30000

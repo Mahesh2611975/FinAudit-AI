@@ -1,0 +1,4 @@
+invoice_number,vendor_name,invoice_date,due_date,currency,purchase_order_number,item_code,description,quantity,unit_price,tax_rate,line_total,total_amount
+INV-ACME-1001,Acme Supplies,2099-01-10,2099-02-09,INR,PO-ACME-1001,A1,A4 Paper,100,250,18,25000,29500
+INV-NORTH-2001,Northwind Traders,2099-01-16,2099-02-15,INR,PO-NORTH-2001,B1,Printer Toner,18,1500,18,27000,31860
+INV-ACME-1001-DUP,Acme Supplies,2099-01-10,2099-02-09,INR,PO-ACME-1001,A1,A4 Paper,100,250,18,25000,29500

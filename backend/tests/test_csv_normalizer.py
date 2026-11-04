@@ -202,3 +202,38 @@ def test_cross_file_duplicates_are_detected_and_keep_source_filenames():
     assert len(duplicates) == 2
     assert {item["source_file"] for item in duplicates} == {"january.csv", "february.csv"}
     assert all(item["transaction_id"] for item in duplicates)
+
+
+def test_channel_and_location_columns_are_canonicalized():
+    rows = pd.DataFrame(
+        [
+            {
+                "date": "2026-03-06",
+                "type": "debit",
+                "amount": "100",
+                "recipient": "Vendor",
+                "payment_mode": "mobile banking",
+                "country": "India",
+                "state": "Karnataka",
+                "city": "Bengaluru",
+                "latitude": "12.9716",
+                "longitude": "77.5946",
+            },
+            {
+                "date": "2026-03-06",
+                "type": "debit",
+                "amount": "200",
+                "recipient": "Vendor",
+                "description": "Paid by RTGS",
+            },
+        ]
+    )
+
+    frame = normalize_files([("channels.csv", rows)]).frame
+
+    assert frame.iloc[0]["channel"] == "Mobile Banking"
+    assert frame.iloc[0]["country"] == "India"
+    assert frame.iloc[0]["latitude"] == 12.9716
+    assert frame.iloc[1]["channel"] == "Unknown"
+    assert frame.iloc[1]["country"] == ""
+    assert pd.isna(frame.iloc[1]["latitude"])
