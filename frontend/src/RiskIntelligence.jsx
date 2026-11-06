@@ -11,9 +11,7 @@ import {
   CircleDollarSign,
   FileSearch,
   Filter,
-  Globe2,
   Loader2,
-  MapPin,
   MessageSquare,
   Radar,
   RefreshCw,
@@ -30,15 +28,12 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
-  Cell,
   ResponsiveContainer,
-  Scatter,
-  ScatterChart,
   Tooltip,
   XAxis,
-  YAxis,
-  ZAxis
+  YAxis
 } from 'recharts';
+import GeographicRiskIntelligence from './GeographicRiskIntelligence';
 import './risk.css';
 
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'];
@@ -139,20 +134,6 @@ function ChannelTooltip({ active, payload }) {
       <div>Transactions: {fmtNumber(item.transaction_count)}</div>
       <div>Flagged: {fmtNumber(item.flagged_count)} ({fmtPercent(item.risk_percentage)})</div>
       <div>Total value: {fmtCurrency(item.total_amount)}</div>
-    </div>
-  );
-}
-
-function GeoTooltip({ active, payload }) {
-  if (!active || !payload?.length) return null;
-  const item = payload[0].payload;
-  return (
-    <div className="risk-tooltip">
-      <strong>{[item.city, item.state, item.country].filter(Boolean).join(', ') || 'Mapped location'}</strong>
-      <div>Transactions: {fmtNumber(item.transaction_count)}</div>
-      <div>Alerts: {fmtNumber(item.alert_count)}</div>
-      <div>Total value: {fmtCurrency(item.total_amount)}</div>
-      <div>Coordinates: {Number(item.latitude).toFixed(3)}, {Number(item.longitude).toFixed(3)}</div>
     </div>
   );
 }
@@ -378,8 +359,8 @@ export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000' }) 
   const [alertsData, setAlertsData] = useState({ items: [], total: 0, categories: [] });
   const [channels, setChannels] = useState(null);
   const [trends, setTrends] = useState(null);
-  const [geography, setGeography] = useState(null);
   const [config, setConfig] = useState(null);
+  const [refreshSignal, setRefreshSignal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [loadingAlerts, setLoadingAlerts] = useState(true);
   const [analyzing, setAnalyzing] = useState(false);
@@ -401,17 +382,15 @@ export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000' }) 
     setLoading(true);
     setError('');
     try {
-      const [overviewData, channelData, trendData, geoData, configData] = await Promise.all([
+      const [overviewData, channelData, trendData, configData] = await Promise.all([
         riskApi(apiBase, '/api/risk/overview'),
         riskApi(apiBase, '/api/risk/channels'),
         riskApi(apiBase, `/api/risk/trends?granularity=${granularity}`),
-        riskApi(apiBase, '/api/risk/geography'),
         riskApi(apiBase, '/api/risk/config')
       ]);
       setOverview(overviewData);
       setChannels(channelData);
       setTrends(trendData);
-      setGeography(geoData);
       setConfig(configData);
     } catch (err) {
       setError(err.message);
@@ -454,6 +433,7 @@ export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000' }) 
         body: JSON.stringify({ triggered_by: 'dashboard' })
       });
       setOffset(0);
+      setRefreshSignal((value) => value + 1);
       await Promise.all([loadOverview(), loadAlerts(0)]);
     } catch (err) {
       setError(err.message);
@@ -487,10 +467,14 @@ export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000' }) 
 
   const trendSeries = trends?.series || [];
   const channelRows = channels?.channels || [];
-  const geoItems = geography?.items || [];
   const hasFilters = Object.values(filters).some(Boolean);
   const start = alertsData.total === 0 ? 0 : offset + 1;
   const end = Math.min(offset + limit, alertsData.total);
+
+  const refreshDashboard = () => {
+    setRefreshSignal((value) => value + 1);
+    return Promise.all([loadOverview(), loadAlerts(offset)]);
+  };
 
   return (
     <section className="risk-page">
@@ -500,7 +484,7 @@ export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000' }) 
           <p>{overview?.last_analysis ? `Last analysis ${fmtDate(overview.last_analysis.finished_at)} · ${fmtNumber(overview.last_analysis.transaction_count)} transactions` : 'No analysis has run yet. Analyze stored records to generate deterministic alerts.'}</p>
         </div>
         <div className="risk-toolbar-actions">
-          <button type="button" className="secondary-btn" onClick={() => Promise.all([loadOverview(), loadAlerts(offset)])} disabled={loading || loadingAlerts}>
+          <button type="button" className="secondary-btn" onClick={refreshDashboard} disabled={loading || loadingAlerts}>
             <RefreshCw size={16} className={loading ? 'spin' : ''} /> Refresh
           </button>
           <button type="button" className="primary-btn" onClick={runAnalysis} disabled={analyzing}>
@@ -520,6 +504,8 @@ export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000' }) 
         <Kpi label="Suspicious vendor patterns" value={overview ? fmtNumber(overview.suspicious_vendors) : '—'} hint="Derived from stored alerts" icon={UserCheck} tone="cyan" />
         <Kpi label="Average risk score" value={overview ? `${overview.average_risk_score} / 100` : '—'} hint="Deterministic score across alerts" icon={TrendingUp} tone="green" />
       </div>
+
+      <GeographicRiskIntelligence apiBase={apiBase} refreshSignal={refreshSignal} />
 
       <div className="risk-grid-2">
         <section className="risk-card">
@@ -706,49 +692,7 @@ export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000' }) 
         )}
       </section>
 
-      <div className="risk-grid-2">
-        <section className="risk-card">
-          <div className="risk-card-header">
-            <div>
-              <h2>Geographic distribution</h2>
-              <p>Only stored coordinates are plotted. No locations are inferred or fabricated.</p>
-            </div>
-            <span className="risk-meta-pill"><MapPin size={14} /> {fmtNumber(geography?.coordinate_location_count)} mapped</span>
-          </div>
-          {!geography?.available || geoItems.length === 0 ? (
-            <EmptyState
-              icon={Globe2}
-              title="Geographic data unavailable"
-              detail={geography?.reason || 'No transaction coordinates are stored yet.'}
-            />
-          ) : (
-            <>
-              <div className="risk-chart">
-                <ResponsiveContainer width="100%" height={260}>
-                  <ScatterChart margin={{ top: 15, right: 20, left: -10, bottom: 5 }}>
-                    <CartesianGrid stroke="rgba(148,163,184,0.12)" />
-                    <XAxis type="number" dataKey="longitude" name="Longitude" domain={['auto', 'auto']} tick={{ fill: '#7f8da8', fontSize: 11 }} axisLine={false} tickLine={false} />
-                    <YAxis type="number" dataKey="latitude" name="Latitude" domain={['auto', 'auto']} tick={{ fill: '#7f8da8', fontSize: 11 }} axisLine={false} tickLine={false} />
-                    <ZAxis type="number" dataKey="transaction_count" range={[80, 420]} />
-                    <Tooltip content={<GeoTooltip />} />
-                    <Scatter name="Locations" data={geoItems}>
-                      {geoItems.map((item) => <Cell key={`${item.latitude}-${item.longitude}`} fill={item.alert_count > 0 ? SEVERITY_COLORS.high : '#3b82f6'} />)}
-                    </Scatter>
-                  </ScatterChart>
-                </ResponsiveContainer>
-              </div>
-              <div className="risk-location-list">
-                {geoItems.slice(0, 8).map((item) => (
-                  <div key={`${item.city}-${item.latitude}-${item.longitude}`}>
-                    <span className="risk-location-name"><MapPin size={14} /> {[item.city, item.state, item.country].filter(Boolean).join(', ') || 'Mapped location'}</span>
-                    <span>{fmtNumber(item.transaction_count)} txns · {fmtNumber(item.alert_count)} alerts</span>
-                  </div>
-                ))}
-              </div>
-            </>
-          )}
-        </section>
-
+      <div className="risk-grid-2 geo-risk-distribution-grid">
         <section className="risk-card">
           <div className="risk-card-header">
             <div>
