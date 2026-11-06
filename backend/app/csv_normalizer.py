@@ -25,6 +25,7 @@ CANONICAL_COLUMNS = [
     "transaction_id",
     "date",
     "amount",
+    "currency",
     "signed_amount",
     "type",
     "direction",
@@ -80,6 +81,7 @@ CHANNEL_KEYWORDS = [
 ]
 
 CHANNEL_COLUMNS = ("channel", "payment_channel", "transaction_channel", "payment_mode", "mode")
+CURRENCY_COLUMNS = ("currency", "currency_code", "ccy")
 LOCATION_COLUMNS = {
     "country": ("country", "country_name"),
     "state": ("state", "state_name", "province", "region"),
@@ -161,6 +163,13 @@ def _first_value(row, names: tuple[str, ...]) -> str:
         value = _text(row.get(name, ""))
         if value:
             return value
+    return ""
+
+
+def _currency_value(row) -> str:
+    value = _first_value(row, CURRENCY_COLUMNS).upper()
+    if len(value) == 3 and value.isalpha():
+        return value
     return ""
 
 
@@ -394,6 +403,7 @@ def normalize_files(frames: list[tuple[str, pd.DataFrame]]) -> NormalizationResu
                 warnings.append(f"{source_file}, row {data_row}: invalid balance_after ignored.")
 
             channel = _infer_channel(row)[:60]
+            currency = _currency_value(row)
             location = _location_value(row)
 
             provided_id = _text(row.get("transaction_id", ""))[:100]
@@ -425,6 +435,7 @@ def normalize_files(frames: list[tuple[str, pd.DataFrame]]) -> NormalizationResu
                 "transaction_id": transaction_id,
                 "date": date_value or "",
                 "amount": amount,
+                "currency": currency,
                 "signed_amount": signed_amount,
                 "type": type_value,
                 "direction": direction,

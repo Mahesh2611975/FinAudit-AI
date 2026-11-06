@@ -92,6 +92,7 @@ class TransactionRecord(Base):
     transaction_id = Column(String(100), nullable=True)
     date = Column(String(10), nullable=True)
     amount = Column(Float, nullable=True)
+    currency = Column(String(3), nullable=True)
     signed_amount = Column(Float, nullable=True)
     direction = Column(String(20), nullable=True)
     type = Column(String(50), nullable=True)
@@ -489,3 +490,30 @@ class RiskAlertEvent(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
     alert = relationship("RiskAlert", back_populates="events")
+
+
+class GeocodeCache(Base):
+    """Cached city/state/country lookups.
+
+    Successful and unsuccessful lookups are both cached so a missing place is
+    never sent to an external service on every request. Rows are additive and
+    never contain transaction data.
+    """
+
+    __tablename__ = "geocode_cache"
+    id = Column(Integer, primary_key=True, index=True)
+    query_key = Column(String(512), nullable=False, unique=True, index=True)
+    city = Column(String(100), nullable=True)
+    state = Column(String(100), nullable=True)
+    country = Column(String(100), nullable=True)
+    display_name = Column(String(500), nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    provider = Column(String(40), nullable=False, default="nominatim")
+    status = Column(String(20), nullable=False, default="success", index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )

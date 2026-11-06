@@ -10,6 +10,16 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from .database import get_db
+from .geo_analytics import (
+    geography_cities,
+    geography_countries,
+    geography_filter_options,
+    geography_high_risk_locations,
+    geography_insights,
+    geography_map,
+    geography_trend,
+)
+from .geocoding import geocoding_status
 from .llm import explain_finding
 from .models import RiskAlert, RiskAlertEvent, RiskAnalysisRun
 from .risk_engine import (
@@ -266,6 +276,181 @@ def risk_geography(
     db: Session = Depends(get_db),
 ):
     return geography_analytics(db, country=country, state=state, city=city)
+
+
+def _geo_kwargs(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    country: str | None = None,
+    risk_level: str | None = None,
+    channel: str | None = None,
+    min_amount: float | None = None,
+    max_markers: int = 2000,
+    geocode: bool = True,
+) -> dict:
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "country": country,
+        "risk_level": risk_level,
+        "channel": channel,
+        "min_amount": min_amount,
+        "max_markers": max(1, min(max_markers, 5000)),
+        "allow_geocode": geocode,
+    }
+
+
+@router.get("/api/risk/geography/options")
+def risk_geography_options(db: Session = Depends(get_db)):
+    return {
+        "options": geography_filter_options(db),
+        "risk_levels": ["high", "medium", "low"],
+        "geocoding": geocoding_status(),
+    }
+
+
+@router.get("/api/risk/geography/summary")
+def risk_geography_summary(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    country: str | None = None,
+    risk_level: str | None = None,
+    channel: str | None = None,
+    min_amount: float | None = None,
+    max_markers: int = 2000,
+    geocode: bool = True,
+    db: Session = Depends(get_db),
+):
+    try:
+        return geography_insights(
+            db,
+            **_geo_kwargs(
+                start_date,
+                end_date,
+                country,
+                risk_level,
+                channel,
+                min_amount,
+                max_markers,
+                geocode,
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/api/risk/geography/map")
+def risk_geography_map(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    country: str | None = None,
+    risk_level: str | None = None,
+    channel: str | None = None,
+    min_amount: float | None = None,
+    max_markers: int = 2000,
+    geocode: bool = True,
+    db: Session = Depends(get_db),
+):
+    try:
+        return geography_map(
+            db,
+            **_geo_kwargs(
+                start_date,
+                end_date,
+                country,
+                risk_level,
+                channel,
+                min_amount,
+                max_markers,
+                geocode,
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/api/risk/geography/countries")
+def risk_geography_countries(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    country: str | None = None,
+    risk_level: str | None = None,
+    channel: str | None = None,
+    min_amount: float | None = None,
+    db: Session = Depends(get_db),
+):
+    try:
+        return geography_countries(
+            db,
+            **_geo_kwargs(
+                start_date, end_date, country, risk_level, channel, min_amount
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/api/risk/geography/cities")
+def risk_geography_cities(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    country: str | None = None,
+    risk_level: str | None = None,
+    channel: str | None = None,
+    min_amount: float | None = None,
+    db: Session = Depends(get_db),
+):
+    try:
+        return geography_cities(
+            db,
+            **_geo_kwargs(
+                start_date, end_date, country, risk_level, channel, min_amount
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/api/risk/geography/high-risk-locations")
+def risk_geography_high_risk_locations(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    country: str | None = None,
+    risk_level: str | None = None,
+    channel: str | None = None,
+    min_amount: float | None = None,
+    db: Session = Depends(get_db),
+):
+    try:
+        return geography_high_risk_locations(
+            db,
+            **_geo_kwargs(
+                start_date, end_date, country, risk_level, channel, min_amount
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/api/risk/geography/trend")
+def risk_geography_trend(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    country: str | None = None,
+    risk_level: str | None = None,
+    channel: str | None = None,
+    min_amount: float | None = None,
+    db: Session = Depends(get_db),
+):
+    try:
+        return geography_trend(
+            db,
+            **_geo_kwargs(
+                start_date, end_date, country, risk_level, channel, min_amount
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post("/api/risk/investigate")

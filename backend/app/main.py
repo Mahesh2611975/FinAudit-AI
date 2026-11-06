@@ -151,6 +151,7 @@ async def create_audit(
                 transaction_id=str(row.get("transaction_id") or "") or None,
                 date=str(row.get("date") or "") or None,
                 amount=float(row.get("amount")) if row.get("amount") is not None else None,
+                currency=str(row.get("currency") or "").upper() or None,
                 signed_amount=float(row.get("signed_amount")) if row.get("signed_amount") is not None else None,
                 direction=str(row.get("direction") or "") or None,
                 type=str(row.get("type") or "") or None,
