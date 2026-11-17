@@ -1,179 +1,173 @@
 # FinAudit AI
 
-**Local-first financial audit exception analysis with RAG-assisted investigation.**
+**Local-first financial intelligence and audit investigation with deterministic rules, selective multi-agent AI and local RAG.**
 
-FinAudit AI is a local-first financial audit application that combines transaction exception analysis with an accounts-payable invoice audit workflow. It imports transaction and invoice data, applies deterministic audit rules, stores findings and evidence in SQLite, retrieves relevant audit-policy snippets, and optionally asks a Groq-hosted model to explain an exception. It is an educational prototype, not a certified accounting or fraud-detection system.
+FinAudit AI imports transaction and invoice data, applies explainable Python rules, stores findings and evidence in SQLite, retrieves relevant context with a local TF-IDF vector store, and optionally asks a locally running Ollama model to narrate that evidence. It is an educational prototype, not a certified accounting or fraud-detection system.
+
+See [`FINAL_DELIVERABLES.md`](FINAL_DELIVERABLES.md) for architecture diagrams, workflows, the full API table, migration details, verification results and limitations.
 
 ## Features
 
-- CSV upload and schema validation through FastAPI
-- Deterministic checks for possible duplicate payments, high-value transactions, and negative amounts
-- SQLite persistence for audit runs and findings
-- Local TF-IDF retrieval over built-in audit policy snippets and finding evidence (no embedding API)
-- Optional Groq LLM explanations; clear fallback and safe error category when AI is unavailable
-- React dashboard, recent audit history, and CSV export
-- **Invoice audit module:** vendor, purchase-order and goods-receipt masters; CSV/Excel/PDF invoice ingestion; SHA-256 document provenance; deterministic duplicate, PO, receipt, tax, payment and vendor-pattern checks; human review queue; invoice audit history; CSV and PDF report exports
-- **LangGraph invoice workflow:** ten real nodes from document intake through reporting, persisted with the same timeline/event/evidence model as the existing investigation workflow
-- **Financial risk and fraud intelligence:** deterministic 0–100 risk scoring, duplicate/unusual/frequency/vendor/invoice/reconciliation detectors, alert review workflow, channel analytics, trend analytics, coordinate-only geography, and AI-assisted investigation grounded in stored evidence
-- Pytest coverage for core audit rules, analytics, the multi-agent workflow, the invoice audit module, and the risk intelligence engine/API
+- React workspace with a seven-item sidebar: Dashboard, Transactions, Reconciliation, Risk Alerts, AI Assistant, Reports and Settings.
+- Dashboard KPIs and five charts computed from SQLite records, with documented metric scope and no fake data.
+- Transaction CSV preview with automatic column mapping, validation, duplicate-safe import, search/date/amount filters, detail view and source file/row provenance.
+- Deterministic bank/ledger reconciliation with matched, unmatched, amount/date difference and possible-match results; uncertain matches require human confirmation.
+- Explainable 0–100 risk alerts with severity, reason, amount, timestamp, source evidence and review statuses: Open, Under investigation, Resolved, False positive and Dismissed.
+- Selective LangGraph assistant with five agents: Orchestrator, Transaction Analysis, Reconciliation, Risk Investigation, and Investigation & Reporting. Only relevant specialists run per question.
+- Local RAG over CSV, PDF, text reports and stored investigation reports. Chunks keep source filename, page, row and transaction IDs for citations.
+- Local Ollama generation with grounding rules; no paid API key. When Ollama is offline, answers fall back to explicit evidence-only text.
+- Consolidated PDF/CSV reports containing financial summary, reconciliation, alerts, investigation narratives and evidence references.
+- Invoice/AP audit module remains available through internal navigation from Reports: vendor, PO and receipt masters, CSV/Excel/PDF invoice ingestion, deterministic checks, human review, history and exports.
+- Additive SQLite migrations with automatic pre-migration backups; no destructive schema changes.
+- 114 passing backend tests and a successful frontend production build.
 
 ## Architecture
 
-React + Vite → FastAPI → deterministic validation/matching engines → SQLite. For an explanation request, the backend retrieves relevant policy snippets with TF-IDF and sends only the retrieved context and finding evidence to Groq. The default model is `openai/gpt-oss-20b`.
+```text
+React/Vite → FastAPI → deterministic rules + SQL aggregates
+                    → LangGraph selective agents
+                    → local TF-IDF RAG (SQLite metadata + tfidf.pkl)
+                    → Ollama HTTP API (optional, local only)
+                    → SQLite
+```
 
-The invoice workflow uses LangGraph with ten nodes: Document Intake, Invoice Extraction, Duplicate Detection, Purchase Order Matching, Goods Receipt, Payment Verification, Discrepancy Investigation, Evidence/RAG, Financial Impact and Invoice Reporting. All arithmetic and matching are deterministic. The LLM is optional and is never used to calculate amounts or decide a match. Invoice audit runs also create an `InvestigationRun`, so they appear in the existing AI Agent Center history.
+All amounts, scores, matches and counts are calculated by deterministic Python code. The LLM only narrates supplied evidence; it never computes a value or decides a match. The legacy ten-node invoice workflow and `MultiAgentOrchestrator` are preserved for existing endpoints.
 
 ## Requirements
 
 - Python 3.11 or 3.12 recommended
 - Node.js 20+ recommended
 - Git
-- A Groq API key (optional for non-AI audit checks; required for LLM explanations)
+- Optional: [Ollama](https://ollama.com/) with `llama3.2:1b` for AI explanations. No API key or paid account is required.
 
-## Quick start (Windows PowerShell)
+## Quick start
 
 ### 1. Backend
 
-```powershell
+```bash
 cd backend
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
+python3 -m venv .venv          # Windows: py -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
+cp .env.example .env           # Windows: Copy-Item .env.example .env
 uvicorn app.main:app --reload
 ```
 
-If PowerShell blocks venv activation, run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` in that terminal, then activate again.
+If Windows PowerShell blocks venv activation, run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` in that terminal, then activate again.
 
-Open http://127.0.0.1:8000/docs to explore the API.
+On Windows/WSL, create a Linux virtual environment if running under Linux; the checked-in Windows `backend/.venv` cannot be used from WSL.
+
+Open <http://127.0.0.1:8000/docs> to explore the API.
 
 ### 2. Frontend (new terminal)
 
-```powershell
+```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-Open the Vite URL shown in the terminal, usually http://localhost:5173.
+Open <http://localhost:5173>. Set `VITE_API_URL` in `frontend/.env` if the API is not at `http://127.0.0.1:8000`.
 
-### 3. Enable Groq AI explanations (optional)
+### 3. Enable optional local AI
 
-Create `backend/.env` from `backend/.env.example`, then add your own key:
+Install and start Ollama, then pull a small model suitable for an 8 GB RAM laptop:
 
-```powershell
-Copy-Item backend/.env.example backend/.env
-notepad backend/.env
+```bash
+ollama pull llama3.2:1b
+ollama serve
 ```
 
-Set `GROQ_API_KEY` to your key from https://console.groq.com/keys and keep `GROQ_MODEL=openai/gpt-oss-20b` unless your Groq account uses a different supported model. The backend loads `backend/.env` relative to the Python files, not the current working directory.
-
-Never commit `backend/.env`. If the key is missing or Groq is unavailable, core audits still work and the API returns a safe fallback explanation with an error category.
-
-### 4. Try the sample data
-
-Choose `sample_data/transactions.csv` in the dashboard. The sample intentionally includes a duplicate pair, a high-value payment, and a negative amount.
-
-Required CSV columns: `transaction_id,date,vendor,amount,description`.
-
-For the invoice module, import the files in `sample_data/invoice_audit/` in this order: `vendors.csv`, `purchase_orders.csv`, `goods_receipts.csv`, then upload `invoices.csv` from Invoice Management. The sample includes a deliberate possible duplicate invoice for review.
-
-## Invoice / AP audit workflow
-
-1. Create or import vendors.
-2. Create or import purchase orders and goods receipts.
-3. Upload invoices (CSV, Excel or PDF). Original files are stored under `backend/uploads/invoice_documents/` and hashed for duplicate-document evidence. These files and SQLite databases are ignored by Git.
-4. Run an invoice audit from **Invoice Management**, **Invoice Matching** or **Invoice Agent Center**.
-5. Review discrepancies under **Discrepancies**. A reviewer name, decision and comment are persisted. The workflow never approves a payment or makes a final accounting decision.
-6. Download the audit result as CSV or PDF from the Invoice Agent Center.
-
-Example invoice CSV columns:
+`backend/.env` contains:
 
 ```text
-invoice_number,vendor_name,invoice_date,due_date,currency,purchase_order_number,item_code,description,quantity,unit_price,tax_rate,line_total,total_amount
-INV-100,Acme Supplies,2099-01-03,2099-12-31,INR,PO-100,A1,Paper,10,100,18,1000,1180
+OLLAMA_HOST=http://127.0.0.1:11434
+OLLAMA_MODEL=llama3.2:1b
+OLLAMA_TIMEOUT=20
+OLLAMA_PROBE_TIMEOUT=1.5
 ```
 
-Money is stored as integer minor units (for example paise/cents). A missing field is reported for human review rather than invented. Different currencies are not compared without a documented conversion; the engine records a `currency_mismatch` exception instead.
+No key is needed. If Ollama is unavailable, core audits, reconciliation, risk analysis, RAG retrieval and reports still work; AI answers become evidence-only responses that say the model is unavailable.
 
-PDF text extraction requires the optional `pypdf` package listed in `backend/requirements.txt`. Scanned-image OCR is not included; those documents remain in the human-review queue with missing extracted fields.
+### 4. Try sample data
 
-## API endpoints
+Choose `sample_data/transactions.csv` in the Transactions or Dashboard workspace. It intentionally includes a duplicate pair, a high-value payment and a negative amount.
+
+Required canonical CSV columns: `transaction_id,date,vendor,amount,description`. Common aliases are normalized automatically.
+
+For invoice auditing, import files from `sample_data/invoice_audit/` in this order: `vendors.csv`, `purchase_orders.csv`, `goods_receipts.csv`, then `invoices.csv`.
+
+## Primary API endpoints
 
 | Method | Endpoint | Purpose |
 |---|---|---|
 | GET | `/api/health` | Health check |
-| POST | `/api/audits` | Upload and audit a CSV |
-| GET | `/api/audits` | List recent audit runs |
-| GET | `/api/audits/{id}` | Read an audit and findings |
-| POST | `/api/findings/{id}/explain` | Retrieve context and ask Groq for an explanation |
-| GET | `/api/audits/{id}/export.csv` | Download findings as CSV |
-| POST | `/api/vendors`, `/api/vendors/import` | Create or import vendors |
-| GET | `/api/vendors`, `/api/vendors/{id}`, `/api/vendors/analytics` | Vendor master and analytics |
-| POST | `/api/purchase-orders`, `/api/purchase-orders/import` | Create or import purchase orders |
-| GET | `/api/purchase-orders`, `/api/purchase-orders/{id}` | Read purchase orders and line items |
-| POST | `/api/goods-receipts`, `/api/goods-receipts/import` | Create or import goods receipts |
-| GET | `/api/goods-receipts`, `/api/goods-receipts/{id}` | Read receipts and accepted/rejected quantities |
-| POST | `/api/invoices`, `/api/invoices/upload` | Create an invoice manually or ingest CSV/Excel/PDF |
-| GET | `/api/invoices`, `/api/invoices/{id}` | List invoices or read full evidence detail |
-| POST | `/api/invoices/{id}/payments` | Record a payment (currency must match) |
-| POST | `/api/invoice-payments/{id}/verify` | Mark a recorded payment as verified |
-| POST | `/api/invoices/{id}/audit`, `/api/invoice-audits/run` | Run the ten-node invoice audit workflow |
-| GET | `/api/risk/config` | Read risk thresholds, score bands, channels and review statuses |
-| POST | `/api/risk/analyze` | Run deterministic risk analysis and upsert alerts |
-| GET | `/api/risk/overview`, `/api/risk/alerts`, `/api/risk/alerts/{id}` | Risk KPIs and filterable alert review queue |
-| POST | `/api/risk/alerts/{id}/review` | Assign, investigate, resolve, dismiss or comment on an alert |
-| GET | `/api/risk/channels`, `/api/risk/trends`, `/api/risk/geography` | Channel, trend and stored-coordinate analytics |
-| POST | `/api/risk/investigate` | Build deterministic evidence context and request an AI explanation |
-| GET | `/api/invoice-audits/runs`, `/api/invoice-audits/runs/{id}` | Audit-run history and structured result |
-| GET | `/api/invoice-audits/runs/{id}/export.csv` | Download invoice audit CSV |
-| GET | `/api/invoice-audits/runs/{id}/export.pdf` | Download invoice audit PDF |
-| GET | `/api/discrepancies`, `/api/discrepancies/{id}` | List or read exceptions |
-| POST | `/api/discrepancies/{id}/review` | Persist a human review decision |
-| GET | `/api/invoice-analytics/monthly`, `/api/invoice-analytics/vendors` | Invoice and vendor analytics |
+| GET | `/api/dashboard/overview` | DB-backed KPIs, five charts, recent activity and scope |
+| POST | `/api/transactions/preview` | Validate and preview a CSV before import |
+| POST | `/api/audits` | Import CSV(s); `skip_duplicates=true` prevents re-import |
+| GET | `/api/transactions` | Search and filter transactions |
+| GET | `/api/transactions/{transaction_ref}` | Transaction detail with alerts and reconciliation evidence |
+| POST | `/api/reconciliations` | Run bank/ledger reconciliation |
+| GET | `/api/reconciliations/{id}` | Read reconciliation evidence |
+| POST | `/api/reconciliations/results/{id}/confirm` | Record a human confirmation with reviewer and comment |
+| GET/POST | `/api/risk/analyze`, `/api/risk/alerts`, `/api/risk/alerts/{id}/review` | Run and review deterministic alerts |
+| POST | `/api/documents/ingest` | Ingest CSV/PDF/text documents into local RAG |
+| POST | `/api/documents/sync-transactions` | Index stored transactions into RAG |
+| GET | `/api/assistant/config`, `/api/assistant/suggestions` | Assistant runtime status and prompts |
+| POST | `/api/assistant/query` | Selective multi-agent answer with citations |
+| GET | `/api/reports/summary`, `/api/reports/full.csv`, `/api/reports/full.pdf` | Consolidated reports and exports |
+| POST | `/api/agents/run` | Run the legacy persisted investigation workflow |
+| POST/GET | `/api/invoices*`, `/api/invoice-audits/run*`, `/api/discrepancies*` | Invoice audit and review |
+
+The complete endpoint list, including invoice master data and geospatial analytics, is in the interactive `/docs` page and in `FINAL_DELIVERABLES.md`.
+
+## Reports and exports
+
+- **Full report PDF:** financial summary, metric scope, top alerts, AI explanations and evidence references.
+- **Full report CSV:** transaction, risk-alert and AI-explanation rows.
+- **Focused exports:** transaction analytics, individual audit runs and individual reconciliation runs.
+- **Invoice exports:** invoice audit CSV and PDF from the Invoice Agent Center.
+
+Automated findings are investigation leads. They are not proof of fraud and do not authorize financial action.
 
 ## Tests
 
-From the `backend` directory with the virtual environment active:
+From the repository root:
 
-```powershell
-$env:PYTHONPATH = "."
-pytest -q
+```bash
+cd backend && python3 -m pytest -q
+cd frontend && npm run build
 ```
 
-The current suite contains 91 passing backend tests, including 30 invoice-audit scenarios covering extraction, duplicate documents, PO/vendor/currency/item/quantity/price/tax/total mismatches, missing/partial/rejected receipts, payment states, duplicate bank transactions, missing documents, review actions, exports, analytics and workflow persistence.
+Current results: **114 passed** backend tests (one unrelated `anyio` deprecation warning) and a successful Vite production build (lucide `"use client"` and bundle-size warnings only). Run backend tests from `backend/` so the test configuration sets an isolated `FINAUDIT_DATABASE_URL` before the app imports.
 
-Frontend production build:
+## Database safety
 
-```powershell
-cd frontend
-npm run build
-```
+- The database is SQLite at `backend/data/finaudit.db` by default.
+- A pre-refactor backup exists at `backend/data/backups/finaudit-pre-refactor-20261117-135303.db`.
+- Startup creates a timestamped backup before pending schema changes and applies only additive columns/indexes.
+- Existing tables and records are never dropped; a `NOT NULL` column without a default is added as nullable with a warning.
 
-## Known limitations / next steps
+## Known limitations
 
-- The initial release uses TF-IDF retrieval, not a neural embedding model; this keeps the setup lighter on an 8 GB RAM laptop.
-- The application has no authentication or multi-user access control; run it locally or add access controls before exposing it.
-- The transaction CSV schema is intentionally small. Invoice audit covers invoice-to-PO/receipt/payment matching, but it is not a full ERP or general ledger.
-- Scanned-image OCR is not included. PDF text extraction requires `pypdf`; image-only PDFs are routed to human review.
-- The high-value threshold is a simple configurable code default, not a universal accounting rule.
-- Findings may overlap; the flagged amount KPI can double-count the same transaction across different rules.
-- Currencies are never converted automatically. Different currencies produce a review exception.
-- Do not upload confidential production finance data. Use synthetic or anonymized examples.
-- LLM output can be incorrect. Review source documents and human-approve any financial action.
-- Groq explanations send retrieved policy snippets and finding evidence to Groq's API. Do not use confidential production data unless that transfer is approved.
+- TF-IDF retrieval is lexical rather than semantic; it avoids model downloads and heavy dependencies.
+- PDF extraction uses `pypdf` when available and a lightweight fallback otherwise; scanned/image-only PDFs need manual review.
+- There is no authentication or multi-user access control. Run locally with synthetic or anonymized data.
+- Thresholds are configurable defaults, not universal accounting rules.
+- Overlapping findings can double-count a transaction in flagged-amount KPIs.
+- Currencies are never converted automatically; mismatches become review exceptions.
+- Ollama output can be wrong. Verify cited source rows and have an authorized human approve any financial action.
+- Deployment and production secrets management are out of scope.
 
-## Deployment notes
+## Resume summary
 
-The frontend can be built with `npm run build` and deployed as static assets to a free static host. The backend can be deployed to a free Python web service if the provider supports persistent storage, but free instances may sleep or reset local files. SQLite is suitable for a demo, not a multi-instance production deployment. Configure `GROQ_API_KEY` as a backend environment variable/secret on the host. For a shareable demo, deploy the UI and API separately, configure `VITE_API_URL` to the API base URL, update backend CORS to the deployed frontend origin, and use synthetic sample data. Verify current free-tier limits before choosing a provider.
+**FinAudit AI | Python, FastAPI, SQLite, React, LangGraph, RAG, Ollama**
 
-## Resume bullet (edit to match what you actually complete)
-
-**FinAudit AI | Python, FastAPI, SQLite, React, RAG, Groq**
-- Built a local-first financial audit application that validates CSV transactions and flags potential duplicate, high-value, and negative-amount exceptions using explainable Python rules.
-- Implemented retrieval-augmented investigation notes using TF-IDF retrieval over audit policies and transaction evidence, with optional Groq LLM explanations and source references.
-- Built an accounts-payable invoice audit module with deterministic duplicate, PO, goods-receipt, tax, payment and vendor-pattern checks, human review actions, CSV/PDF exports and 30 additional regression tests.
-- Implemented a ten-node LangGraph invoice workflow with persisted timelines, evidence and human-review checkpoints, plus REST APIs, SQLite persistence, CSV/PDF exports, a React dashboard, and automated tests for audit-rule behavior.
+- Built a local-first financial intelligence platform with database-backed KPIs, five charts, CSV import validation, duplicate prevention and full source provenance.
+- Implemented deterministic bank/ledger reconciliation and an explainable risk engine with human review statuses and evidence-backed alert explanations.
+- Built a selective five-agent LangGraph assistant with validated outputs, SQL evidence, local TF-IDF RAG citations and grounded Ollama narration with safe fallbacks.
+- Added consolidated PDF/CSV investigations reports, additive SQLite migrations, invoice/AP audit workflows and 114 passing backend tests.
 
 ## License
 

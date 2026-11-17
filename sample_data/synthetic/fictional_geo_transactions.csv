@@ -1,0 +1,27 @@
+Transaction ID,Transaction Date,Transaction Amount,Currency,Type,Merchant Name,Vendor Name,Payment Channel,Description,UPI Reference,Balance After,Transaction City,State,Transaction Country,Latitude,Longitude
+SYN-001,2026-06-01,1250.00,INR,debit,Aurora Cafe,Aurora Cafe,Point of Sale,Morning coffee,SYN-UPI-001,88000.00,Bengaluru,Karnataka,India,12.9716,77.5946
+SYN-002,2026-06-01,320.00,INR,debit,Harbor Market,Harbor Market,Cash,Cash purchase,SYN-CASH-001,87680.00,Singapore,,Singapore,1.3521,103.8198
+SYN-003,2026-06-02,45000.00,INR,debit,Northwind Supplies,Northwind Supplies,Wire Transfer,Quarterly equipment payment,SYN-WIRE-001,43000.00,London,,United Kingdom,51.5074,-0.1278
+SYN-004,2026-06-02,180.00,INR,debit,Metro Transit,Metro Transit,ATM,ATM cash withdrawal,SYN-ATM-001,42820.00,Toronto,Ontario,Canada,43.6532,-79.3832
+SYN-005,2026-06-03,850.00,INR,debit,Riverstone Books,Riverstone Books,Mobile App,Ordered from mobile app,SYN-UPI-002,41970.00,Nairobi,Nairobi County,Kenya,-1.2921,36.8219
+SYN-006,2026-06-03,2600.00,INR,debit,Sunset Utilities,Sunset Utilities,Online Banking,Monthly utility bill,SYN-NET-001,39370.00,Sydney,New South Wales,Australia,-33.8688,151.2093
+SYN-007,2026-06-04,790.00,INR,debit,Orchard Grocery,Orchard Grocery,UPI,Gpay grocery payment,SYN-UPI-003,38580.00,Pune,Maharashtra,India,18.5204,73.8567
+SYN-008,2026-06-04,2100.00,INR,debit,Bluebird Travel,Bluebird Travel,Card Payment,Credit card travel booking,SYN-CARD-001,36480.00,Mumbai,Maharashtra,India,19.0760,72.8777
+SYN-009,2026-06-05,150000.00,INR,debit,Cedar Construction,Cedar Construction,Wire Transfer,Large supplier settlement without approval,SYN-WIRE-002,36480.00,Dubai,,United Arab Emirates,25.2048,55.2708
+SYN-010,2026-06-05,150000.00,INR,debit,Cedar Construction,Cedar Construction,Wire Transfer,Large supplier settlement without approval,SYN-WIRE-002B,36480.00,Dubai,,United Arab Emirates,25.2048,55.2708
+SYN-011,2026-06-07,420.00,INR,debit,Maple Produce,Maple Produce,,Paid by RTGS to supplier,SYN-RTGS-001,36060.00,London,,United Kingdom,51.5074,-0.1278
+SYN-012,2026-06-08,650.00,INR,debit,Quartz Studio,Quartz Studio,,Card swipe at merchant terminal,SYN-POS-001,35410.00,Bengaluru,Karnataka,India,12.9716,77.5946
+SYN-013,2026-06-09,1100.00,INR,debit,Wave Communications,Wave Communications,Unknown,Payment method not supplied,SYN-UNK-001,34310.00,Singapore,,Singapore,1.3521,103.8198
+SYN-014,2026-06-10,75.00,INR,debit,Unknown merchant,Unknown merchant,Cash,Paid in cash,SYN-CASH-002,34235.00,Nairobi,Nairobi County,Kenya,,
+SYN-015,2026-06-11,95.00,INR,debit,Lakeside Vendor,Lakeside Vendor,Mobile App,Invalid latitude row,SYN-BAD-001,34140.00,Toronto,Ontario,Canada,999,-79.3832
+SYN-016,2026-06-12,240.00,INR,debit,Cloud Print,Cloud Print,Online Banking,No location supplied,SYN-NOLOC-001,33900.00,,,,,
+SYN-017,2026-06-13,500.00,INR,debit,Emerald Supplies,Emerald Supplies,UPI,Repeated same-day payment 1,SYN-FREQ-001,33400.00,Mumbai,Maharashtra,India,19.0760,72.8777
+SYN-018,2026-06-13,500.00,INR,debit,Emerald Supplies,Emerald Supplies,UPI,Repeated same-day payment 2,SYN-FREQ-002,32900.00,Mumbai,Maharashtra,India,19.0760,72.8777
+SYN-019,2026-06-13,500.00,INR,debit,Emerald Supplies,Emerald Supplies,UPI,Repeated same-day payment 3,SYN-FREQ-003,32400.00,Mumbai,Maharashtra,India,19.0760,72.8777
+SYN-020,2026-06-13,500.00,INR,debit,Emerald Supplies,Emerald Supplies,UPI,Repeated same-day payment 4,SYN-FREQ-004,31900.00,Mumbai,Maharashtra,India,19.0760,72.8777
+SYN-021,2026-06-13,500.00,INR,debit,Emerald Supplies,Emerald Supplies,UPI,Repeated same-day payment 5,SYN-FREQ-005,31400.00,Mumbai,Maharashtra,India,19.0760,72.8777
+SYN-022,2026-06-14,100.00,INR,debit,Willow Stationery,Willow Stationery,Point of Sale,Baseline payment 1,SYN-BASE-001,31300.00,Pune,Maharashtra,India,18.5204,73.8567
+SYN-023,2026-06-14,120.00,INR,debit,Willow Stationery,Willow Stationery,Point of Sale,Baseline payment 2,SYN-BASE-002,31180.00,Pune,Maharashtra,India,18.5204,73.8567
+SYN-024,2026-06-14,130.00,INR,debit,Willow Stationery,Willow Stationery,Point of Sale,Baseline payment 3,SYN-BASE-003,31050.00,Pune,Maharashtra,India,18.5204,73.8567
+SYN-025,2026-06-15,28000.00,INR,debit,Willow Stationery,Willow Stationery,Point of Sale,Unusual amount against baseline,SYN-BASE-004,3050.00,Pune,Maharashtra,India,18.5204,73.8567
+SYN-026,2026-06-16,900.00,INR,credit,Fictional Payroll,Fictional Payroll,Wire Transfer,Salary received,SYN-SALARY-001,3950.00,London,,United Kingdom,51.5074,-0.1278
