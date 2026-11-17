@@ -19,20 +19,24 @@ from sqlalchemy.orm import Session
 from .geocoding import geocoding_enabled, location_key, resolve_locations
 from .models import RiskAlert, TransactionRecord
 from .risk_engine import (
+    SUPPORTED_CHANNELS,
     _alert_record_ids,
     _alert_transaction_ids,
     _amount,
     _as_date,
     _text,
     _valid_coordinates,
-    infer_channel,
+    build_channel_analytics,
+    infer_channel_details,
     load_analysis_transactions,
 )
 
 SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 HIGH_RISK_LEVELS = {"high", "critical"}
 VALID_RISK_FILTERS = {"low", "medium", "high", "critical"}
+VALID_LOCATION_STATUSES = {"mapped", "named_only", "invalid_coordinates", "unavailable"}
 LOCATION_UNAVAILABLE = "Location unavailable"
+CHANNEL_ORDER = {channel: index for index, channel in enumerate(SUPPORTED_CHANNELS)}
 
 
 @dataclass(frozen=True)
@@ -211,6 +215,18 @@ def _merge_location(
     return country, state, city, coords, source
 
 
+def _location_status(record: TransactionRecord) -> str:
+    stored = _text(getattr(record, "location_status", None)).lower()
+    if stored in VALID_LOCATION_STATUSES:
+        return stored
+    coords = _valid_coordinates(record.latitude, record.longitude)
+    if coords:
+        return "mapped"
+    if any(_text(getattr(record, key, None)) for key in ("city", "state", "country")):
+        return "named_only"
+    return "unavailable"
+
+
 def _matches_channel(entry_channel: str, channels: tuple[str, ...]) -> bool:
     if not channels:
         return True
@@ -250,7 +266,7 @@ def _base_entries(
     entries: list[dict[str, Any]] = []
     for record in records:
         amount = abs(_amount(record.amount))
-        channel = infer_channel(record)
+        channel, channel_source = infer_channel_details(record)
         related = _related_alerts(record, by_record, by_transaction)
         risk_level, risk_score, flagged, reason = _risk_from_alerts(related)
         country, state, city, coords, location_source = _merge_location(
@@ -276,6 +292,8 @@ def _base_entries(
                 "amount": amount,
                 "currency": _currency_for(record, related),
                 "channel": channel,
+                "channel_source": channel_source,
+                "merchant": _text(getattr(record, "merchant", None)) or None,
                 "alerts": related,
                 "alert_ids": sorted(
                     alert.alert_code for alert in related if alert.alert_code
@@ -290,6 +308,7 @@ def _base_entries(
                 "latitude": coords[0] if coords else None,
                 "longitude": coords[1] if coords else None,
                 "location_source": location_source,
+                "location_status": "mapped" if coords else _location_status(record),
             }
         )
 
@@ -299,12 +318,13 @@ def _base_entries(
 
 def _filter_options(records: Iterable[TransactionRecord]) -> dict[str, Any]:
     records = list(records)
+    observed = {infer_channel_details(record)[0] for record in records}
+    # Keep Unknown available even when no transaction currently uses it so a
+    # user can filter explicitly for records with an unavailable channel.
+    observed.add("Unknown")
     channels = sorted(
-        {
-            infer_channel(record)
-            for record in records
-            if infer_channel(record) != "Unknown"
-        }
+        observed,
+        key=lambda channel: (CHANNEL_ORDER.get(channel, len(CHANNEL_ORDER)), channel),
     )
     return {
         "countries": sorted(
@@ -369,6 +389,7 @@ def _resolve_missing_coordinates(
         entry["latitude"] = result["latitude"]
         entry["longitude"] = result["longitude"]
         entry["location_source"] = result["source"]
+        entry["location_status"] = "mapped"
     return stats
 
 
@@ -409,8 +430,11 @@ def _marker(entry: dict[str, Any]) -> dict[str, Any]:
         "source_file": record.source_file,
         "source_row": record.source_row,
         "channel": entry["channel"],
+        "channel_source": entry["channel_source"],
+        "merchant": entry["merchant"],
         "vendor": record.vendor,
         "description": record.description,
+        "location_status": entry["location_status"],
         "location_source": entry["location_source"],
         "alert_ids": entry["alert_ids"],
         "location_label": _display_name(entry),
@@ -667,6 +691,7 @@ def _summary(
         entry for entry in located if entry["risk_level"] in HIGH_RISK_LEVELS
     ]
     distribution = Counter(entry["risk_level"] for entry in located)
+    status_counts = Counter(entry.get("location_status", "unavailable") for entry in entries)
     countries = {_text(entry.get("country")).lower() for entry in located if entry.get("country")}
     cities = {
         (
@@ -693,6 +718,13 @@ def _summary(
         "coordinate_transactions": len(coordinate_backed),
         "geocoded_transactions": len(geocoded),
         "unlocated_transactions": len(entries) - len(located),
+        "location_status_counts": {
+            status: status_counts.get(status, 0)
+            for status in sorted(VALID_LOCATION_STATUSES)
+        },
+        "named_only_transactions": status_counts.get("named_only", 0),
+        "invalid_coordinate_transactions": status_counts.get("invalid_coordinates", 0),
+        "unavailable_location_transactions": status_counts.get("unavailable", 0),
         "total_mapped_value": round(sum(entry["amount"] for entry in located), 2),
         "flagged_transactions": len(flagged),
         "flagged_value": round(sum(entry["amount"] for entry in flagged), 2),
@@ -756,6 +788,7 @@ def geography_insights(
     ][:25]
     unusual = _unusual_locations(cities)
     trend = _trend(entries)
+    channel_analytics = build_channel_analytics(entries)
     summary = _summary(entries, geocoding_stats, len(records))
     available = bool(located)
 
@@ -794,6 +827,7 @@ def geography_insights(
         "high_risk_locations": high_risk_locations,
         "unusual_locations": unusual,
         "trend": trend,
+        "channel_analytics": channel_analytics,
         "filters": filters.as_dict(),
         "options": options,
         "geocoding": geocoding_stats,
@@ -814,6 +848,7 @@ def geography_map(
         "reason": data["reason"],
         "summary": data["summary"],
         "markers": data["markers"],
+        "channel_analytics": data["channel_analytics"],
         "filters": data["filters"],
         "options": data["options"],
         "geocoding": data["geocoding"],

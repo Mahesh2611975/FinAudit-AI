@@ -1104,8 +1104,8 @@ class MultiAgentOrchestrator:
             )
 
             llm_meta: dict[str, Any] = {
-                "configured": llm.get_api_key() is not None,
-                "client_available": llm.client is not None,
+                "backend": "ollama",
+                "available": llm.is_available(),
                 "used": False,
                 "fallback": None,
                 "model": llm.MODEL,
@@ -1113,7 +1113,7 @@ class MultiAgentOrchestrator:
                 "attempts": 0,
             }
             narrative: str | None = None
-            if llm.get_api_key() and llm.client is not None:
+            if llm_meta["available"]:
                 evidence_text = "\n".join(
                     f"[{item.get('source_id')}] {item.get('excerpt')}"
                     for item in evidence[:20]
@@ -1124,50 +1124,40 @@ class MultiAgentOrchestrator:
                     f"Verified facts: {facts}. Hypotheses: {hypotheses}. "
                     f"Limitations: {limitations}."
                 )
-                transient_errors = {
-                    "rate_limit",
-                    "timeout",
-                    "network",
-                    "provider_server",
-                }
+                retryable = {"timeout", "network", "rate_limit", "ollama_unavailable"}
                 for attempt in range(1, 3):
-                    llm_meta["attempts"] = attempt
                     try:
                         llm_result = asyncio.run(
                             llm.explain_finding(question, evidence_text)
                         )
-                        narrative = llm_result.get("answer")
                         llm_meta.update(
                             {
+                                "attempts": attempt,
                                 "used": not llm_result.get("fallback", False),
                                 "fallback": bool(llm_result.get("fallback", False)),
                                 "model": llm_result.get("model"),
                                 "error_category": llm_result.get("error_category"),
                             }
                         )
-                        if not llm_result.get("fallback", False) or (
-                            llm_result.get("error_category") not in transient_errors
-                        ):
+                        if not llm_result.get("fallback"):
+                            narrative = llm_result.get("answer")
+                            break
+                        if llm_result.get("error_category") not in retryable:
                             break
                     except Exception as exc:  # noqa: BLE001
+                        llm_meta["attempts"] = attempt
                         llm_meta["error_category"] = "unexpected"
                         llm_meta["error"] = str(exc)
                         break
-                if llm_meta["fallback"]:
+                if llm_meta["fallback"] or llm_meta["error_category"]:
                     limitations.append(
-                        "LLM narrative fell back after "
-                        f"{llm_meta['attempts']} attempt(s); deterministic "
-                        "results are unaffected."
+                        "Local LLM narrative fell back; deterministic results are "
+                        "unaffected and remain the source of truth."
                     )
-            elif not llm.get_api_key():
+            else:
                 limitations.append(
-                    "LLM narrative is unavailable because GROQ_API_KEY is not "
-                    "configured. Deterministic results are unaffected."
-                )
-            elif llm.client is None:
-                limitations.append(
-                    "GROQ_API_KEY is configured but the Groq client is unavailable; "
-                    "deterministic results are unaffected."
+                    "Local LLM narrative is unavailable because Ollama is not "
+                    "running. Deterministic results are unaffected."
                 )
 
             data_evidence = [

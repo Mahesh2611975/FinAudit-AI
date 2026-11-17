@@ -24,8 +24,12 @@ def upload_csv(csv_text: str, filename: str) -> dict:
 
 
 def disable_llm(monkeypatch):
-    monkeypatch.setattr(llm, "get_api_key", lambda: None)
-    monkeypatch.setattr(llm, "client", None)
+    monkeypatch.setattr(llm, "is_available", lambda: False)
+
+    async def should_not_run(*args, **kwargs):
+        raise AssertionError("LLM must not run when Ollama is unavailable")
+
+    monkeypatch.setattr(llm, "explain_finding", should_not_run)
 
 
 JUNE_CSV = (
@@ -96,8 +100,9 @@ def test_monthly_agent_executes_real_nodes_and_persists_results(monkeypatch):
     assert all(item.get("source_id") for item in policy_evidence)
 
     synthesis = result["outputs"]["synthesis"]
-    assert synthesis["llm"]["configured"] is False
-    assert any("GROQ_API_KEY" in item for item in synthesis["limitations"])
+    assert synthesis["llm"]["available"] is False
+    assert synthesis["llm"]["used"] is False
+    assert any("Ollama is not running" in item for item in synthesis["limitations"])
     assert synthesis["facts"]
     assert synthesis["hypotheses"]
     assert synthesis["recommendations"]
@@ -237,8 +242,7 @@ def test_transient_llm_failure_is_retried_once(monkeypatch):
             "retrieved_sources": [],
         }
 
-    monkeypatch.setattr(llm, "get_api_key", lambda: "test-key")
-    monkeypatch.setattr(llm, "client", object())
+    monkeypatch.setattr(llm, "is_available", lambda: True)
     monkeypatch.setattr(llm, "explain_finding", fake_explain)
 
     response = client.post(

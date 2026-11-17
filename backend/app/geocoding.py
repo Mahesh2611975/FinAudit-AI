@@ -260,9 +260,17 @@ def geocoding_status() -> dict[str, Any]:
         "provider": PROVIDER,
         "url": NOMINATIM_URL,
         "max_lookups_per_request": _max_lookups(),
+        "policy": {
+            "stored_coordinates_first": True,
+            "geocode_only_named_locations_without_coordinates": True,
+            "cache_every_successful_or_empty_lookup": True,
+            "invent_coordinates": False,
+            "network_disabled_by_default": True,
+        },
         "notice": (
             "Geocoding is optional and disabled by default. Set "
             "FINAUDIT_GEOCODING_ENABLED=true to resolve stored city/state/country "
-            "values with OpenStreetMap Nominatim. Results are cached in SQLite."
+            "values with OpenStreetMap Nominatim. Results are cached in SQLite; "
+            "unresolved places stay unavailable."
         ),
     }

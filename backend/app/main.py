@@ -1,24 +1,31 @@
 import json
 import os
+import re
+from datetime import datetime, timezone
 from io import BytesIO, StringIO
 
 import pandas as pd
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from .analytics import AnalyticsInputError, monthly_analysis, monthly_comparison
 from .audit_engine import detect_findings
-from .csv_normalizer import normalize_files, safe_filename
+from .csv_normalizer import COLUMN_ALIASES, normalize_files, safe_filename
 from .database import Base, engine, get_db
 from .llm import explain_finding
 from .migrations import backup_sqlite_database, ensure_database_schema, has_pending_schema_changes
-from .models import AuditRun, Finding, ReconciliationResult, ReconciliationRun, TransactionRecord, InvestigationRun, InvestigationCase
+from .models import AuditRun, Finding, ReconciliationResult, ReconciliationRun, RiskAlert, TransactionRecord, InvestigationRun, InvestigationCase
 from .invoice_api import router as invoice_router
 from .risk_api import router as risk_router
 from .reconciliation import ReconciliationError, reconcile_files
 from .category import categorize_transaction
+from .dashboard import dashboard_overview
+from . import llm, rag
+from .agents.assistant_graph import get_assistant_graph
+from .pdf_utils import build_text_pdf
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_FILES = 20
@@ -82,10 +89,96 @@ def _files_for_run(run: AuditRun) -> list[str]:
     return [run.filename] if run.filename else []
 
 
+def _header_mapping(columns) -> list[dict[str, str]]:
+    """Show the automatic column mapping applied to a uploaded CSV."""
+    reverse: dict[str, str] = {}
+    for canonical, aliases in COLUMN_ALIASES.items():
+        for alias in (*aliases, canonical):
+            normalized = re.sub(r"[^a-z0-9]+", "_", str(alias).lower()).strip("_")
+            reverse.setdefault(normalized, canonical)
+    mapping = []
+    for column in columns:
+        normalized = re.sub(r"[^a-z0-9]+", "_", str(column).lower()).strip("_")
+        mapping.append({"source": str(column), "canonical": reverse.get(normalized, normalized)})
+    return mapping
+
+
+def _existing_import_keys(db: Session) -> tuple[set[str], set[tuple[str, int]]]:
+    rows = db.query(TransactionRecord).all()
+    keys = {str(row.duplicate_key) for row in rows if row.duplicate_key}
+    provenance = {
+        (str(row.source_file), int(row.source_row))
+        for row in rows
+        if row.source_file and row.source_row is not None
+    }
+    return keys, provenance
+
+
+def _is_duplicate_row(row, keys: set[str], provenance: set[tuple[str, int]]) -> bool:
+    key = str(row.get("duplicate_key") or "")
+    source_file = str(row.get("source_file") or "")
+    source_row = row.get("source_row")
+    if key and key in keys:
+        return True
+    if source_file and source_row is not None:
+        try:
+            if (source_file, int(source_row)) in provenance:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
+@app.post("/api/transactions/preview")
+async def preview_transactions(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Validate a CSV and preview normalized rows before importing it."""
+    filename = safe_filename(file.filename)
+    if not filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=422, detail="Upload a .csv file.")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=422, detail="CSV is empty.")
+    if len(raw) > MAX_FILE_BYTES:
+        raise HTTPException(status_code=413, detail="CSV must be 5 MB or smaller.")
+    try:
+        frame = pd.read_csv(BytesIO(raw), encoding="utf-8-sig")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=422, detail=f"Could not read CSV: {exc}") from exc
+
+    normalized = normalize_files([(filename, frame)])
+    keys, provenance = _existing_import_keys(db)
+    rows = normalized.frame.to_dict("records")
+    duplicate_count = sum(1 for row in rows if _is_duplicate_row(row, keys, provenance))
+    preview = []
+    for row in rows[:10]:
+        item = {
+            key: (None if pd.isna(value) else value)
+            for key, value in row.items()
+            if key in {
+                "transaction_id", "date", "amount", "direction", "vendor", "description",
+                "source_file", "source_row", "duplicate_key",
+            }
+        }
+        item["duplicate"] = _is_duplicate_row(row, keys, provenance)
+        preview.append(item)
+    return {
+        "valid": not normalized.errors,
+        "filename": filename,
+        "schema": normalized.schema,
+        "mapping": _header_mapping(frame.columns),
+        "row_count": len(normalized.frame),
+        "duplicate_count": duplicate_count,
+        "errors": normalized.errors,
+        "warnings": normalized.warnings,
+        "preview": preview,
+    }
+
+
 @app.post("/api/audits")
 async def create_audit(
     files: list[UploadFile] | None = File(None),
     file: UploadFile | None = File(None),
+    skip_duplicates: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     uploads = []
@@ -120,7 +213,17 @@ async def create_audit(
     normalized = normalize_files(frames)
     if normalized.errors:
         raise HTTPException(status_code=422, detail=normalized.errors)
-    findings = detect_findings(normalized.frame)
+
+    skipped_duplicates = 0
+    if skip_duplicates:
+        keys, provenance = _existing_import_keys(db)
+        mask = normalized.frame.apply(
+            lambda row: not _is_duplicate_row(row, keys, provenance), axis=1
+        )
+        skipped_duplicates = int((~mask).sum())
+        normalized.frame = normalized.frame.loc[mask].reset_index(drop=True)
+
+    findings = detect_findings(normalized.frame) if not normalized.frame.empty else []
 
     display_name = ", ".join(normalized.files)
     if len(display_name) > 255:
@@ -156,17 +259,20 @@ async def create_audit(
                 direction=str(row.get("direction") or "") or None,
                 type=str(row.get("type") or "") or None,
                 vendor=str(row.get("vendor") or "") or None,
+                merchant=str(row.get("merchant") or "") or None,
                 description=str(row.get("description") or "") or None,
                 category=cat,
                 account=str(row.get("account") or "") or None,
                 upi_ref=str(row.get("upi_ref") or "") or None,
                 reference=str(row.get("upi_ref") or "") or None,
                 channel=str(row.get("channel") or "") or None,
+                channel_source=str(row.get("channel_source") or "unknown") or "unknown",
                 country=str(row.get("country") or "") or None,
                 state=str(row.get("state") or "") or None,
                 city=str(row.get("city") or "") or None,
                 latitude=_optional_float(row.get("latitude")),
                 longitude=_optional_float(row.get("longitude")),
+                location_status=str(row.get("location_status") or "unavailable") or "unavailable",
                 source_file=str(row.get("source_file") or "") or None,
                 source_row=int(row.get("source_row")) if row.get("source_row") is not None else None,
                 duplicate_key=str(row.get("duplicate_key") or "") or None,
@@ -180,6 +286,7 @@ async def create_audit(
         "files": normalized.files,
         "row_count": run.row_count,
         "finding_count": run.finding_count,
+        "skipped_duplicates": skipped_duplicates,
         "warnings": normalized.warnings,
         "findings": [finding_dict(item) for item in run.findings],
     }
@@ -715,3 +822,451 @@ def list_cases(limit: int = 50, db: Session = Depends(get_db)):
         }
         for c in cases
     ]
+
+
+# ---------------------------------------------------------------------------
+# Dashboard (all figures derived from persisted records)
+# ---------------------------------------------------------------------------
+@app.get("/api/dashboard/overview")
+def dashboard_metrics(db: Session = Depends(get_db)):
+    return dashboard_overview(db)
+
+
+# ---------------------------------------------------------------------------
+# Transaction management: search, filter, provenance and detail
+# ---------------------------------------------------------------------------
+@app.get("/api/transactions")
+def search_transactions(
+    q: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    min_amount: float | None = None,
+    max_amount: float | None = None,
+    direction: str | None = None,
+    source_file: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    query = db.query(TransactionRecord)
+    if q:
+        like = f"%{q.lower()}%"
+        query = query.filter(
+            or_(
+                TransactionRecord.description.ilike(like),
+                TransactionRecord.vendor.ilike(like),
+                TransactionRecord.transaction_id.ilike(like),
+                TransactionRecord.reference.ilike(like),
+                TransactionRecord.category.ilike(like),
+            )
+        )
+    if date_from:
+        query = query.filter(TransactionRecord.date >= date_from)
+    if date_to:
+        query = query.filter(TransactionRecord.date <= date_to)
+    if min_amount is not None:
+        query = query.filter(TransactionRecord.amount >= min_amount)
+    if max_amount is not None:
+        query = query.filter(TransactionRecord.amount <= max_amount)
+    if direction:
+        query = query.filter(TransactionRecord.direction == direction)
+    if source_file:
+        query = query.filter(TransactionRecord.source_file.ilike(f"%{source_file}%"))
+
+    total = query.count()
+    rows = (
+        query.order_by(TransactionRecord.date.desc(), TransactionRecord.id.desc())
+        .offset(max(0, offset))
+        .limit(min(max(1, limit), 500))
+        .all()
+    )
+    return {
+        "total": total,
+        "items": [
+            {
+                "id": row.id,
+                "transaction_id": row.transaction_id,
+                "date": row.date,
+                "amount": row.amount,
+                "signed_amount": row.signed_amount,
+                "direction": row.direction,
+                "vendor": row.vendor,
+                "description": row.description,
+                "category": row.category,
+                "source_file": row.source_file,
+                "source_row": row.source_row,
+                "duplicate_key": row.duplicate_key,
+                "channel": row.channel,
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.get("/api/transactions/{transaction_ref}")
+def transaction_detail(transaction_ref: str, db: Session = Depends(get_db)):
+    filters = [
+        TransactionRecord.transaction_id == transaction_ref,
+        TransactionRecord.reference == transaction_ref,
+    ]
+    if transaction_ref.isdigit():
+        filters.append(TransactionRecord.id == int(transaction_ref))
+    row = db.query(TransactionRecord).filter(or_(*filters)).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    alerts = (
+        db.query(RiskAlert)
+        .filter(RiskAlert.transaction_id == row.transaction_id)
+        .order_by(RiskAlert.risk_score.desc())
+        .all()
+    )
+    matches = (
+        db.query(ReconciliationResult)
+        .filter(
+            or_(
+                ReconciliationResult.bank_reference == row.transaction_id,
+                ReconciliationResult.ledger_reference == row.transaction_id,
+            )
+        )
+        .limit(20)
+        .all()
+    )
+    return {
+        "transaction": {
+            "id": row.id,
+            "transaction_id": row.transaction_id,
+            "date": row.date,
+            "amount": row.amount,
+            "signed_amount": row.signed_amount,
+            "direction": row.direction,
+            "vendor": row.vendor,
+            "description": row.description,
+            "category": row.category,
+            "account": row.account,
+            "upi_ref": row.upi_ref,
+            "source_file": row.source_file,
+            "source_row": row.source_row,
+            "duplicate_key": row.duplicate_key,
+        },
+        "risk_alerts": [
+            {
+                "id": alert.id,
+                "alert_code": alert.alert_code,
+                "risk_category": alert.risk_category,
+                "risk_score": alert.risk_score,
+                "severity": alert.severity,
+                "explanation": alert.explanation,
+                "review_status": alert.review_status,
+            }
+            for alert in alerts
+        ],
+        "reconciliation": [
+            {
+                "id": item.id,
+                "status": item.status,
+                "amount_difference": item.amount_difference,
+                "date_difference_days": item.date_difference_days,
+                "note": item.note,
+            }
+            for item in matches
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# RAG document ingestion and introspection
+# ---------------------------------------------------------------------------
+@app.post("/api/documents/ingest")
+async def ingest_documents(files: list[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="Upload at least one document.")
+    if len(files) > 20:
+        raise HTTPException(status_code=400, detail="Upload no more than 20 documents at once.")
+    results = []
+    for upload in files:
+        filename = safe_filename(upload.filename)
+        raw = await upload.read()
+        if not raw:
+            results.append({"filename": filename, "status": "error", "error": "Empty file"})
+            continue
+        if len(raw) > MAX_FILE_BYTES:
+            results.append({"filename": filename, "status": "error", "error": "File exceeds 5 MB"})
+            continue
+        try:
+            results.append(rag.ingest_upload(raw, filename))
+        except ValueError as exc:
+            results.append({"filename": filename, "status": "error", "error": str(exc)})
+    return {"results": results, "stats": rag.store_stats()}
+
+
+@app.post("/api/documents/sync-transactions")
+def sync_transactions_to_rag(db: Session = Depends(get_db)):
+    return rag.ingest_transactions(db)
+
+
+@app.get("/api/documents")
+def list_documents(limit: int = 50):
+    return {"stats": rag.store_stats(), "documents": rag.list_documents(limit)}
+
+
+# ---------------------------------------------------------------------------
+# AI Assistant (selective LangGraph workflow + grounded Ollama answer)
+# ---------------------------------------------------------------------------
+@app.get("/api/assistant/suggestions")
+def assistant_suggestions():
+    return {
+        "questions": [
+            "Explain my highest-risk transaction.",
+            "Why was this payment flagged?",
+            "Find possible duplicate payments.",
+            "Explain the latest reconciliation results.",
+            "Summarize this month's financial risks.",
+            "What evidence supports this alert?",
+            "Generate an investigation summary.",
+        ]
+    }
+
+
+@app.get("/api/assistant/config")
+def assistant_config():
+    return {
+        "backend": "ollama",
+        "available": llm.is_available(),
+        "model": llm.get_model(),
+        "host": llm.get_host(),
+        "rag": rag.store_stats(),
+    }
+
+
+@app.post("/api/assistant/query")
+def assistant_query(payload: dict):
+    question = str((payload or {}).get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required.")
+    if len(question) > 1000:
+        raise HTTPException(status_code=400, detail="question must be 1000 characters or fewer.")
+    result = get_assistant_graph().run(question)
+    links = []
+    for citation in result.get("citations", []):
+        if citation.get("type") in {"risk_alert", "transaction_record"} and citation.get("transaction_id"):
+            links.append(
+                {
+                    "label": citation.get("source"),
+                    "kind": citation.get("type"),
+                    "transaction_id": citation.get("transaction_id"),
+                }
+            )
+    return {
+        "question": question,
+        "answer": result.get("answer"),
+        "intent": result.get("intent"),
+        "agents_selected": result.get("route"),
+        "route_reason": result.get("route_reason"),
+        "sufficiency": result.get("sufficiency"),
+        "llm": result.get("llm"),
+        "evidence": result.get("sql_evidence", []),
+        "citations": result.get("citations", []),
+        "document_evidence": result.get("doc_evidence", []),
+        "agent_outputs": result.get("agent_outputs", {}),
+        "timeline": result.get("timeline", []),
+        "links": links,
+        "disclaimer": "AI assists human review. Findings are not proof of fraud and no financial action is authorised by this output.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Human confirmation of uncertain reconciliation matches
+# ---------------------------------------------------------------------------
+@app.post("/api/reconciliations/results/{result_id}/confirm")
+def confirm_reconciliation_result(result_id: int, payload: dict, db: Session = Depends(get_db)):
+    row = db.query(ReconciliationResult).filter(ReconciliationResult.id == result_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Reconciliation result not found")
+    decision = str((payload or {}).get("decision") or "").strip().lower()
+    if decision not in {"confirmed", "rejected"}:
+        raise HTTPException(status_code=400, detail="decision must be 'confirmed' or 'rejected'")
+    reviewer = str((payload or {}).get("reviewer") or "").strip()
+    if not reviewer:
+        raise HTTPException(status_code=400, detail="reviewer is required")
+    row.review_status = decision
+    row.reviewed_by = reviewer
+    row.reviewed_at = datetime.now(timezone.utc)
+    row.reviewer_comment = (payload or {}).get("comment")
+    if row.note:
+        row.note = f"{row.note}\nReview: {decision} by {reviewer}. {row.reviewer_comment or ''}".strip()
+    else:
+        row.note = f"Review: {decision} by {reviewer}. {row.reviewer_comment or ''}".strip()
+    db.commit()
+    db.refresh(row)
+    return {**reconciliation_result_dict(row), "review_status": row.review_status,
+            "reviewed_by": row.reviewed_by, "reviewed_at": row.reviewed_at.isoformat() if row.reviewed_at else None}
+
+
+# ---------------------------------------------------------------------------
+# Consolidated reports (PDF + CSV) from persisted records
+# ---------------------------------------------------------------------------
+def _investigation_explanation(run: InvestigationRun) -> dict:
+    """Extract the grounded report payload from a persisted investigation run."""
+    state = run.output_state if isinstance(run.output_state, dict) else {}
+    outputs = state.get("outputs") if isinstance(state.get("outputs"), dict) else {}
+    report = outputs.get("report") if isinstance(outputs.get("report"), dict) else {}
+    payload = report.get("output") if isinstance(report.get("output"), dict) else state
+
+    def strings(key: str, limit: int) -> list[str]:
+        values = payload.get(key) if isinstance(payload, dict) else []
+        return [str(item) for item in (values or [])[:limit]] if isinstance(values, list) else []
+
+    references = []
+    raw_references = payload.get("evidence_references") if isinstance(payload, dict) else []
+    if isinstance(raw_references, list):
+        for item in raw_references[:5]:
+            if isinstance(item, dict):
+                references.append(
+                    {
+                        "source_id": item.get("source_id"),
+                        "source_type": item.get("source_type"),
+                        "source_file": item.get("source_file"),
+                        "source_row": item.get("source_row"),
+                        "transaction_id": item.get("transaction_id"),
+                    }
+                )
+    return {
+        "ai_narrative": payload.get("ai_narrative") if isinstance(payload, dict) else None,
+        "conclusion_status": payload.get("conclusion_status") if isinstance(payload, dict) else None,
+        "verified_facts": strings("verified_facts", 5),
+        "recommended_review_actions": strings("recommended_review_actions", 3),
+        "evidence_references": references,
+    }
+
+
+@app.get("/api/reports/summary")
+def report_summary(db: Session = Depends(get_db)):
+    overview = dashboard_overview(db)
+    latest_recon = db.query(ReconciliationRun).order_by(ReconciliationRun.id.desc()).first()
+    alerts = db.query(RiskAlert).order_by(RiskAlert.risk_score.desc()).limit(20).all()
+    recent_runs = db.query(InvestigationRun).order_by(InvestigationRun.id.desc()).limit(10).all()
+    return {
+        "financial_summary": overview["metrics"],
+        "scope": overview["scope"],
+        "reconciliation": {
+            "id": latest_recon.id,
+            "bank_file": latest_recon.bank_filename,
+            "ledger_file": latest_recon.ledger_filename,
+            "summary": reconciliation_summary(latest_recon),
+        } if latest_recon else None,
+        "risk_alerts": [
+            {
+                "alert_code": alert.alert_code,
+                "risk_category": alert.risk_category,
+                "severity": alert.severity,
+                "risk_score": alert.risk_score,
+                "amount": alert.amount_value,
+                "transaction_id": alert.transaction_id,
+                "explanation": alert.explanation,
+                "review_status": alert.review_status,
+            }
+            for alert in alerts
+        ],
+        "investigations": [
+            {"id": run.id, "name": run.name, "status": run.status, "task_type": run.task_type}
+            for run in recent_runs
+        ],
+        "ai_explanations": [
+            {"investigation_id": run.id, "name": run.name, **_investigation_explanation(run)}
+            for run in recent_runs
+            if _investigation_explanation(run)["ai_narrative"]
+            or _investigation_explanation(run)["verified_facts"]
+        ],
+        "disclaimer": "Automated investigation leads for human review. Not proof of fraud.",
+    }
+
+
+@app.get("/api/reports/full.csv")
+def report_full_csv(db: Session = Depends(get_db)):
+    output = StringIO()
+    rows = []
+    for item in db.query(TransactionRecord).limit(10000).all():
+        rows.append({
+            "record_type": "transaction", "reference": item.transaction_id,
+            "date": item.date, "amount": item.amount, "direction": item.direction,
+            "description": item.description, "severity": "", "score": "",
+            "source_file": item.source_file, "source_row": item.source_row,
+        })
+    for alert in db.query(RiskAlert).limit(10000).all():
+        rows.append({
+            "record_type": "risk_alert", "reference": alert.alert_code,
+            "date": alert.detected_at.date().isoformat() if alert.detected_at else "",
+            "amount": alert.amount_value, "direction": "", "description": alert.explanation,
+            "severity": alert.severity, "score": alert.risk_score,
+            "source_file": (alert.evidence or {}).get("source_file") if isinstance(alert.evidence, dict) else "",
+            "source_row": "",
+        })
+    for run in db.query(InvestigationRun).limit(10000).all():
+        explanation = _investigation_explanation(run)
+        if not explanation["ai_narrative"] and not explanation["verified_facts"]:
+            continue
+        rows.append({
+            "record_type": "ai_explanation", "reference": f"investigation-{run.id}",
+            "date": run.finished_at.date().isoformat() if run.finished_at else "",
+            "amount": "", "direction": "",
+            "description": explanation["ai_narrative"] or "; ".join(explanation["verified_facts"]),
+            "severity": explanation["conclusion_status"] or "", "score": "",
+            "source_file": ", ".join(
+                str(item.get("source_file") or "")
+                for item in explanation["evidence_references"]
+                if item.get("source_file")
+            ),
+            "source_row": "",
+        })
+    columns = ["record_type", "reference", "date", "amount", "direction", "description", "severity", "score", "source_file", "source_row"]
+    pd.DataFrame(rows, columns=columns).to_csv(output, index=False)
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv",
+                             headers={"Content-Disposition": "attachment; filename=finaudit_full_report.csv"})
+
+
+@app.get("/api/reports/full.pdf")
+def report_full_pdf(db: Session = Depends(get_db)):
+    overview = dashboard_overview(db)
+    lines = ["FINANCIAL INTELLIGENCE REPORT", "Automated indicators for human review - not proof of fraud", ""]
+    lines.append("FINANCIAL SUMMARY")
+    for key, value in overview["metrics"].items():
+        lines.append(f"  {key.replace('_', ' ').title()}: {value}")
+    lines.append("")
+    lines.append("METRIC SCOPE")
+    for key, value in overview["scope"].items():
+        lines.append(f"  {key}: {value}")
+    lines.append("")
+    lines.append("TOP RISK ALERTS")
+    alerts = db.query(RiskAlert).order_by(RiskAlert.risk_score.desc()).limit(30).all()
+    for alert in alerts:
+        lines.append(f"  {alert.alert_code} | {alert.severity} | score {alert.risk_score} | {alert.risk_category} | {alert.transaction_id}")
+        lines.append(f"    {alert.explanation}")
+    lines.append("")
+    lines.append("AI EXPLANATIONS & INVESTIGATIONS")
+    investigations = (
+        db.query(InvestigationRun)
+        .order_by(InvestigationRun.id.desc())
+        .limit(10)
+        .all()
+    )
+    for run in investigations:
+        explanation = _investigation_explanation(run)
+        if not explanation["ai_narrative"] and not explanation["verified_facts"]:
+            continue
+        lines.append(
+            f"  Investigation #{run.id} | {run.name or 'investigation'} | "
+            f"{explanation['conclusion_status'] or run.status or 'unknown'}"
+        )
+        if explanation["ai_narrative"]:
+            lines.append(f"    AI narrative: {str(explanation['ai_narrative'])[:400]}")
+        for fact in explanation["verified_facts"][:3]:
+            lines.append(f"    Verified fact: {fact[:240]}")
+        for reference in explanation["evidence_references"][:3]:
+            lines.append(f"    Evidence: {reference}")
+    lines.append("")
+    lines.append("EVIDENCE REFERENCES")
+    for item in overview["recent_activity"][:20]:
+        lines.append(f"  {item['kind']} {item['reference']} | {item['date']} | {item['description']} | source {item.get('source_file') or 'n/a'}")
+    return StreamingResponse(iter([build_text_pdf("FinAudit AI - Financial Intelligence Report", lines)]),
+                             media_type="application/pdf",
+                             headers={"Content-Disposition": "attachment; filename=finaudit_full_report.pdf"})

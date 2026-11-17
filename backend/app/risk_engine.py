@@ -18,6 +18,12 @@ from typing import Any, Iterable
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from .csv_normalizer import (
+    CANONICAL_CHANNELS,
+    LEGACY_CHANNELS,
+    channel_from_description,
+)
+
 from .models import (
     Invoice,
     InvoiceDiscrepancy,
@@ -32,29 +38,11 @@ from .models import (
 )
 
 
-SUPPORTED_CHANNELS = (
-    "Online Banking",
-    "Mobile Banking",
-    "ATM",
-    "UPI",
-    "NEFT",
-    "RTGS",
-    "IMPS",
-    "Wire Transfer",
-    "POS",
-)
-
-CHANNEL_KEYWORDS = {
-    "UPI": ("upi", "@upi", "vpa", "gpay", "google pay", "phonepe", "paytm", "bhim"),
-    "NEFT": ("neft",),
-    "RTGS": ("rtgs",),
-    "IMPS": ("imps",),
-    "ATM": ("atm", "cash withdrawal", "cash withdraw"),
-    "POS": ("pos", "point of sale", "card swipe", "merchant terminal"),
-    "Wire Transfer": ("wire transfer", "wire", "swift", "international transfer"),
-    "Mobile Banking": ("mobile banking", "mobile app"),
-    "Online Banking": ("online banking", "netbanking", "internet banking", "net banking"),
-}
+# New uploads use the canonical labels. Legacy labels remain supported so old
+# stored transactions keep their original value and stay visible in analytics.
+SUPPORTED_CHANNELS = CANONICAL_CHANNELS + LEGACY_CHANNELS
+CHANNEL_LOOKUP = {channel.lower(): channel for channel in SUPPORTED_CHANNELS}
+CHANNEL_SOURCES = {"explicit", "inferred", "unknown", "explicit_unmapped"}
 
 CATEGORY_LABELS = (
     "Duplicate Payment",
@@ -102,7 +90,7 @@ PAYMENT_ANOMALY_TYPES = {
 DUPLICATE_INVOICE_TYPES = {"duplicate_invoice", "possible_duplicate_invoice"}
 
 SEVERITY_BASE = {"low": 30, "medium": 50, "high": 72, "critical": 88}
-REVIEW_STATUSES = ("open", "investigating", "resolved", "dismissed")
+REVIEW_STATUSES = ("open", "investigating", "resolved", "false_positive", "dismissed")
 
 
 @dataclass(frozen=True)
@@ -309,19 +297,48 @@ def is_debit_like(record: TransactionRecord) -> bool:
     return True
 
 
-def infer_channel(record: TransactionRecord | None) -> str:
+def _stored_channel_source(record: TransactionRecord | None) -> str:
+    source = _text(getattr(record, "channel_source", None)).lower()
+    return source if source in CHANNEL_SOURCES else ""
+
+
+def infer_channel_details(record: TransactionRecord | None) -> tuple[str, str]:
+    """Return ``(channel, source)`` without changing existing risk calculations.
+
+    An explicit source column always wins. Legacy labels are preserved for old
+    records while new uploads are normalised in ``csv_normalizer``. When no
+    source column exists, only transaction free text is classified and the
+    result is explicitly marked as inferred.
+    """
     if record is None:
-        return "Unknown"
+        return "Unknown", "unknown"
+
     explicit = _text(getattr(record, "channel", None))
     if explicit:
-        normalized = explicit.lower().replace("_", " ")
-        for channel in SUPPORTED_CHANNELS:
-            if normalized == channel.lower() or channel.lower() in normalized:
-                return channel
-        for channel, keywords in CHANNEL_KEYWORDS.items():
-            if any(keyword in normalized for keyword in keywords):
-                return channel
-    return "Unknown"
+        channel = CHANNEL_LOOKUP.get(explicit.lower())
+        if channel:
+            return channel, _stored_channel_source(record) or "explicit"
+        inferred = channel_from_description(explicit)
+        if inferred:
+            return inferred, _stored_channel_source(record) or "explicit"
+        return "Unknown", "explicit_unmapped"
+
+    free_text = " ".join(
+        part
+        for part in (
+            _text(getattr(record, "description", None)),
+            _text(getattr(record, "source_sms", None)),
+        )
+        if part
+    )
+    inferred = channel_from_description(free_text)
+    if inferred:
+        return inferred, "inferred"
+    return "Unknown", "unknown"
+
+
+def infer_channel(record: TransactionRecord | None) -> str:
+    return infer_channel_details(record)[0]
 
 
 def _location_from(record: TransactionRecord | None) -> dict[str, Any]:
@@ -1257,6 +1274,112 @@ def serialize_alert(alert: RiskAlert, include_events: bool = True) -> dict[str, 
     return payload
 
 
+def _channel_bucket(channel: str) -> dict[str, Any]:
+    return {
+        "channel": channel,
+        "transaction_count": 0,
+        "total_amount": 0.0,
+        "flagged_count": 0,
+        "flagged_amount": 0.0,
+        "source_counts": {source: 0 for source in sorted(CHANNEL_SOURCES)},
+    }
+
+
+def build_channel_analytics(
+    entries: Iterable[dict[str, Any]],
+    *,
+    transactions_analyzed: int | None = None,
+) -> dict[str, Any]:
+    """Aggregate channel counts from already-filtered transaction entries.
+
+    Every canonical channel is returned, including channels with zero activity
+    and ``Unknown``, so a supported channel never disappears from the dashboard.
+    Legacy labels are added only when a stored record still uses them.
+    """
+    stats: dict[str, dict[str, Any]] = {
+        channel: _channel_bucket(channel) for channel in CANONICAL_CHANNELS
+    }
+    trend: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    total_source_counts = {source: 0 for source in sorted(CHANNEL_SOURCES)}
+    analyzed = 0
+
+    for entry in entries:
+        channel = _text(entry.get("channel")) or "Unknown"
+        bucket = stats.setdefault(channel, _channel_bucket(channel))
+        source = _text(entry.get("channel_source")).lower()
+        if source not in CHANNEL_SOURCES:
+            source = "unknown"
+        amount = _amount(entry.get("amount"))
+        flagged = bool(entry.get("flagged"))
+        analyzed += 1
+
+        bucket["transaction_count"] += 1
+        bucket["total_amount"] += amount
+        bucket["source_counts"][source] += 1
+        total_source_counts[source] += 1
+        if flagged:
+            bucket["flagged_count"] += 1
+            bucket["flagged_amount"] += amount
+
+        day = _text(entry.get("date")) or "unknown"
+        day_bucket = trend[channel].setdefault(
+            day,
+            {
+                "date": day,
+                "transaction_count": 0,
+                "flagged_count": 0,
+                "amount": 0.0,
+                "flagged_amount": 0.0,
+            },
+        )
+        day_bucket["transaction_count"] += 1
+        day_bucket["amount"] += amount
+        if flagged:
+            day_bucket["flagged_count"] += 1
+            day_bucket["flagged_amount"] += amount
+
+    channels: list[dict[str, Any]] = []
+    for channel, bucket in stats.items():
+        count = bucket["transaction_count"]
+        bucket["total_amount"] = round(bucket["total_amount"], 2)
+        bucket["flagged_amount"] = round(bucket["flagged_amount"], 2)
+        bucket["risk_percentage"] = round((bucket["flagged_count"] / count) * 100, 2) if count else 0
+        bucket["explicit_count"] = bucket["source_counts"]["explicit"]
+        bucket["inferred_count"] = bucket["source_counts"]["inferred"]
+        bucket["unknown_count"] = bucket["source_counts"]["unknown"] + bucket["source_counts"]["explicit_unmapped"]
+        bucket["trend"] = []
+        for day in sorted(trend[channel]):
+            item = trend[channel][day]
+            item["amount"] = round(item["amount"], 2)
+            item["flagged_amount"] = round(item["flagged_amount"], 2)
+            bucket["trend"].append(item)
+        channels.append(bucket)
+
+    channel_order = {channel: index for index, channel in enumerate(SUPPORTED_CHANNELS)}
+    channels.sort(
+        key=lambda item: (
+            item["transaction_count"] == 0,
+            -item["transaction_count"],
+            channel_order.get(item["channel"], len(channel_order)),
+        )
+    )
+    unknown_count = next(
+        (item["transaction_count"] for item in channels if item["channel"] == "Unknown"),
+        0,
+    )
+    return {
+        "available": analyzed > 0,
+        "supported_channels": list(CANONICAL_CHANNELS),
+        "legacy_channels": list(LEGACY_CHANNELS),
+        "channels": channels,
+        "unknown_channel_count": unknown_count,
+        "transactions_analyzed": analyzed if transactions_analyzed is None else transactions_analyzed,
+        "source_counts": total_source_counts,
+        "inferred_count": total_source_counts["inferred"],
+        "unknown_count": total_source_counts["unknown"] + total_source_counts["explicit_unmapped"],
+    }
+
+
 def channel_analytics(db: Session) -> dict[str, Any]:
     records = load_analysis_transactions(db)
     alerts = db.query(RiskAlert).all()
@@ -1266,65 +1389,22 @@ def channel_analytics(db: Session) -> dict[str, Any]:
         flagged_ids.update(_alert_transaction_ids(alert))
         flagged_records.update(_alert_record_ids(alert))
 
-    stats: dict[str, dict[str, Any]] = {}
-    trend: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    entries: list[dict[str, Any]] = []
     for record in records:
-        channel = infer_channel(record)
-        amount = _abs_amount(record)
-        flagged = (
-            (record.id in flagged_records)
-            or (_text(record.transaction_id) in flagged_ids)
-        )
-        bucket = stats.setdefault(
-            channel,
+        channel, source = infer_channel_details(record)
+        entries.append(
             {
                 "channel": channel,
-                "transaction_count": 0,
-                "total_amount": 0.0,
-                "flagged_count": 0,
-                "flagged_amount": 0.0,
-            },
+                "channel_source": source,
+                "amount": _abs_amount(record),
+                "flagged": (
+                    record.id in flagged_records
+                    or _text(record.transaction_id) in flagged_ids
+                ),
+                "date": record.date,
+            }
         )
-        bucket["transaction_count"] += 1
-        bucket["total_amount"] += amount
-        if flagged:
-            bucket["flagged_count"] += 1
-            bucket["flagged_amount"] += amount
-        day = _text(record.date) or "unknown"
-        day_bucket = trend[channel].setdefault(
-            day,
-            {"date": day, "transaction_count": 0, "flagged_count": 0, "amount": 0.0, "flagged_amount": 0.0},
-        )
-        day_bucket["transaction_count"] += 1
-        day_bucket["amount"] += amount
-        if flagged:
-            day_bucket["flagged_count"] += 1
-            day_bucket["flagged_amount"] += amount
-
-    channels = []
-    for channel, bucket in stats.items():
-        count = bucket["transaction_count"]
-        bucket["total_amount"] = round(bucket["total_amount"], 2)
-        bucket["flagged_amount"] = round(bucket["flagged_amount"], 2)
-        bucket["risk_percentage"] = round((bucket["flagged_count"] / count) * 100, 2) if count else 0
-        channel_trend = []
-        for day in sorted(trend[channel]):
-            item = trend[channel][day]
-            item["amount"] = round(item["amount"], 2)
-            item["flagged_amount"] = round(item["flagged_amount"], 2)
-            channel_trend.append(item)
-        bucket["trend"] = channel_trend
-        channels.append(bucket)
-    channels.sort(key=lambda item: item["transaction_count"], reverse=True)
-    return {
-        "available": bool(records),
-        "supported_channels": list(SUPPORTED_CHANNELS),
-        "channels": channels,
-        "unknown_channel_count": next(
-            (item["transaction_count"] for item in channels if item["channel"] == "Unknown"), 0
-        ),
-        "transactions_analyzed": len(records),
-    }
+    return build_channel_analytics(entries, transactions_analyzed=len(records))
 
 
 def _parse_filter_date(value: Any) -> date | None:

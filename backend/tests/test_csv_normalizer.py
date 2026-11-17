@@ -231,9 +231,88 @@ def test_channel_and_location_columns_are_canonicalized():
 
     frame = normalize_files([("channels.csv", rows)]).frame
 
-    assert frame.iloc[0]["channel"] == "Mobile Banking"
+    assert frame.iloc[0]["channel"] == "Mobile App"
+    assert frame.iloc[0]["channel_source"] == "explicit"
+    assert frame.iloc[0]["location_status"] == "mapped"
     assert frame.iloc[0]["country"] == "India"
     assert frame.iloc[0]["latitude"] == 12.9716
-    assert frame.iloc[1]["channel"] == "Unknown"
+    assert frame.iloc[1]["channel"] == "Wire Transfer"
+    assert frame.iloc[1]["channel_source"] == "inferred"
+    assert frame.iloc[1]["description"] == "Paid by RTGS"
     assert frame.iloc[1]["country"] == ""
+    assert frame.iloc[1]["location_status"] == "unavailable"
     assert pd.isna(frame.iloc[1]["latitude"])
+
+
+def test_human_readable_headers_merchant_and_inferred_channel_are_preserved():
+    rows = pd.DataFrame(
+        [
+            {
+                "Transaction Date": "2026-03-10",
+                "Transaction Amount": "240.00",
+                "Merchant Name": "Fictional Cafe",
+                "Payment Description": "Paid by Google Pay",
+                "Transaction City": "Mumbai",
+                "Country Name": "India",
+            }
+        ]
+    )
+
+    result = normalize_files([("human-headers.csv", rows)])
+    frame = result.frame
+
+    assert result.errors == []
+    assert frame.iloc[0]["date"] == "2026-03-10"
+    assert frame.iloc[0]["amount"] == 240.0
+    assert frame.iloc[0]["merchant"] == "Fictional Cafe"
+    assert frame.iloc[0]["channel"] == "UPI"
+    assert frame.iloc[0]["channel_source"] == "inferred"
+    assert frame.iloc[0]["description"] == "Paid by Google Pay"
+    assert frame.iloc[0]["location_status"] == "named_only"
+
+
+def test_coordinate_pairs_are_validated_together():
+    rows = pd.DataFrame(
+        [
+            {
+                "date": "2026-03-11",
+                "type": "debit",
+                "amount": "10",
+                "city": "Duplicate City",
+                "latitude": "999",
+                "longitude": "10",
+            },
+            {
+                "date": "2026-03-11",
+                "type": "debit",
+                "amount": "20",
+                "city": "Incomplete City",
+                "latitude": "10",
+                "longitude": "",
+            },
+            {
+                "date": "2026-03-11",
+                "type": "debit",
+                "amount": "30",
+                "city": "Valid City",
+                "latitude": "10.5",
+                "longitude": "20.5",
+            },
+        ]
+    )
+
+    result = normalize_files([("coordinates.csv", rows)])
+    frame = result.frame
+
+    assert result.errors == []
+    assert list(frame["location_status"]) == [
+        "invalid_coordinates",
+        "invalid_coordinates",
+        "mapped",
+    ]
+    assert pd.isna(frame.iloc[0]["latitude"]) and pd.isna(frame.iloc[0]["longitude"])
+    assert pd.isna(frame.iloc[1]["latitude"]) and pd.isna(frame.iloc[1]["longitude"])
+    assert frame.iloc[2]["latitude"] == 10.5
+    assert frame.iloc[2]["longitude"] == 20.5
+    assert any("Latitude 999" in warning for warning in result.warnings)
+    assert any("Incomplete latitude/longitude pair" in warning for warning in result.warnings)

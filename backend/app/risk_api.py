@@ -23,7 +23,9 @@ from .geocoding import geocoding_status
 from .llm import explain_finding
 from .models import RiskAlert, RiskAlertEvent, RiskAnalysisRun
 from .risk_engine import (
+    CANONICAL_CHANNELS,
     CATEGORY_LABELS,
+    LEGACY_CHANNELS,
     REVIEW_STATUSES,
     SUPPORTED_CHANNELS,
     build_investigation,
@@ -68,6 +70,8 @@ def risk_config():
             "critical": [thresholds.critical_min, 100],
         },
         "supported_channels": list(SUPPORTED_CHANNELS),
+        "canonical_channels": list(CANONICAL_CHANNELS),
+        "legacy_channels": list(LEGACY_CHANNELS),
         "categories": list(CATEGORY_LABELS),
         "review_statuses": list(REVIEW_STATUSES),
         "environment_variables": [
@@ -184,6 +188,11 @@ def review_risk_alert(alert_id: str, payload: dict, db: Session = Depends(get_db
             "investigate": "investigating",
         }.get(action, alert.review_status)
     requested_status = str(requested_status).strip().lower()
+    requested_status = {
+        "under_investigation": "investigating",
+        "under investigation": "investigating",
+        "false positive": "false_positive",
+    }.get(requested_status, requested_status)
     if requested_status not in REVIEW_STATUSES:
         raise HTTPException(
             status_code=422,

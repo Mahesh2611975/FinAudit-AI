@@ -1,113 +1,155 @@
+"""Tests for the local Ollama-backed, grounded explanation layer."""
 import asyncio
 from types import SimpleNamespace
 
-import groq
 import httpx
 import pytest
 
 from app import llm
 from app.rag import POLICIES, retrieve_context
+from app.vector_store import VectorStore
 
 
 def run_explain(question="Possible duplicate payment to Acme", evidence="Vendor=Acme; amount=120.00"):
     return asyncio.run(llm.explain_finding(question, evidence))
 
 
-def fake_client(content="The payment [POLICY-DUP-01] needs review.", model="mock-model"):
-    captured = {}
-
-    async def create(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(
-            model=model,
-            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
-        )
-
-    client = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
-    )
-    return client, captured
+CONTEXTS = [
+    {
+        "source": "POLICY-DUP-01",
+        "text": "Duplicate payment review: compare vendor, date, amount and reference.",
+        "score": 0.42,
+    },
+    {
+        "source": "STRUCTURED-EVIDENCE",
+        "text": "Vendor=Acme; amount=120.00",
+        "score": 0.999,
+    },
+]
 
 
-def http_error(error_type, status_code, request):
-    return error_type(
-        "provider failure",
-        response=httpx.Response(status_code, request=request),
-        body={"error": "provider failure"},
-    )
+class FakeResponse:
+    def __init__(self, content="The payment [POLICY-DUP-01] needs review.", status_code=200):
+        self._content = content
+        self.status_code = status_code
+        self.payload = {
+            "message": {"role": "assistant", "content": self._content},
+        }
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("provider failure", request=httpx.Request("POST", "http://localhost"), response=httpx.Response(self.status_code))
+
+    def json(self):
+        return self.payload
 
 
-def test_missing_api_key_returns_safe_configuration_fallback(monkeypatch):
+def test_ollama_configuration_uses_local_host_and_needs_no_api_key(monkeypatch):
+    monkeypatch.setenv("OLLAMA_MODEL", "phi3:mini")
+    monkeypatch.setenv("OLLAMA_HOST", "http://127.0.0.1:12345/")
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
+
+    assert llm.get_model() == "phi3:mini"
+    assert llm.get_host() == "http://127.0.0.1:12345"
     assert llm.get_api_key() is None
     assert llm.create_client() is None
 
-    monkeypatch.setattr(llm, "client", None)
+
+def test_is_available_checks_local_ollama_tags(monkeypatch):
+    monkeypatch.setattr(llm, "get_host", lambda: "http://ollama.local:11434")
+    monkeypatch.setattr(
+        llm.httpx,
+        "get",
+        lambda url, timeout: SimpleNamespace(status_code=200 if url.endswith("/api/tags") else 500),
+    )
+    assert llm.is_available() is True
+
+    def fail(*args, **kwargs):
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(llm.httpx, "get", fail)
+    assert llm.is_available() is False
+
+
+def test_generate_posts_grounded_messages_to_ollama(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json, timeout):
+        captured.update(url=url, json=json, timeout=timeout)
+        return FakeResponse()
+
+    monkeypatch.setattr(llm, "get_model", lambda: "local-test-model")
+    monkeypatch.setattr(llm, "get_host", lambda: "http://127.0.0.1:11434")
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+
+    answer = llm.generate("Explain the finding", system="Cautious assistant", max_tokens=123)
+
+    assert answer == "The payment [POLICY-DUP-01] needs review."
+    assert captured["url"] == "http://127.0.0.1:11434/api/chat"
+    assert captured["json"]["model"] == "local-test-model"
+    assert captured["json"]["options"]["num_predict"] == 123
+    assert captured["json"]["messages"] == [
+        {"role": "system", "content": "Cautious assistant"},
+        {"role": "user", "content": "Explain the finding"},
+    ]
+
+
+def test_generate_returns_none_when_ollama_request_fails(monkeypatch):
+    def fail(*args, **kwargs):
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(llm.httpx, "post", fail)
+    assert llm.generate("Explain") is None
+
+
+def test_unavailable_ollama_returns_evidence_only_fallback(monkeypatch):
+    monkeypatch.setattr(llm, "retrieve_context", lambda *args, **kwargs: CONTEXTS)
+    monkeypatch.setattr(llm, "is_available", lambda: False)
+
     result = run_explain()
 
     assert result["fallback"] is True
-    assert result["error_category"] == "configuration"
-    assert "GROQ_API_KEY" in result["answer"]
-    assert result["retrieved_sources"]
+    assert result["error_category"] == "ollama_unavailable"
+    assert "Ollama is not running" in result["answer"]
+    assert result["retrieved_sources"] == [
+        {"source": "POLICY-DUP-01", "score": 0.42},
+        {"source": "STRUCTURED-EVIDENCE", "score": 0.999},
+    ]
     assert result["model"] == llm.MODEL
 
 
-def test_successful_groq_response_uses_retrieved_context(monkeypatch):
-    client, captured = fake_client()
-    monkeypatch.setattr(llm, "client", client)
+def test_successful_ollama_response_is_grounded_in_retrieved_context(monkeypatch):
+    captured = {}
+
+    async def fake_agenerate(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured["kwargs"] = kwargs
+        return "The payment [POLICY-DUP-01] needs review."
+
+    monkeypatch.setattr(llm, "retrieve_context", lambda *args, **kwargs: CONTEXTS)
+    monkeypatch.setattr(llm, "is_available", lambda: True)
+    monkeypatch.setattr(llm, "agenerate", fake_agenerate)
 
     result = run_explain()
 
     assert result["fallback"] is False
     assert result["answer"] == "The payment [POLICY-DUP-01] needs review."
-    assert result["model"] == "mock-model"
-    assert {"source": "POLICY-DUP-01"}.items() <= next(
-        item for item in result["retrieved_sources"] if item["source"] == "POLICY-DUP-01"
-    ).items()
+    assert result["model"] == llm.MODEL
     assert all(set(item) == {"source", "score"} for item in result["retrieved_sources"])
-
-    prompt = captured["messages"][1]["content"]
-    assert "POLICY-DUP-01" in prompt
-    assert "Vendor=Acme" in prompt
-    assert "Never invent or cite any other source" in prompt
-
-
-@pytest.mark.parametrize(
-    ("make_error", "expected_category"),
-    [
-        (lambda req: http_error(groq.AuthenticationError, 401, req), "authentication"),
-        (lambda req: http_error(groq.PermissionDeniedError, 403, req), "permission"),
-        (lambda req: http_error(groq.RateLimitError, 429, req), "rate_limit"),
-        (lambda req: http_error(groq.NotFoundError, 404, req), "model_or_resource_not_found"),
-        (lambda req: groq.APIConnectionError(request=req), "network"),
-        (lambda req: groq.APITimeoutError(req), "timeout"),
-    ],
-)
-def test_provider_errors_return_safe_fallback(monkeypatch, caplog, make_error, expected_category):
-    request = httpx.Request("POST", "https://api.groq.example/chat/completions")
-
-    class FailingCompletions:
-        async def create(self, **kwargs):
-            raise make_error(request)
-
-    client = SimpleNamespace(
-        chat=SimpleNamespace(completions=FailingCompletions())
-    )
-    monkeypatch.setattr(llm, "client", client)
-
-    result = run_explain()
-
-    assert result["fallback"] is True
-    assert result["error_category"] == expected_category
-    assert "provider failure" not in result["answer"]
-    assert "GROQ_API_KEY" not in result["answer"]
-    assert expected_category in caplog.text
+    assert "POLICY-DUP-01" in captured["prompt"]
+    assert "Vendor=Acme" in captured["prompt"]
+    assert "Never invent or guess transaction IDs" in captured["prompt"]
+    assert "proof of fraud" in captured["kwargs"]["system"]
 
 
-def test_empty_model_response_returns_fallback(monkeypatch):
-    client, _ = fake_client(content=None)
-    monkeypatch.setattr(llm, "client", client)
+def test_empty_model_response_returns_safe_fallback(monkeypatch):
+    monkeypatch.setattr(llm, "retrieve_context", lambda *args, **kwargs: CONTEXTS)
+    monkeypatch.setattr(llm, "is_available", lambda: True)
 
+    async def empty(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(llm, "agenerate", empty)
     result = run_explain()
 
     assert result["fallback"] is True
@@ -115,23 +157,25 @@ def test_empty_model_response_returns_fallback(monkeypatch):
     assert "empty response" in result["answer"].lower()
 
 
-def test_retrieval_returns_known_source_metadata(monkeypatch):
+def test_retrieval_returns_known_source_metadata_with_empty_store(monkeypatch, tmp_path):
+    monkeypatch.setattr("app.rag._store", VectorStore(tmp_path / "rag"))
     contexts = retrieve_context(
         "Possible duplicate payment to Acme",
         "Vendor=Acme; amount=120.00",
     )
     source_ids = {item["source"] for item in contexts}
-    allowed_ids = {item["source"] for item in POLICIES} | {"TRANSACTION-EVIDENCE"}
+    allowed_ids = {item["source"] for item in POLICIES} | {"STRUCTURED-EVIDENCE"}
 
     assert "POLICY-DUP-01" in source_ids
-    assert "TRANSACTION-EVIDENCE" in source_ids
+    assert "STRUCTURED-EVIDENCE" in source_ids
     assert source_ids <= allowed_ids
     assert all(set(item) == {"source", "text", "score"} for item in contexts)
     assert all(0 <= item["score"] <= 1 for item in contexts)
 
 
-def test_irrelevant_or_empty_evidence_retrieval_is_safe():
+def test_irrelevant_or_empty_evidence_retrieval_is_safe(monkeypatch, tmp_path):
+    monkeypatch.setattr("app.rag._store", VectorStore(tmp_path / "rag"))
     assert retrieve_context("zzzxq plugh") == []
 
     contexts = retrieve_context("duplicate payment", "")
-    assert all(item["source"] != "TRANSACTION-EVIDENCE" for item in contexts)
+    assert all(item["source"] != "STRUCTURED-EVIDENCE" for item in contexts)
