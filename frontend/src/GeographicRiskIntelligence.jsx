@@ -88,6 +88,31 @@ const locationSourceLabel = (source) => {
   }
 };
 
+const locationStatusLabel = (status) => {
+  switch (status) {
+    case 'mapped':
+      return 'Mapped with valid coordinates';
+    case 'named_only':
+      return 'Named location only · coordinates unavailable';
+    case 'invalid_coordinates':
+      return 'Invalid coordinate pair ignored';
+    default:
+      return 'Location unavailable';
+  }
+};
+
+const channelSourceLabel = (item) => {
+  const source = String(item?.channel_source || '').toLowerCase();
+  if (source === 'inferred') return 'Inferred from description';
+  if (source === 'explicit') return 'Explicit channel column';
+  if (source === 'explicit_unmapped') return 'Unmapped explicit value';
+  const counts = item?.source_counts;
+  if (counts?.inferred && !counts?.explicit && !counts?.unknown) return 'Inferred from description';
+  if (counts?.explicit && !counts?.inferred && !counts?.unknown) return 'Explicit channel column';
+  if (counts?.inferred || counts?.explicit) return 'Mixed sources';
+  return 'Unknown source';
+};
+
 async function geoApi(apiBase, path, options = {}) {
   const response = await fetch(`${apiBase}${path}`, {
     headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
@@ -199,8 +224,11 @@ function MarkerDetail({ marker, onClose }) {
         <div><span>State</span><strong>{marker.state || LOCATION_UNAVAILABLE}</strong></div>
         <div><span>Country</span><strong>{marker.country || LOCATION_UNAVAILABLE}</strong></div>
         <div><span>Channel</span><strong>{marker.channel || 'Unknown'}</strong></div>
+        <div><span>Channel source</span><strong>{channelSourceLabel(marker)}</strong></div>
+        <div><span>Merchant</span><strong>{marker.merchant || '—'}</strong></div>
         <div><span>Source file</span><strong>{marker.source_file || '—'}</strong></div>
         <div><span>Source row</span><strong>{marker.source_row || '—'}</strong></div>
+        <div><span>Location status</span><strong>{locationStatusLabel(marker.location_status)}</strong></div>
         <div><span>Coordinates</span><strong>{marker.latitude != null && marker.longitude != null ? `${Number(marker.latitude).toFixed(4)}, ${Number(marker.longitude).toFixed(4)}` : LOCATION_UNAVAILABLE}</strong></div>
         <div><span>Location source</span><strong>{locationSourceLabel(marker.location_source)}</strong></div>
       </div>
@@ -363,6 +391,46 @@ function UnusualLocationsPanel({ locations }) {
   );
 }
 
+function GeoChannelPanel({ analytics, currency }) {
+  const channels = analytics?.channels || [];
+  const observed = channels.filter((item) => item.transaction_count > 0);
+  return (
+    <section className="risk-card geo-panel">
+      <div className="risk-card-header">
+        <div>
+          <h2>Channel analytics for this map filter</h2>
+          <p>Counts and flagged values by payment channel, with source provenance.</p>
+        </div>
+        <span className="risk-meta-pill"><Layers size={13} /> {fmtNumber(analytics?.transactions_analyzed)} txns</span>
+      </div>
+      {channels.length === 0 ? (
+        <GeoEmpty title="No channel analytics" detail="No transactions match the current geographic filter." />
+      ) : (
+        <>
+          <div className="geo-channel-list">
+            {channels.map((item) => (
+              <div key={item.channel} className={item.transaction_count ? '' : 'geo-channel-empty'}>
+                <div className="geo-channel-name">
+                  <strong>{item.channel}</strong>
+                  <small>{channelSourceLabel(item)}</small>
+                </div>
+                <div className="geo-channel-stats">
+                  <span><b>{fmtNumber(item.transaction_count)}</b> txns</span>
+                  <span><b>{fmtNumber(item.flagged_count)}</b> flagged</span>
+                  <span className="geo-channel-value">{fmtCurrency(item.flagged_amount, currency)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+          <p className="risk-muted">
+            {fmtNumber(observed.length)} active channels · {fmtNumber(analytics?.inferred_count)} inferred from descriptions · Unknown remains listed.
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
+
 function GeoTrendTooltip({ active, payload, label }) {
   if (!active || !payload?.length) return null;
   const item = payload[0].payload;
@@ -427,6 +495,7 @@ export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1
   const cities = data?.high_risk_locations || [];
   const unusualLocations = data?.unusual_locations || [];
   const trend = data?.trend || [];
+  const channelAnalytics = data?.channel_analytics || null;
   const options = data?.options || { countries: [], channels: [], risk_levels: [] };
   const geocoding = data?.geocoding || {};
   const available = Boolean(data?.available && markers.length > 0);
@@ -774,15 +843,19 @@ export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1
       </div>
 
       <div className="geo-panel-grid">
-        <UnusualLocationsPanel locations={unusualLocations} />
+        <GeoChannelPanel analytics={channelAnalytics} currency={currency} />
         <GeoTrendPanel trend={trend} />
+      </div>
+
+      <div className="geo-panel-grid">
+        <UnusualLocationsPanel locations={unusualLocations} />
       </div>
 
       <div className="geo-footnote">
         <Globe2 size={14} />
         <span>
           {summary
-            ? `${fmtNumber(summary.coordinate_transactions)} markers use stored or alert coordinates; ${fmtNumber(summary.geocoded_transactions)} use cached geocoding. ${fmtPercent(
+            ? `${fmtNumber(summary.coordinate_transactions)} markers use stored or alert coordinates; ${fmtNumber(summary.geocoded_transactions)} use cached geocoding. ${fmtNumber(summary.unavailable_location_transactions)} unavailable, ${fmtNumber(summary.named_only_transactions)} named-only and ${fmtNumber(summary.invalid_coordinate_transactions)} invalid-coordinate transactions are reported without invented markers. ${fmtPercent(
               summary.transactions_with_location_information
                 ? (summary.located_transactions / summary.transactions_with_location_information) * 100
                 : 0

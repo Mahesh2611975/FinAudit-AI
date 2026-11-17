@@ -133,9 +133,18 @@ function ChannelTooltip({ active, payload }) {
       <strong>{item.channel}</strong>
       <div>Transactions: {fmtNumber(item.transaction_count)}</div>
       <div>Flagged: {fmtNumber(item.flagged_count)} ({fmtPercent(item.risk_percentage)})</div>
+      <div>Flagged amount: {fmtCurrency(item.flagged_amount)}</div>
       <div>Total value: {fmtCurrency(item.total_amount)}</div>
+      <div>Explicit: {fmtNumber(item.explicit_count)} · Inferred: {fmtNumber(item.inferred_count)}</div>
     </div>
   );
+}
+
+function channelSourceLabel(channel) {
+  if (channel?.inferred_count && !channel?.explicit_count) return 'inferred from description';
+  if (channel?.explicit_count && !channel?.inferred_count) return 'explicit source column';
+  if (channel?.explicit_count && channel?.inferred_count) return 'explicit + inferred';
+  return 'no transactions';
 }
 
 function AlertDetail({
@@ -554,9 +563,11 @@ export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000' }) 
           <div className="risk-card-header">
             <div>
               <h2>Channel risk</h2>
-              <p>Transactions and flagged activity by payment channel.</p>
+              <p>Counts, flagged amounts and provenance by payment channel. Unknown stays visible.</p>
             </div>
-            <span className="risk-meta-pill">{fmtNumber(channels?.unknown_channel_count)} unknown</span>
+            <span className="risk-meta-pill">
+              {fmtNumber(channels?.transactions_analyzed)} analyzed · {fmtNumber(channels?.unknown_channel_count)} unknown
+            </span>
           </div>
           {channelRows.length === 0 ? (
             <EmptyState icon={Radar} title="No channel data" detail="Upload transactions with a channel or payment mode to see channel analytics." />
@@ -564,7 +575,7 @@ export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000' }) 
             <>
               <div className="risk-chart">
                 <ResponsiveContainer width="100%" height={220}>
-                  <BarChart data={channelRows.slice(0, 8)} margin={{ top: 10, right: 10, left: -18, bottom: 0 }}>
+                  <BarChart data={channelRows.filter((item) => item.transaction_count > 0).slice(0, 8)} margin={{ top: 10, right: 10, left: -18, bottom: 0 }}>
                     <CartesianGrid stroke="rgba(148,163,184,0.12)" vertical={false} />
                     <XAxis dataKey="channel" tick={{ fill: '#7f8da8', fontSize: 10 }} axisLine={false} tickLine={false} interval={0} angle={-16} textAnchor="end" height={48} />
                     <YAxis allowDecimals={false} tick={{ fill: '#7f8da8', fontSize: 11 }} axisLine={false} tickLine={false} />
@@ -574,15 +585,26 @@ export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000' }) 
                   </BarChart>
                 </ResponsiveContainer>
               </div>
-              <div className="risk-channel-list">
-                {channelRows.slice(0, 6).map((item) => (
-                  <div key={item.channel}>
-                    <span>{item.channel}</span>
-                    <div className="risk-channel-bar"><span style={{ width: `${Math.min(item.risk_percentage, 100)}%` }} /></div>
-                    <strong>{fmtPercent(item.risk_percentage)}</strong>
-                  </div>
-                ))}
+              <div className="risk-channel-table">
+                <div className="risk-channel-table-head">
+                  <span>Channel</span><span>Txns</span><span>Flagged</span><span>Flagged value</span><span>Source</span>
+                </div>
+                <div className="risk-channel-table-body">
+                  {channelRows.map((item) => (
+                    <div key={item.channel} className={item.transaction_count ? '' : 'risk-channel-empty'}>
+                      <span>{item.channel}</span>
+                      <span>{fmtNumber(item.transaction_count)}</span>
+                      <span>{fmtNumber(item.flagged_count)}</span>
+                      <span>{fmtCurrency(item.flagged_amount)}</span>
+                      <span>{channelSourceLabel(item)}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
+              <p className="risk-muted risk-channel-footnote">
+                {fmtNumber(channels?.inferred_count)} channels were inferred from descriptions and keep the original description text.
+                Explicit payment-channel columns always take precedence.
+              </p>
             </>
           )}
         </section>

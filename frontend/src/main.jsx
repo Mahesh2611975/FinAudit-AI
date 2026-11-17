@@ -53,23 +53,23 @@ import {
   YAxis
 } from 'recharts';
 import './style.css';
+import './workspace.css';
 import RiskIntelligence from './RiskIntelligence';
+import Dashboard from './Dashboard';
+import Transactions from './Transactions';
+import Assistant from './Assistant';
 
 const API = (
   import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
 ).replace(/\/$/, '');
 
 const NAV_ITEMS = [
-  { id: 'overview', label: 'Overview', icon: LayoutDashboard },
-  { id: 'analytics', label: 'Financial Analytics', icon: BarChart3 },
-  { id: 'risk-intelligence', label: 'Risk Intelligence', icon: ShieldAlert },
-  { id: 'monitoring', label: 'Monitoring', icon: Activity },
-  { id: 'investigations', label: 'Investigations', icon: FileSearch },
-  { id: 'cases', label: 'Cases', icon: Users },
-  { id: 'reconciliation', label: 'Bank Reconciliation', icon: ArrowLeftRight },
-  { id: 'agents', label: 'AI Agent Center', icon: Sparkles },
+  { id: 'overview', label: 'Dashboard', icon: LayoutDashboard },
+  { id: 'transactions', label: 'Transactions', icon: FileSpreadsheet },
+  { id: 'reconciliation', label: 'Reconciliation', icon: ArrowLeftRight },
+  { id: 'risk-intelligence', label: 'Risk Alerts', icon: ShieldAlert },
+  { id: 'assistant', label: 'AI Assistant', icon: Bot },
   { id: 'reports', label: 'Reports', icon: FileText },
-  { id: 'compliance', label: 'Compliance', icon: ShieldCheck },
   { id: 'settings', label: 'Settings', icon: Settings }
 ];
 
@@ -84,7 +84,12 @@ const INVOICE_NAV_ITEMS = [
   { id: 'invoice-analytics', label: 'Invoice Analytics', icon: BarChart3 }
 ];
 
-const ALL_NAV_ITEMS = [...NAV_ITEMS, ...INVOICE_NAV_ITEMS];
+const ALL_NAV_ITEMS = [...NAV_ITEMS, ...INVOICE_NAV_ITEMS, { id: 'analytics' }, { id: 'monitoring' }, { id: 'investigations' }, { id: 'cases' }, { id: 'agents' }, { id: 'compliance' }];
+
+const SECONDARY_VIEWS = new Set([
+  'analytics', 'monitoring', 'investigations', 'cases', 'agents', 'compliance',
+  ...INVOICE_NAV_ITEMS.map((item) => item.id),
+]);
 
 const RECON_STEPS = [
   'Select Files',
@@ -1806,6 +1811,7 @@ function App() {
   const [reconciliations, setReconciliations] = useState([]);
   const [reconciliation, setReconciliation] = useState(null);
   const [loadingOverview, setLoadingOverview] = useState(false);
+  const [transactionFocus, setTransactionFocus] = useState('');
 
   const themeClass = activeView === 'reconciliation' ? 'theme-reconciliation' : 'theme-dashboard';
 
@@ -1842,12 +1848,25 @@ function App() {
         setMobileMenuOpen(false);
       }
     };
+    const transactionHandler = (event) => {
+      if (typeof event.detail === 'string') {
+        setTransactionFocus(`${Date.now()}:${event.detail}`);
+        setActiveView('transactions');
+        setMobileMenuOpen(false);
+      }
+    };
     document.addEventListener('finaudit:navigate', handler);
-    return () => document.removeEventListener('finaudit:navigate', handler);
+    document.addEventListener('finaudit:open-transaction', transactionHandler);
+    return () => {
+      document.removeEventListener('finaudit:navigate', handler);
+      document.removeEventListener('finaudit:open-transaction', transactionHandler);
+    };
   }, []);
 
   const pageTitle = {
-    overview: { eyebrow: 'Dashboard', title: 'Financial Risk Overview', description: 'Monitor audits, findings, and reconciliation activity at a glance.' },
+    overview: { eyebrow: 'Dashboard', title: 'Financial Intelligence Dashboard', description: 'Database-backed KPIs, five charts and recent evidence from actual records.' },
+    transactions: { eyebrow: 'Transactions', title: 'Transaction Management', description: 'Import, validate, search and inspect transactions with full source provenance.' },
+    assistant: { eyebrow: 'AI Assistant', title: 'Grounded AI Assistant', description: 'Selective multi-agent investigation with SQL evidence, RAG citations and human review.' },
     analytics: { eyebrow: 'Analytics', title: 'Financial Analytics', description: 'Monthly spending, categories, trends and transaction details from actual data.' },
     'risk-intelligence': { eyebrow: 'Risk Intelligence', title: 'Financial Risk & Fraud Intelligence', description: 'Deterministic risk scoring, anomaly alerts, channel analytics, trends and geography from stored records.' },
     monitoring: { eyebrow: 'Monitoring', title: 'Audit Activity Monitoring', description: 'Historical audit runs, findings by risk/type, and activity.' },
@@ -1885,25 +1904,6 @@ function App() {
 
         <div className="side-label">Navigation</div>
         {NAV_ITEMS.map((item) => {
-          const Icon = item.icon;
-          return (
-            <button
-              key={item.id}
-              type="button"
-              className={`nav ${activeView === item.id ? 'active' : ''}`}
-              onClick={() => {
-                setActiveView(item.id);
-                setMobileMenuOpen(false);
-              }}
-            >
-              <Icon size={18} />
-              <span>{item.label}</span>
-            </button>
-          );
-        })}
-
-        <div className="side-label" style={{ marginTop: 16 }}>Invoice Audit</div>
-        {INVOICE_NAV_ITEMS.map((item) => {
           const Icon = item.icon;
           return (
             <button
@@ -1959,17 +1959,18 @@ function App() {
           </div>
         </header>
 
+        {SECONDARY_VIEWS.has(activeView) && (
+          <div className="workspace-backbar">
+            <button className="secondary-btn" type="button" onClick={() => setActiveView('reports')}>← Reports workspace</button>
+            <span>Additional workspace · reachable from Reports</span>
+          </div>
+        )}
+
         {activeView === 'overview' && (
-          <OverviewPage
-            audits={audits}
-            reconciliations={reconciliations}
-            loading={loadingOverview}
-            onAuditCreated={loadOverview}
-            onNavigateInvestigations={() => {
-              setActiveView('investigations');
-              setMobileMenuOpen(false);
-            }}
-          />
+          <Dashboard onNavigate={(view) => setActiveView(view)} />
+        )}
+        {activeView === 'transactions' && (
+          <Transactions focusRef={transactionFocus} />
         )}
         {activeView === 'monitoring' && (
           <MonitoringPage audits={audits} loadOverview={loadOverview} />
@@ -1994,11 +1995,14 @@ function App() {
         {activeView === 'risk-intelligence' && (
           <RiskIntelligence apiBase={API} />
         )}
+        {activeView === 'assistant' && (
+          <Assistant />
+        )}
         {activeView === 'agents' && (
           <AgentsPage />
         )}
         {activeView === 'reports' && (
-          <ReportsPage audits={audits} reconciliations={reconciliations} />
+          <ReportsPage audits={audits} reconciliations={reconciliations} onNavigate={setActiveView} />
         )}
         {activeView === 'compliance' && (
           <CompliancePage audits={audits} reconciliations={reconciliations} />
@@ -2367,24 +2371,101 @@ function AgentsPage() {
 }
 
 
-function ReportsPage({ audits = [], reconciliations = [] }) {
+function ReportsPage({ audits = [], reconciliations = [], onNavigate }) {
+  const [summary, setSummary] = useState(null);
+  const [error, setError] = useState('');
+  const navigate = (view) => onNavigate && onNavigate(view);
+
+  useEffect(() => {
+    let active = true;
+    fetch(`${API}/api/reports/summary`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Report summary failed (${response.status})`);
+        return response.json();
+      })
+      .then((data) => { if (active) setSummary(data); })
+      .catch((err) => { if (active) setError(err.message); });
+    return () => { active = false; };
+  }, []);
+
+  const financial = summary?.financial_summary || {};
+  const recon = summary?.reconciliation;
+  const latestAuditId = audits[0]?.id;
+  const latestReconId = reconciliations[0]?.id || reconciliations[0]?.reconciliation_id;
+
   return (
-    <>
-      <header className="page-header">
-        <div>
-          <h1>Reports & Exports</h1>
-          <p>Export audit findings, reconciliation results, and analytics.</p>
-        </div>
-      </header>
-      <div className="quick-actions">
-        <a className="action-card" href={`${API}/api/analytics/export.csv`}><div className="icon-wrap"><Download size={20}/></div><div><strong>Export all analytics (CSV)</strong><span>Transactions with provenance</span></div></a>
-        {(audits[0]?.id) && <a className="action-card" href={`${API}/api/audits/${audits[0].id}/export.csv`}><div className="icon-wrap"><Download size={20}/></div><div><strong>Latest audit findings (CSV)</strong><span>Audit #{audits[0].id}</span></div></a>}
-        {(reconciliations[0]?.id || reconciliations[0]?.reconciliation_id) && <a className="action-card" href={`${API}/api/reconciliations/${reconciliations[0].id || reconciliations[0].reconciliation_id}/export.csv`}><div className="icon-wrap"><Download size={20}/></div><div><strong>Latest reconciliation (CSV)</strong><span>Run export</span></div></a>}
+    <div className="reports-workspace">
+      <div className="report-toolbar">
+        <a className="primary-btn" href={`${API}/api/reports/full.pdf`}><Download size={16} />Full report (PDF)</a>
+        <a className="secondary-btn" href={`${API}/api/reports/full.csv`}><Download size={16} />Full report (CSV)</a>
+        <a className="secondary-btn" href={`${API}/api/analytics/export.csv`}><Download size={16} />Transaction export</a>
+        {latestAuditId && <a className="secondary-btn" href={`${API}/api/audits/${latestAuditId}/export.csv`}><Download size={16} />Audit #{latestAuditId}</a>}
+        {latestReconId && <a className="secondary-btn" href={`${API}/api/reconciliations/${latestReconId}/export.csv`}><Download size={16} />Reconciliation #{latestReconId}</a>}
       </div>
-      <section className="panel" style={{ padding: 18 }}>
-        <p style={{ color: 'var(--dash-text-secondary)' }}>All exports link to actual backend data. Deterministic results distinguished from AI interpretations in Agent Center.</p>
+      {error && <div className="ai-alert ai-alert-error"><AlertTriangle size={15} />{error}</div>}
+
+      <div className="kpi-grid">
+        <article className="kpi-card"><div className="kpi-top"><div className="kpi-label"><span>Transactions</span><strong>{fmtNumber(financial.total_transactions)}</strong></div><div className="kpi-icon blue"><FileText size={19}/></div></div><span className="kpi-subtle">Stored records in scope</span></article>
+        <article className="kpi-card"><div className="kpi-top"><div className="kpi-label"><span>Spending</span><strong>{fmtCurrency(financial.total_spending)}</strong></div><div className="kpi-icon amber"><CircleDollarSign size={19}/></div></div><span className="kpi-subtle">Debit-like absolute amounts</span></article>
+        <article className="kpi-card"><div className="kpi-top"><div className="kpi-label"><span>Net cash flow</span><strong>{fmtCurrency(financial.net_cash_flow)}</strong></div><div className="kpi-icon cyan"><ArrowLeftRight size={19}/></div></div><span className="kpi-subtle">Received less spending</span></article>
+        <article className="kpi-card"><div className="kpi-top"><div className="kpi-label"><span>Risk alerts</span><strong>{fmtNumber(financial.total_risk_alerts)}</strong></div><div className="kpi-icon red"><ShieldAlert size={19}/></div></div><span className="kpi-subtle">Deterministic findings</span></article>
+      </div>
+
+      <div className="report-grid">
+        <section className="table-card report-panel">
+          <div className="section-header"><div><h2>Financial summary</h2><p>{summary?.scope?.spending || 'Scope is documented by the backend.'}</p></div></div>
+          <div className="report-definitions">
+            {Object.entries(summary?.scope || {}).map(([key, value]) => (
+              <div key={key}><strong>{key.replaceAll('_', ' ')}</strong><span>{Array.isArray(value) ? value.join(', ') : String(value)}</span></div>
+            ))}
+          </div>
+        </section>
+        <section className="table-card report-panel">
+          <div className="section-header"><div><h2>Reconciliation</h2><p>{recon ? `${recon.bank_file} ↔ ${recon.ledger_file}` : 'No reconciliation run stored'}</p></div></div>
+          {recon?.summary ? <div className="report-definitions">{Object.entries(recon.summary).map(([key, value]) => <div key={key}><strong>{key.replaceAll('_', ' ')}</strong><span>{String(value)}</span></div>)}</div> : <div className="empty-state"><ArrowLeftRight size={22}/><strong>No reconciliation data</strong><span>Run a reconciliation to include it in reports.</span></div>}
+        </section>
+        <section className="table-card report-panel">
+          <div className="section-header"><div><h2>Risk alerts</h2><p>Top deterministic alerts with evidence references</p></div></div>
+          {(summary?.risk_alerts || []).length ? <div className="data-table-wrap"><table className="data-table"><thead><tr><th>Alert</th><th>Category</th><th>Score</th><th>Transaction</th><th>Status</th></tr></thead><tbody>
+            {summary.risk_alerts.slice(0, 12).map((alert) => <tr key={alert.alert_code}><td className="table-primary">{alert.alert_code}</td><td>{alert.risk_category}</td><td>{alert.risk_score} · {alert.severity}</td><td>{alert.transaction_id || '—'}</td><td>{alert.review_status}</td></tr>)}
+          </tbody></table></div> : <div className="empty-state"><ShieldAlert size={22}/><strong>No alerts</strong><span>Run risk analysis first.</span></div>}
+        </section>
+        <section className="table-card report-panel">
+          <div className="section-header"><div><h2>Investigations & AI explanations</h2><p>Persisted runs; AI never changes deterministic results</p></div></div>
+          {(summary?.investigations || []).length ? <div className="data-table-wrap"><table className="data-table"><thead><tr><th>Run</th><th>Name</th><th>Type</th><th>Status</th></tr></thead><tbody>
+            {summary.investigations.map((run) => <tr key={run.id}><td className="table-primary">#{run.id}</td><td>{run.name || '—'}</td><td>{run.task_type}</td><td>{run.status}</td></tr>)}
+          </tbody></table></div> : <div className="empty-state"><FileSearch size={22}/><strong>No investigations</strong><span>Use the AI Assistant to run an investigation.</span></div>}
+          {(summary?.ai_explanations || []).slice(0, 3).map((item) => (
+            <div className="ai-explanation-summary" key={item.investigation_id}>
+              <strong>Investigation #{item.investigation_id} · {item.conclusion_status || 'review required'}</strong>
+              <p>{item.ai_narrative || item.verified_facts.join(' | ')}</p>
+              {item.evidence_references?.length ? <span>Evidence: {item.evidence_references.map((ref) => ref.source_file || ref.source_id).filter(Boolean).join(', ')}</span> : null}
+            </div>
+          ))}
+          <button className="text-btn" type="button" onClick={() => navigate('assistant')}>Open AI Assistant →</button>
+        </section>
+      </div>
+
+      <section className="panel report-hub">
+        <div className="section-header"><div><h2>Additional workspaces</h2><p>Existing tools remain available through internal navigation</p></div></div>
+        <div className="report-shortcuts">
+          <button type="button" onClick={() => navigate('analytics')}><BarChart3 size={17}/>Financial analytics</button>
+          <button type="button" onClick={() => navigate('monitoring')}><Activity size={17}/>Monitoring</button>
+          <button type="button" onClick={() => navigate('investigations')}><FileSearch size={17}/>Investigations</button>
+          <button type="button" onClick={() => navigate('cases')}><Users size={17}/>Review cases</button>
+          <button type="button" onClick={() => navigate('agents')}><Sparkles size={17}/>Legacy agent center</button>
+          <button type="button" onClick={() => navigate('compliance')}><ShieldCheck size={17}/>Compliance</button>
+        </div>
+        <h3>Invoice audit workspace</h3>
+        <div className="report-shortcuts">
+          {INVOICE_NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            return <button key={item.id} type="button" onClick={() => navigate(item.id)}><Icon size={17}/>{item.label}</button>;
+          })}
+        </div>
       </section>
-    </>
+      <section className="panel report-disclaimer"><AlertTriangle size={16}/><span>{summary?.disclaimer || 'Automated investigation leads for human review. Not proof of fraud.'}</span></section>
+    </div>
   );
 }
 
@@ -2505,25 +2586,47 @@ function CompliancePage({ audits = [], reconciliations = [] }) {
 
 function SettingsPage() {
   const [health, setHealth] = useState(null);
+  const [assistant, setAssistant] = useState(null);
   const load = async () => {
     try {
-      const res = await fetch(`${API}/api/health`);
-      if (res.ok) setHealth(await res.json());
+      const [healthRes, assistantRes] = await Promise.all([
+        fetch(`${API}/api/health`),
+        fetch(`${API}/api/assistant/config`),
+      ]);
+      if (healthRes.ok) setHealth(await healthRes.json());
+      if (assistantRes.ok) setAssistant(await assistantRes.json());
     } catch {}
   };
   useEffect(()=>{ load(); }, []);
+  const rows = [
+    ['API base URL', API],
+    ['Backend health', health?.status || 'unknown'],
+    ['Database', 'SQLite (local, additive migrations)'],
+    ['LLM backend', assistant?.backend || 'ollama'],
+    ['Local model', assistant?.model || 'not configured'],
+    ['Ollama host', assistant?.host || 'not configured'],
+    ['Ollama status', assistant?.available ? 'reachable' : 'offline (evidence-only fallback)'],
+    ['RAG backend', assistant?.rag?.backend || 'local-tfidf-sqlite'],
+    ['Indexed documents', assistant?.rag?.documents ?? 0],
+    ['Indexed chunks', assistant?.rag?.chunks ?? 0],
+  ];
   return (
-    <>
-      <header className="page-header"><div><h1>Settings</h1><p>Real configuration status (secrets not displayed)</p></div></header>
-      <section className="panel" style={{ padding: 18, marginBottom: 18 }}>
-        <div style={{ display: 'grid', gap: 8 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>API Base URL</span><span>{API}</span></div>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>Backend health</span><span>{health ? health.status : 'unknown'}</span></div>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>Database</span><span>SQLite (local)</span></div>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>LLM</span><span>Groq optional, Ollama optional (env-based)</span></div>
+    <div className="settings-workspace">
+      <section className="panel settings-panel">
+        <div className="section-header"><div><h2>Local configuration</h2><p>Only non-secret runtime status is displayed</p></div><ShieldCheck size={20}/></div>
+        <div className="settings-rows">
+          {rows.map(([label, value]) => <div key={label}><span>{label}</span><strong>{String(value)}</strong></div>)}
         </div>
       </section>
-      <section className="panel" style={{ padding: 18 }}><p style={{ color: 'var(--dash-text-secondary)' }}>No API keys or secrets are displayed. Configure via environment variables (.env not committed).</p></section>
-    </>
+      <section className="panel settings-panel">
+        <div className="section-header"><div><h2>Operating principles</h2><p>How this deployment handles finance data and AI</p></div></div>
+        <ul className="settings-notes">
+          <li>No paid LLM API is used. Ollama runs locally; when offline, answers degrade to evidence-only summaries.</li>
+          <li>Financial values are computed by deterministic SQL and Python rules; the model never modifies calculations.</li>
+          <li>Reconciliation suggestions and risk alerts require human confirmation before any financial action.</li>
+          <li>Configuration is read from environment variables; secrets are never shown in the UI.</li>
+        </ul>
+      </section>
+    </div>
   );
 }
