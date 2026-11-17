@@ -767,6 +767,19 @@ function ReconciliationPage({
   const [error, setError] = useState('');
   const [warnings, setWarnings] = useState([]);
   const [filter, setFilter] = useState('all');
+  const [showMapping, setShowMapping] = useState(false);
+  const MAPPING_FIELDS = ['date', 'amount', 'debit', 'credit', 'reference', 'description'];
+  const emptyMapping = () => MAPPING_FIELDS.reduce((acc, key) => ({ ...acc, [key]: '' }), {});
+  const [bankMapping, setBankMapping] = useState(emptyMapping());
+  const [ledgerMapping, setLedgerMapping] = useState(emptyMapping());
+  const [reviewer, setReviewer] = useState('reviewer');
+
+  const mappingJson = (mapping) => {
+    const cleaned = Object.fromEntries(
+      Object.entries(mapping).filter(([, value]) => String(value || '').trim())
+    );
+    return Object.keys(cleaned).length ? JSON.stringify(cleaned) : '';
+  };
 
   const results = reconciliation?.results || [];
   const summary = reconciliation?.summary || {};
@@ -815,6 +828,10 @@ function ReconciliationPage({
       formData.append('bank_file', bankFile);
       formData.append('ledger_file', ledgerFile);
       formData.append('date_tolerance_days', String(tolerance));
+      const bankMappingJson = mappingJson(bankMapping);
+      const ledgerMappingJson = mappingJson(ledgerMapping);
+      if (bankMappingJson) formData.append('bank_mapping', bankMappingJson);
+      if (ledgerMappingJson) formData.append('ledger_mapping', ledgerMappingJson);
 
       const response = await fetch(`${API}/api/reconciliations`, {
         method: 'POST',
@@ -836,6 +853,36 @@ function ReconciliationPage({
       setError(err.message || 'Could not connect to the backend.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const confirmResult = async (resultId, decision) => {
+    if (!reviewer.trim()) {
+      setError('Enter a reviewer name before recording a review decision.');
+      return;
+    }
+    setError('');
+    try {
+      const response = await fetch(
+        `${API}/api/reconciliations/results/${resultId}/confirm`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ decision, reviewer: reviewer.trim() }),
+        }
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || 'Could not record review decision.');
+      }
+      // Refresh the run so the recorded review is visible without a re-upload.
+      const refreshed = await fetch(
+        `${API}/api/reconciliations/${reconciliation.reconciliation_id}`
+      );
+      if (refreshed.ok) setReconciliation(await refreshed.json());
+      await loadHistory?.();
+    } catch (err) {
+      setError(err.message || 'Could not record review decision.');
     }
   };
 
@@ -931,6 +978,51 @@ function ReconciliationPage({
           </label>
         </section>
       </div>
+
+      <section className="panel" style={{ padding: '16px 26px', marginBottom: 22 }}>
+        <button
+          className="text-btn"
+          type="button"
+          onClick={() => setShowMapping((value) => !value)}
+        >
+          {showMapping ? 'Hide' : 'Show'} independent column mapping (optional)
+        </button>
+        <p className="kpi-subtle">
+          Map non-standard column names on each file separately. Leave blank to
+          auto-detect common names (date, amount/debit/credit, reference, description).
+        </p>
+        {showMapping && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(280px,1fr))', gap: 18, marginTop: 12 }}>
+            {[
+              { label: 'Bank statement', value: bankMapping, set: setBankMapping },
+              { label: 'Accounting ledger', value: ledgerMapping, set: setLedgerMapping },
+            ].map(({ label, value, set }) => (
+              <div key={label}>
+                <h3 style={{ fontSize: 13, marginBottom: 8 }}>{label} columns</h3>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                  {MAPPING_FIELDS.map((key) => (
+                    <label key={key} style={{ fontSize: 12, color: 'var(--rec-text-secondary)' }}>
+                      {key}
+                      <input
+                        placeholder={key}
+                        value={value[key] || ''}
+                        onChange={(event) => set({ ...value, [key]: event.target.value })}
+                        style={{ width: '100%', marginTop: 3, padding: '6px 8px', borderRadius: 6, border: '1px solid var(--rec-border-strong)', background: 'var(--rec-surface)' }}
+                      />
+                    </label>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        {reconciliation && (reconciliation.bank_mapping || reconciliation.ledger_mapping) && (
+          <p className="kpi-subtle" style={{ marginTop: 10 }}>
+            Applied mapping — bank: {JSON.stringify(reconciliation.bank_mapping || {})} ·
+            ledger: {JSON.stringify(reconciliation.ledger_mapping || {})}
+          </p>
+        )}
+      </section>
 
       <section className="panel" style={{ padding: '18px 26px', marginBottom: 22 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
@@ -1031,6 +1123,15 @@ function ReconciliationPage({
                   {reconciliation.bank_file} ↔ {reconciliation.ledger_file} ·{' '}
                   {reconciliation.date_tolerance_days} day tolerance
                 </p>
+                <label className="kpi-subtle" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginTop: 6 }}>
+                  Reviewer
+                  <input
+                    value={reviewer}
+                    onChange={(event) => setReviewer(event.target.value)}
+                    placeholder="Reviewer name"
+                    style={{ padding: '6px 8px', borderRadius: 6, border: '1px solid var(--rec-border-strong)', background: 'var(--rec-surface)' }}
+                  />
+                </label>
               </div>
               <div className="filter-bar" style={{ marginBottom: 0 }}>
                 <button
@@ -1117,7 +1218,32 @@ function ReconciliationPage({
                       return (
                         <tr key={item.id || index}>
                           <td>
-                            <input type="checkbox" disabled title="No backend action to confirm matches in this view" />
+                            {item.id ? (
+                              item.review_status ? (
+                                <StatusBadge status={item.review_status} />
+                              ) : (
+                                <div style={{ display: 'flex', gap: 4 }}>
+                                  <button
+                                    className="text-btn"
+                                    type="button"
+                                    title="Confirm this match for financial action"
+                                    onClick={() => confirmResult(item.id, 'confirmed')}
+                                  >
+                                    Confirm
+                                  </button>
+                                  <button
+                                    className="text-btn"
+                                    type="button"
+                                    title="Reject this match"
+                                    onClick={() => confirmResult(item.id, 'rejected')}
+                                  >
+                                    Reject
+                                  </button>
+                                </div>
+                              )
+                            ) : (
+                              <span className="cell-muted">—</span>
+                            )}
                           </td>
                           <td className="cell-primary">{dateValue || '—'}</td>
                           <td>
@@ -2398,11 +2524,17 @@ function ReportsPage({ audits = [], reconciliations = [], onNavigate }) {
       <div className="report-toolbar">
         <a className="primary-btn" href={`${API}/api/reports/full.pdf`}><Download size={16} />Full report (PDF)</a>
         <a className="secondary-btn" href={`${API}/api/reports/full.csv`}><Download size={16} />Full report (CSV)</a>
-        <a className="secondary-btn" href={`${API}/api/analytics/export.csv`}><Download size={16} />Transaction export</a>
+        <a className="secondary-btn" href={`${API}/api/transactions/export.csv`}><Download size={16} />Transactions (filtered CSV)</a>
+        <a className="secondary-btn" href={`${API}/api/risk/alerts/export.csv?severity=high,critical`}><Download size={16} />Risk alerts (CSV)</a>
         {latestAuditId && <a className="secondary-btn" href={`${API}/api/audits/${latestAuditId}/export.csv`}><Download size={16} />Audit #{latestAuditId}</a>}
         {latestReconId && <a className="secondary-btn" href={`${API}/api/reconciliations/${latestReconId}/export.csv`}><Download size={16} />Reconciliation #{latestReconId}</a>}
       </div>
       {error && <div className="ai-alert ai-alert-error"><AlertTriangle size={15} />{error}</div>}
+      {summary?.generated_at && (
+        <div className="panel" style={{ padding: '10px 16px', marginBottom: 14 }}>
+          <span className="kpi-subtle">Generated (UTC): {formatDateTime(summary.generated_at)} · Filters: {JSON.stringify(summary.filters || {})} · {summary.provenance}</span>
+        </div>
+      )}
 
       <div className="kpi-grid">
         <article className="kpi-card"><div className="kpi-top"><div className="kpi-label"><span>Transactions</span><strong>{fmtNumber(financial.total_transactions)}</strong></div><div className="kpi-icon blue"><FileText size={19}/></div></div><span className="kpi-subtle">Stored records in scope</span></article>
@@ -2498,19 +2630,68 @@ function MonitoringPage({ audits = [], loadOverview }) {
 
 
 function InvestigationsPage({ audits = [], onNavigate }) {
-  const findings = (audits[0]?.findings)||[];
+  const [cases, setCases] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const findings = (audits[0]?.findings) || [];
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      setLoading(true);
+      setErr('');
+      try {
+        const res = await fetch(`${API}/api/investigations?limit=50`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Failed to load investigations');
+        if (mounted) {
+          setCases(data.items || []);
+          setTotal(data.total || 0);
+        }
+      } catch (e) {
+        if (mounted) setErr(e.message);
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    })();
+    return () => { mounted = false; };
+  }, []);
+
   return (
     <>
-      <header className="page-header"><div><h1>Investigations</h1><p>Findings with source evidence and provenance</p></div></header>
+      <header className="page-header"><div><h1>Investigations</h1><p>Persisted cases with source evidence and provenance</p></div>
+        <button className="primary-btn" type="button" onClick={() => onNavigate && onNavigate('cases')}><Plus size={16}/>Open case workspace</button>
+      </header>
+      {err && <div className="warning-box" style={{ marginBottom: 12 }}>{err}</div>}
       <section className="table-card">
-        <div className="section-header"><div><h2>Latest findings</h2><p>From most recent audit run</p></div></div>
+        <div className="section-header"><div><h2>Investigation cases</h2><p>{total} case(s) stored in the database{loading ? ' · loading…' : ''}</p></div></div>
+        {cases.length === 0 ? (
+          <div className="empty-state"><div className="empty-icon"><Users size={24}/></div><strong>No investigation cases</strong><span>Create one in the case workspace, or start one from a risk alert.</span></div>
+        ) : (
+          <div className="data-table-wrap"><table className="data-table"><thead><tr><th>Case</th><th>Severity</th><th>Status</th><th>Transaction</th><th>Vendor</th><th>Reviewer</th><th>Created</th></tr></thead><tbody>
+            {cases.map(c => (
+              <tr key={c.id}>
+                <td className="table-primary">{c.case_number}<div className="cell-muted">{c.title}</div></td>
+                <td><StatusBadge status={c.severity}/></td>
+                <td><StatusBadge status={c.status}/></td>
+                <td>{c.transaction_id || '—'}</td>
+                <td>{c.vendor_name || '—'}</td>
+                <td>{c.assigned_to || 'unassigned'}</td>
+                <td>{formatDateTime(c.created_at)}</td>
+              </tr>
+            ))}
+          </tbody></table></div>
+        )}
+      </section>
+      <section className="table-card" style={{ marginTop: 18 }}>
+        <div className="section-header"><div><h2>Latest findings</h2><p>From the most recent audit run · source file and row included</p></div></div>
         {findings.length === 0 ? <div className="empty-state"><div className="empty-icon"><FileSearch size={24}/></div><strong>No findings</strong><span>Run an audit to generate findings.</span></div> : (
           <div className="data-table-wrap"><table className="data-table"><thead><tr><th>Finding</th><th>Txn ID</th><th>Source file</th><th>Amount</th><th>Risk</th><th>Type</th></tr></thead><tbody>
             {findings.map(f=>(<tr key={f.id}><td className="table-primary">{f.summary}</td><td>{f.transaction_id||'—'}</td><td>{f.source_file||'—'}</td><td>{fmtCurrency(f.amount)}</td><td><StatusBadge status={f.risk_level}/></td><td>{f.finding_type}</td></tr>))}
           </tbody></table></div>
         )}
       </section>
-      <section className="panel" style={{ padding: 18 }}><p style={{ color: 'var(--dash-text-secondary)' }}>Use Cases page to create/update investigation cases linked to findings. Evidence includes source filename/row from normalized transactions.</p></section>
     </>
   );
 }
@@ -2518,52 +2699,211 @@ function InvestigationsPage({ audits = [], onNavigate }) {
 
 function CasesPage({ audits = [] }) {
   const [cases, setCases] = useState([]);
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
-  const [form, setForm] = useState({ title: '', description: '', severity: 'medium', status: 'open' });
+  const [detail, setDetail] = useState(null);
+  const [selected, setSelected] = useState(null);
   const [msg, setMsg] = useState('');
+  const [err, setErr] = useState('');
+  const [form, setForm] = useState({ title: '', description: '', severity: 'medium', transaction_id: '', vendor_name: '', assigned_to: '' });
+  const [statusForm, setStatusForm] = useState({ status: 'open', resolution: '', reviewer_notes: '', actor: 'reviewer' });
+  const [note, setNote] = useState({ author: 'reviewer', note: '' });
+  const [evidenceForm, setEvidenceForm] = useState({ source_type: 'document', source_reference: '', excerpt: '' });
 
   const load = async () => {
     setLoading(true);
+    setErr('');
     try {
-      const res = await fetch(`${API}/api/cases`);
-      if (res.ok) setCases(await res.json());
-    } catch {}
-    finally { setLoading(false); }
+      const res = await fetch(`${API}/api/investigations?limit=200`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed to load investigations');
+      setCases(data.items || []);
+      setTotal(data.total || 0);
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setLoading(false);
+    }
   };
-  useEffect(()=>{ load(); }, []);
+  useEffect(() => { load(); }, []);
+
+  const openCase = async (caseRef) => {
+    setSelected(caseRef);
+    setDetail(null);
+    setErr('');
+    try {
+      const res = await fetch(`${API}/api/investigations/${encodeURIComponent(caseRef)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed to load case');
+      setDetail(data);
+      setStatusForm({ status: data.status || 'open', resolution: data.resolution || '', reviewer_notes: '', actor: 'reviewer' });
+    } catch (e) {
+      setErr(e.message);
+    }
+  };
 
   const create = async () => {
     setMsg('');
+    setErr('');
     try {
-      const res = await fetch(`${API}/api/cases`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...form, audit_run_id: audits[0]?.id }) });
+      const payload = { ...form, audit_run_id: audits[0]?.id, created_by: 'reviewer' };
+      Object.keys(payload).forEach(k => { if (payload[k] === '') delete payload[k]; });
+      const res = await fetch(`${API}/api/investigations`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Failed');
-      setMsg('Case created');
-      setForm({ title: '', description: '', severity: 'medium', status: 'open' });
-      load();
-    } catch(e) { setMsg(e.message); }
+      setMsg(`Created ${data.case_number}`);
+      setForm({ title: '', description: '', severity: 'medium', transaction_id: '', vendor_name: '', assigned_to: '' });
+      await load();
+      await openCase(data.case_number);
+    } catch (e) {
+      setErr(e.message);
+    }
+  };
+
+  const updateStatus = async () => {
+    if (!selected) return;
+    setErr('');
+    try {
+      const res = await fetch(`${API}/api/investigations/${encodeURIComponent(selected)}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(statusForm),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed');
+      setDetail(data);
+      setMsg(`Status updated to ${data.status}`);
+      await load();
+    } catch (e) {
+      setErr(e.message);
+    }
+  };
+
+  const addNote = async () => {
+    if (!selected || !note.note.trim()) return;
+    setErr('');
+    try {
+      const res = await fetch(`${API}/api/investigations/${encodeURIComponent(selected)}/notes`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(note),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed');
+      setNote({ ...note, note: '' });
+      await openCase(selected);
+      setMsg('Note added');
+    } catch (e) {
+      setErr(e.message);
+    }
+  };
+
+  const addEvidence = async () => {
+    if (!selected || !evidenceForm.source_reference.trim()) return;
+    setErr('');
+    try {
+      const res = await fetch(`${API}/api/investigations/${encodeURIComponent(selected)}/evidence`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...evidenceForm, added_by: 'reviewer', metadata: { added_from: 'investigation workspace' } }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed');
+      setEvidenceForm({ source_type: 'document', source_reference: '', excerpt: '' });
+      await openCase(selected);
+      setMsg('Evidence attached');
+    } catch (e) {
+      setErr(e.message);
+    }
+  };
+
+  const explain = async () => {
+    if (!selected) return;
+    setErr('');
+    setMsg('Generating grounded explanation…');
+    try {
+      const res = await fetch(`${API}/api/investigations/${encodeURIComponent(selected)}/explain`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed');
+      setDetail((prev) => ({ ...prev, ai_explanation: data.explanation }));
+      setMsg(data.fallback ? 'Explanation generated from evidence (Ollama offline)' : 'Explanation generated');
+    } catch (e) {
+      setErr(e.message);
+    }
   };
 
   return (
     <>
-      <header className="page-header"><div><h1>Cases</h1><p>Investigation cases with status, priority, notes and timestamps</p></div></header>
+      <header className="page-header"><div><h1>Investigation Cases</h1><p>Alerts to cases with status, reviewer, evidence, notes and history</p></div></header>
+      {err && <div className="warning-box" style={{ marginBottom: 12 }}>{err}</div>}
+      {msg && <div className="success-box" style={{ marginBottom: 12 }}>{msg}</div>}
       <section className="panel" style={{ padding: 18, marginBottom: 18, display: 'grid', gap: 10 }}>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(200px,1fr))', gap: 10 }}>
+        <div className="section-header"><div><h2>Open a new investigation</h2><p>Link to a transaction or vendor when known</p></div></div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(180px,1fr))', gap: 10 }}>
           <input placeholder="Title" value={form.title} onChange={e=>setForm({...form,title:e.target.value})} style={{ padding: 8, borderRadius: 8 }}/>
           <select value={form.severity} onChange={e=>setForm({...form,severity:e.target.value})} style={{ padding: 8, borderRadius: 8 }}><option>low</option><option>medium</option><option>high</option><option>critical</option></select>
-          <select value={form.status} onChange={e=>setForm({...form,status:e.target.value})} style={{ padding: 8, borderRadius: 8 }}><option>open</option><option>in_review</option><option>resolved</option><option>closed</option></select>
+          <input placeholder="Transaction ID" value={form.transaction_id} onChange={e=>setForm({...form,transaction_id:e.target.value})} style={{ padding: 8, borderRadius: 8 }}/>
+          <input placeholder="Vendor" value={form.vendor_name} onChange={e=>setForm({...form,vendor_name:e.target.value})} style={{ padding: 8, borderRadius: 8 }}/>
+          <input placeholder="Assigned reviewer" value={form.assigned_to} onChange={e=>setForm({...form,assigned_to:e.target.value})} style={{ padding: 8, borderRadius: 8 }}/>
         </div>
-        <textarea placeholder="Description" value={form.description} onChange={e=>setForm({...form,description:e.target.value})} style={{ padding: 8, borderRadius: 8, minHeight: 60 }}/>
-        <div><button className="primary-btn" onClick={create}><Users size={16}/>Create Case</button> {msg && <span style={{ marginLeft: 10 }}>{msg}</span>}</div>
+        <textarea placeholder="Description" value={form.description} onChange={e=>setForm({...form,description:e.target.value})} style={{ padding: 8, borderRadius: 8, minHeight: 56 }}/>
+        <div><button className="primary-btn" onClick={create}><Plus size={16}/>Create Investigation</button></div>
       </section>
-      <section className="table-card">
-        <div className="section-header"><div><h2>Cases</h2><p>Persisted in database</p></div></div>
-        {cases.length === 0 ? <div className="empty-state"><div className="empty-icon"><Users size={24}/></div><strong>No cases</strong><span>Create a case above.</span></div> : (
-          <div className="data-table-wrap"><table className="data-table"><thead><tr><th>ID</th><th>Title</th><th>Severity</th><th>Status</th><th>Audit run</th><th>Created</th></tr></thead><tbody>
-            {cases.map(c=>(<tr key={c.id}><td>{c.id}</td><td className="table-primary">{c.title}</td><td>{c.severity}</td><td>{c.status}</td><td>{c.audit_run_id||'—'}</td><td>{formatDateTime(c.created_at)}</td></tr>))}
-          </tbody></table></div>
-        )}
-      </section>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px,0.9fr) minmax(360px,1.4fr)', gap: 18 }}>
+        <section className="table-card">
+          <div className="section-header"><div><h2>Cases</h2><p>{total} persisted investigation(s)</p></div>{loading && <Loader2 size={16} className="spin"/>}</div>
+          {cases.length === 0 ? <div className="empty-state"><div className="empty-icon"><Users size={24}/></div><strong>No cases</strong><span>Create one above or start from a risk alert.</span></div> : (
+            <div className="data-table-wrap"><table className="data-table"><thead><tr><th>Case</th><th>Severity</th><th>Status</th><th>Created</th></tr></thead><tbody>
+              {cases.map(c=>(<tr key={c.id} onClick={()=>openCase(c.case_number)} style={{ cursor: 'pointer', background: selected===c.case_number ? 'var(--rec-surface-alt)' : undefined }}>
+                <td className="table-primary">{c.case_number}<div className="cell-muted">{c.title}</div></td>
+                <td>{c.severity}</td><td><StatusBadge status={c.status}/></td><td>{formatDateTime(c.created_at)}</td>
+              </tr>))}
+            </tbody></table></div>
+          )}
+        </section>
+
+        <section className="panel" style={{ padding: 18 }}>
+          {!detail ? (
+            <div className="empty-state"><div className="empty-icon"><FileSearch size={24}/></div><strong>Select a case</strong><span>Choose a case to review evidence, notes and history.</span></div>
+          ) : (
+            <>
+              <div className="section-header"><div><h2>{detail.case_number} · {detail.title}</h2><p>Severity {detail.severity} · Assigned to {detail.assigned_to || 'unassigned'}</p></div><a className="secondary-btn" href={`${API}/api/investigations/${encodeURIComponent(detail.case_number)}/export.csv`}><Download size={16}/>Export</a></div>
+              <div style={{ display: 'grid', gap: 14, marginTop: 12 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: 8 }}>
+                  <select value={statusForm.status} onChange={e=>setStatusForm({...statusForm,status:e.target.value})} style={{ padding: 8, borderRadius: 8 }}><option>open</option><option>under_review</option><option>resolved</option><option>dismissed</option></select>
+                  <input placeholder="Actor" value={statusForm.actor} onChange={e=>setStatusForm({...statusForm,actor:e.target.value})} style={{ padding: 8, borderRadius: 8 }}/>
+                  <button className="primary-btn" onClick={updateStatus}>Update status</button>
+                </div>
+                <input placeholder="Resolution (optional)" value={statusForm.resolution} onChange={e=>setStatusForm({...statusForm,resolution:e.target.value})} style={{ padding: 8, borderRadius: 8 }}/>
+                <textarea placeholder="Reviewer note (also logged on update)" value={statusForm.reviewer_notes} onChange={e=>setStatusForm({...statusForm,reviewer_notes:e.target.value})} style={{ padding: 8, borderRadius: 8, minHeight: 48 }}/>
+                <div style={{ display: 'flex', gap: 8 }}><input placeholder="Note author" value={note.author} onChange={e=>setNote({...note,author:e.target.value})} style={{ padding: 8, borderRadius: 8, width: 140 }}/><input placeholder="Add a note" value={note.note} onChange={e=>setNote({...note,note:e.target.value})} style={{ padding: 8, borderRadius: 8, flex: 1 }}/><button className="secondary-btn" onClick={addNote}>Add note</button></div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: 8 }}>
+                  <select value={evidenceForm.source_type} onChange={e=>setEvidenceForm({...evidenceForm,source_type:e.target.value})} style={{ padding: 8, borderRadius: 8 }}><option>document</option><option>transaction_record</option><option>rag_chunk</option><option>invoice</option></select>
+                  <input placeholder="Source reference" value={evidenceForm.source_reference} onChange={e=>setEvidenceForm({...evidenceForm,source_reference:e.target.value})} style={{ padding: 8, borderRadius: 8 }}/>
+                  <input placeholder="Excerpt" value={evidenceForm.excerpt} onChange={e=>setEvidenceForm({...evidenceForm,excerpt:e.target.value})} style={{ padding: 8, borderRadius: 8 }}/>
+                  <button className="secondary-btn" onClick={addEvidence}>Attach evidence</button>
+                </div>
+                <div><button className="secondary-btn" onClick={explain}><Sparkles size={16}/>Generate AI explanation</button></div>
+                {detail.ai_explanation && <div className="warning-box"><strong>AI explanation (human review required)</strong><p>{detail.ai_explanation}</p></div>}
+              </div>
+              <div style={{ marginTop: 16 }}>
+                <h3>Related transactions</h3>
+                {detail.transactions?.length ? <div className="data-table-wrap"><table className="data-table"><thead><tr><th>Txn</th><th>Date</th><th>Amount</th><th>Vendor</th></tr></thead><tbody>{detail.transactions.map(t=><tr key={t.id}><td className="table-primary">{t.transaction_id}</td><td>{t.date}</td><td>{fmtCurrency(t.amount)}</td><td>{t.vendor||t.description||'—'}</td></tr>)}</tbody></table></div> : <p className="kpi-subtle">No linked transaction.</p>}
+              </div>
+              <div style={{ marginTop: 16 }}>
+                <h3>Evidence ({detail.evidence?.length || 0})</h3>
+                {detail.evidence?.length ? <ul>{detail.evidence.map(e=><li key={e.id}><strong>{e.source_type}</strong> {e.source_reference||'—'} — {e.excerpt||''}</li>)}</ul> : <p className="kpi-subtle">No evidence attached.</p>}
+              </div>
+              <div style={{ marginTop: 16 }}>
+                <h3>Notes ({detail.notes?.length || 0})</h3>
+                {detail.notes?.length ? <ul>{detail.notes.map(n=><li key={n.id}><strong>{n.author}</strong> ({formatDateTime(n.created_at)}): {n.note}</li>)}</ul> : <p className="kpi-subtle">No notes yet.</p>}
+              </div>
+              <div style={{ marginTop: 16 }}>
+                <h3>History</h3>
+                {detail.history?.length ? <ul>{detail.history.map(e=><li key={e.id}>{formatDateTime(e.created_at)} · {e.action} · {e.actor||'system'} {e.previous_status?`(${e.previous_status} → ${e.new_status})`:''}</li>)}</ul> : <p className="kpi-subtle">No events.</p>}
+              </div>
+            </>
+          )}
+        </section>
+      </div>
     </>
   );
 }
@@ -2586,34 +2926,53 @@ function CompliancePage({ audits = [], reconciliations = [] }) {
 
 function SettingsPage() {
   const [health, setHealth] = useState(null);
-  const [assistant, setAssistant] = useState(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
   const load = async () => {
+    setLoading(true);
+    setError('');
     try {
-      const [healthRes, assistantRes] = await Promise.all([
-        fetch(`${API}/api/health`),
-        fetch(`${API}/api/assistant/config`),
-      ]);
-      if (healthRes.ok) setHealth(await healthRes.json());
-      if (assistantRes.ok) setAssistant(await assistantRes.json());
-    } catch {}
+      const res = await fetch(`${API}/api/system/health`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed to load system health');
+      setHealth(data);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
   };
-  useEffect(()=>{ load(); }, []);
+  useEffect(() => { load(); }, []);
   const rows = [
     ['API base URL', API],
-    ['Backend health', health?.status || 'unknown'],
-    ['Database', 'SQLite (local, additive migrations)'],
-    ['LLM backend', assistant?.backend || 'ollama'],
-    ['Local model', assistant?.model || 'not configured'],
-    ['Ollama host', assistant?.host || 'not configured'],
-    ['Ollama status', assistant?.available ? 'reachable' : 'offline (evidence-only fallback)'],
-    ['RAG backend', assistant?.rag?.backend || 'local-tfidf-sqlite'],
-    ['Indexed documents', assistant?.rag?.documents ?? 0],
-    ['Indexed chunks', assistant?.rag?.chunks ?? 0],
+    ['System status', health?.status || 'unknown'],
+    ['Backend API', health?.backend?.api || 'unknown'],
+    ['Checked at (UTC)', health?.checked_at || '—'],
+    ['Database backend', health?.database?.backend || '—'],
+    ['Database connection', health?.database?.status || 'unknown'],
+    ['Tables', health?.database?.tables ?? '—'],
+    ['Transaction records', health?.database?.transaction_records ?? '—'],
+    ['Risk alerts', health?.database?.risk_alerts ?? '—'],
+    ['Reconciliation runs', health?.database?.reconciliation_runs ?? '—'],
+    ['Investigation cases', health?.database?.investigation_cases ?? '—'],
+    ['LLM provider', health?.llm?.provider || 'ollama'],
+    ['Local model', health?.llm?.model || 'not configured'],
+    ['LLM status', health?.llm?.status || 'unknown'],
+    ['RAG backend', health?.rag?.backend || 'local-tfidf-sqlite'],
+    ['RAG status', health?.rag?.status || 'empty'],
+    ['Indexed documents', health?.rag?.documents ?? 0],
+    ['Indexed chunks', health?.rag?.chunks ?? 0],
+    ['Deterministic engine', health?.deterministic_engine || 'unknown'],
+    ['Authentication enabled', health?.configuration?.authentication_enabled ? 'yes' : 'no'],
   ];
   return (
     <div className="settings-workspace">
       <section className="panel settings-panel">
-        <div className="section-header"><div><h2>Local configuration</h2><p>Only non-secret runtime status is displayed</p></div><ShieldCheck size={20}/></div>
+        <div className="section-header"><div><h2>System health</h2><p>Every value comes from an actual runtime probe; no secrets are displayed</p></div>
+          <button className="secondary-btn" type="button" onClick={load} disabled={loading}><RefreshCw size={16} className={loading ? 'spin' : ''}/>Refresh</button>
+        </div>
+        {error && <div className="error-box">{error}</div>}
+        {health?.llm?.note && <div className="warning-box">{health.llm.note}</div>}
         <div className="settings-rows">
           {rows.map(([label, value]) => <div key={label}><span>{label}</span><strong>{String(value)}</strong></div>)}
         </div>

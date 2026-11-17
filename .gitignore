@@ -16,4 +16,5 @@ backend/.env
 .env.*
 !.env.example
 !backend/.env.example
+!deploy/.env.production.example
 .DS_Store

@@ -7,8 +7,10 @@ import {
   FileText,
   Loader2,
   RefreshCw,
+  Search,
   Send,
   ShieldCheck,
+  Trash2,
   Upload
 } from 'lucide-react';
 
@@ -35,19 +37,25 @@ export default function Assistant() {
 
   const [config, setConfig] = useState(null);
   const [documents, setDocuments] = useState([]);
+  const [docStatus, setDocStatus] = useState(null);
   const [docFile, setDocFile] = useState(null);
   const [indexing, setIndexing] = useState(false);
   const [docMessage, setDocMessage] = useState('');
+  const [retrievalQuery, setRetrievalQuery] = useState('');
+  const [retrievalResult, setRetrievalResult] = useState(null);
+  const [retrieving, setRetrieving] = useState(false);
 
   const loadMeta = useCallback(async () => {
     try {
-      const [configData, docData, suggestionData] = await Promise.all([
+      const [configData, docData, statusData, suggestionData] = await Promise.all([
         assistantRequest('/api/assistant/config'),
         assistantRequest('/api/documents'),
+        assistantRequest('/api/documents/status'),
         assistantRequest('/api/assistant/suggestions'),
       ]);
       setConfig(configData);
       setDocuments(docData.documents || []);
+      setDocStatus(statusData);
       setSuggestions(suggestionData.questions || []);
     } catch (err) {
       setError(err.message || 'Could not load assistant configuration.');
@@ -109,6 +117,55 @@ export default function Assistant() {
     }
   };
 
+  const deleteDocument = async (docId, filename) => {
+    setIndexing(true);
+    setDocMessage('');
+    setError('');
+    try {
+      const result = await assistantRequest(`/api/documents/${encodeURIComponent(docId)}`, { method: 'DELETE' });
+      setDocMessage(`Removed ${filename || docId}. ${result.stats?.chunks || 0} chunk(s) remain indexed.`);
+      await loadMeta();
+    } catch (err) {
+      setError(err.message || 'Could not delete document.');
+    } finally {
+      setIndexing(false);
+    }
+  };
+
+  const reindex = async () => {
+    setIndexing(true);
+    setDocMessage('');
+    setError('');
+    try {
+      const result = await assistantRequest('/api/documents/reindex', { method: 'POST' });
+      setDocMessage(`Re-index complete: ${result.stats?.chunks || 0} chunk(s) available.`);
+      await loadMeta();
+    } catch (err) {
+      setError(err.message || 'Could not re-index documents.');
+    } finally {
+      setIndexing(false);
+    }
+  };
+
+  const retrievalTest = async () => {
+    const query = retrievalQuery.trim();
+    if (!query) return;
+    setRetrieving(true);
+    setError('');
+    try {
+      const result = await assistantRequest('/api/documents/retrieval-test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, top_k: 5 }),
+      });
+      setRetrievalResult(result);
+    } catch (err) {
+      setError(err.message || 'Retrieval test failed.');
+    } finally {
+      setRetrieving(false);
+    }
+  };
+
   const openTransaction = (reference) => {
     document.dispatchEvent(new CustomEvent('finaudit:open-transaction', { detail: reference }));
   };
@@ -134,6 +191,8 @@ export default function Assistant() {
             'Explain my highest-risk transaction.',
             'Find possible duplicate payments.',
             'Explain the latest reconciliation results.',
+            'Generate an investigation report.',
+            'What evidence supports the flagged transactions?',
           ]).map((item) => <button key={item} type="button" onClick={() => ask(item)}>{item}</button>)}
         </div>
         <div className="ai-input-row">
@@ -160,12 +219,23 @@ export default function Assistant() {
             </div>
             <div className="ai-answer-text">{answer.answer}</div>
             <p className="ai-route-reason">{answer.route_reason}</p>
+            {answer.agent_failures?.length ? (
+              <div className="ai-alert ai-alert-error"><AlertTriangle size={15} />
+                Agent failure(s): {answer.agent_failures.map((item) => `${item.agent_name}: ${item.error}`).join(' · ')}
+              </div>
+            ) : null}
             <div className="ai-meta-row">
               <span>LLM: {answer.llm?.fallback ? 'evidence-only fallback' : 'grounded response'}</span>
               <span>Model: {pretty(answer.llm?.model)}</span>
               <span>SQL evidence: {answer.evidence?.length || 0}</span>
               <span>Document chunks: {answer.document_evidence?.length || 0}</span>
             </div>
+            {answer.required_roles?.length ? (
+              <div className="ai-meta-row">
+                <span>Roles used: {(answer.agent_roles || []).join(', ') || 'none'}</span>
+                <span>Required roles: {answer.required_roles.join(', ')}</span>
+              </div>
+            ) : null}
             <div className="ai-disclaimer"><ShieldCheck size={15} />{answer.disclaimer}</div>
 
             <h3>Agent timeline</h3>
@@ -212,7 +282,10 @@ export default function Assistant() {
       <section className="panel ai-documents">
         <div className="section-header">
           <div><h2>Knowledge sources</h2><p>Ingest CSV, PDF or text evidence into the local TF-IDF + SQLite vector store</p></div>
-          <button className="secondary-btn" type="button" onClick={loadMeta}><RefreshCw size={15} />Refresh</button>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="secondary-btn" type="button" onClick={reindex} disabled={indexing}><RefreshCw size={15} />Re-index</button>
+            <button className="secondary-btn" type="button" onClick={loadMeta}><RefreshCw size={15} />Refresh</button>
+          </div>
         </div>
         <div className="ai-doc-row">
           <label className="file-picker"><Upload size={15} />{docFile ? docFile.name : 'Choose CSV / PDF / TXT'}<input type="file" accept=".csv,.pdf,.txt,.md,.log,.json" onChange={(e) => setDocFile(e.target.files?.[0] || null)} /></label>
@@ -221,11 +294,46 @@ export default function Assistant() {
           {docMessage && <span className="ai-doc-message"><CheckCircle2 size={14} />{docMessage}</span>}
         </div>
         <div className="ai-doc-stats">
-          <span>Documents: {config?.rag?.documents || 0}</span><span>Chunks: {config?.rag?.chunks || 0}</span><span>Backend: {config?.rag?.backend || 'local-tfidf-sqlite'}</span>
+          <span>Documents: {docStatus?.documents ?? config?.rag?.documents ?? 0}</span>
+          <span>Chunks: {docStatus?.chunks ?? config?.rag?.chunks ?? 0}</span>
+          <span>Backend: {docStatus?.backend || config?.rag?.backend || 'local-tfidf-sqlite'}</span>
+          <span>Status: {docStatus?.status || 'empty'}</span>
+          {docStatus?.message && <span>{docStatus.message}</span>}
         </div>
+
+        <div style={{ marginTop: 14 }}>
+          <div className="section-header"><div><h3>Retrieval test</h3><p>Debug which chunks are retrieved for a query — no LLM call, no fabricated evidence</p></div></div>
+          <div className="ai-input-row" style={{ marginTop: 8 }}>
+            <input
+              value={retrievalQuery}
+              onChange={(e) => setRetrievalQuery(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); retrievalTest(); } }}
+              placeholder="e.g. duplicate payment evidence"
+              style={{ flex: 1, padding: '8px 10px', borderRadius: 8, border: '1px solid var(--rec-border-strong)', background: 'var(--rec-surface)' }}
+            />
+            <button className="secondary-btn" type="button" onClick={retrievalTest} disabled={retrieving || !retrievalQuery.trim()}>
+              {retrieving ? <Loader2 size={16} className="spin" /> : <Search size={16} />}Test retrieval
+            </button>
+          </div>
+          {retrievalResult && (
+            <div className="ai-panel" style={{ marginTop: 10, padding: 12 }}>
+              <span className="kpi-subtle">{retrievalResult.result_count} chunk(s) · {retrievalResult.message || 'Evidence retrieved.'}</span>
+              {retrievalResult.chunks.map((item, index) => (
+                <div className="ai-evidence" key={`${item.source}-${index}`}>
+                  <strong>{pretty(item.source)}</strong>
+                  <span>{pretty(item.source_filename)} · chunk {pretty(item.chunk_id)} · score {Number(item.score || 0).toFixed(3)}</span>
+                  <p>{pretty(item.text)}</p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
         {documents.length ? (
-          <div className="data-table-wrap"><table className="data-table"><thead><tr><th>File</th><th>Type</th><th>Chunks</th><th>Ingested</th></tr></thead><tbody>
-            {documents.map((item) => <tr key={item.doc_id}><td className="table-primary">{pretty(item.source_filename)}</td><td>{pretty(item.document_type)}</td><td>{item.chunk_count}</td><td>{pretty(item.upload_timestamp)}</td></tr>)}
+          <div className="data-table-wrap"><table className="data-table"><thead><tr><th>File</th><th>Type</th><th>Chunks</th><th>Ingested</th><th /></tr></thead><tbody>
+            {documents.map((item) => <tr key={item.doc_id}><td className="table-primary">{pretty(item.source_filename)}</td><td>{pretty(item.document_type)}</td><td>{item.chunk_count}</td><td>{pretty(item.upload_timestamp)}</td>
+              <td><button className="text-btn" type="button" title="Delete this document and its chunks" onClick={() => deleteDocument(item.doc_id, item.source_filename)} disabled={indexing}><Trash2 size={14} />Delete</button></td>
+            </tr>)}
           </tbody></table></div>
         ) : <p className="ai-muted">No documents ingested yet.</p>}
       </section>

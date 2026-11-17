@@ -1,11 +1,14 @@
 """FastAPI routes for the Financial Risk & Fraud Intelligence Center."""
 from __future__ import annotations
 
+import csv
+import io
 import json
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
@@ -91,17 +94,15 @@ def risk_overview(db: Session = Depends(get_db)):
     return overview(db)
 
 
-@router.get("/api/risk/alerts")
-def list_risk_alerts(
-    q: str | None = None,
-    severity: str | None = None,
-    category: str | None = None,
-    status: str | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
-    db: Session = Depends(get_db),
+def _filtered_alert_query(
+    db: Session,
+    *,
+    q: str | None,
+    severity: str | None,
+    category: str | None,
+    status: str | None,
+    start_date: str | None,
+    end_date: str | None,
 ):
     query = db.query(RiskAlert)
     if q:
@@ -138,7 +139,30 @@ def list_risk_alerts(
         if "T" not in end_date:
             end = end.replace(hour=23, minute=59, second=59, microsecond=999999)
         query = query.filter(RiskAlert.detected_at <= end)
+    return query
 
+
+@router.get("/api/risk/alerts")
+def list_risk_alerts(
+    q: str | None = None,
+    severity: str | None = None,
+    category: str | None = None,
+    status: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    query = _filtered_alert_query(
+        db,
+        q=q,
+        severity=severity,
+        category=category,
+        status=status,
+        start_date=start_date,
+        end_date=end_date,
+    )
     total = query.count()
     alerts = (
         query.order_by(RiskAlert.detected_at.desc(), RiskAlert.id.desc())
@@ -158,6 +182,75 @@ def list_risk_alerts(
         "severities": ["critical", "high", "medium", "low"],
         "statuses": list(REVIEW_STATUSES),
     }
+
+
+@router.get("/api/risk/alerts/export.csv")
+def export_risk_alerts(
+    q: str | None = None,
+    severity: str | None = None,
+    category: str | None = None,
+    status: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 10000,
+    db: Session = Depends(get_db),
+):
+    query = _filtered_alert_query(
+        db,
+        q=q,
+        severity=severity,
+        category=category,
+        status=status,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    alerts = (
+        query.order_by(RiskAlert.detected_at.desc(), RiskAlert.id.desc())
+        .limit(min(max(1, limit), 50000))
+        .all()
+    )
+    generated_at = datetime.now(timezone.utc).isoformat()
+    filter_label = json.dumps(
+        {
+            "q": q,
+            "severity": severity,
+            "category": category,
+            "status": status,
+            "start_date": start_date,
+            "end_date": end_date,
+        },
+        ensure_ascii=False,
+    )
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "generated_at", "filters", "record_type", "reference", "detected_at",
+        "risk_category", "severity", "risk_score", "amount", "vendor",
+        "transaction_id", "review_status", "explanation", "provenance",
+    ])
+    for alert in alerts:
+        evidence = alert.evidence if isinstance(alert.evidence, dict) else {}
+        writer.writerow([
+            generated_at,
+            filter_label,
+            "risk_alert",
+            alert.alert_code,
+            alert.detected_at.isoformat() if alert.detected_at else "",
+            alert.risk_category,
+            alert.severity,
+            alert.risk_score,
+            alert.amount_value,
+            alert.vendor_name,
+            alert.transaction_id,
+            alert.review_status,
+            alert.explanation,
+            f"{evidence.get('source_file') or 'unknown'}:{evidence.get('source_row') or '?'}",
+        ])
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=finaudit_risk_alerts.csv"},
+    )
 
 
 @router.get("/api/risk/alerts/{alert_id}")

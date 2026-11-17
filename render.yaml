@@ -1,0 +1,33 @@
+# Render Blueprint for the FinAudit AI backend.
+# Deploy via: Render Dashboard → Blueprints → New Blueprint Instance → this repo.
+# Secret values (database URL, inference host) are set in the Render dashboard
+# and are intentionally not stored in source control.
+services:
+  - type: web
+    name: finaudit-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    contextDir: .
+    plan: starter
+    healthCheckPath: /api/health
+    envVars:
+      # PostgreSQL (e.g. Neon). Set in the dashboard; never commit the value.
+      - key: FINAUDIT_DATABASE_URL
+        sync: false
+      # Comma-separated Vercel frontend origin(s), e.g. https://finaudit-abc.vercel.app
+      - key: FINAUDIT_CORS_ORIGINS
+        sync: false
+      # Hosted Ollama-compatible inference endpoint reachable from Render.
+      # If unreachable, deterministic rules and evidence-only answers still work.
+      - key: OLLAMA_HOST
+        sync: false
+      - key: OLLAMA_MODEL
+        value: llama3.2:1b
+      - key: OLLAMA_TIMEOUT
+        value: "20"
+      - key: OLLAMA_PROBE_TIMEOUT
+        value: "1.5"
+      - key: FINAUDIT_GEOCODING_ENABLED
+        value: "false"
+      - key: FINAUDIT_GEOCODING_MAX_LOOKUPS
+        value: "10"

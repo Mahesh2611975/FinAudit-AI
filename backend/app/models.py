@@ -51,6 +51,8 @@ class ReconciliationRun(Base):
     amount_mismatch_count = Column(Integer, default=0)
     date_mismatch_count = Column(Integer, default=0)
     ambiguous_count = Column(Integer, default=0)
+    bank_mapping = Column(JSON, nullable=True)
+    ledger_mapping = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     results = relationship(
         "ReconciliationResult",
@@ -149,17 +151,70 @@ class InvestigationRun(Base):
 class InvestigationCase(Base):
     __tablename__ = "investigation_cases"
     id = Column(Integer, primary_key=True, index=True)
+    case_number = Column(String(40), nullable=True, unique=True, index=True)
     title = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
     severity = Column(String(20), nullable=True)
-    status = Column(String(40), nullable=True)
+    status = Column(String(40), nullable=True, default="open", index=True)
     audit_run_id = Column(Integer, ForeignKey("audit_runs.id"), nullable=True)
-    transaction_id = Column(String(100), nullable=True)
+    risk_alert_id = Column(Integer, ForeignKey("risk_alerts.id"), nullable=True, index=True)
+    transaction_id = Column(String(100), nullable=True, index=True)
+    vendor_name = Column(String(255), nullable=True, index=True)
     source_file = Column(String(255), nullable=True)
     source_row = Column(Integer, nullable=True)
+    assigned_to = Column(String(255), nullable=True, index=True)
+    created_by = Column(String(255), nullable=True)
     reviewer_notes = Column(Text, nullable=True)
+    resolution = Column(Text, nullable=True)
+    ai_explanation = Column(Text, nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    notes = relationship("InvestigationNote", back_populates="case", cascade="all, delete-orphan")
+    evidence = relationship("InvestigationEvidence", back_populates="case", cascade="all, delete-orphan")
+    events = relationship("InvestigationEvent", back_populates="case", cascade="all, delete-orphan")
+
+
+class InvestigationNote(Base):
+    __tablename__ = "investigation_notes"
+    id = Column(Integer, primary_key=True, index=True)
+    case_id = Column(Integer, ForeignKey("investigation_cases.id"), nullable=False, index=True)
+    author = Column(String(255), nullable=False)
+    note = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+    case = relationship("InvestigationCase", back_populates="notes")
+
+
+class InvestigationEvidence(Base):
+    __tablename__ = "investigation_evidence"
+    id = Column(Integer, primary_key=True, index=True)
+    case_id = Column(Integer, ForeignKey("investigation_cases.id"), nullable=False, index=True)
+    source_type = Column(String(50), nullable=False, index=True)
+    source_id = Column(String(120), nullable=True, index=True)
+    source_reference = Column(String(255), nullable=True)
+    excerpt = Column(Text, nullable=True)
+    details_json = Column(JSON, nullable=True)
+    added_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+    case = relationship("InvestigationCase", back_populates="evidence")
+
+
+class InvestigationEvent(Base):
+    __tablename__ = "investigation_events"
+    id = Column(Integer, primary_key=True, index=True)
+    case_id = Column(Integer, ForeignKey("investigation_cases.id"), nullable=False, index=True)
+    action = Column(String(50), nullable=False, index=True)
+    actor = Column(String(255), nullable=True)
+    comment = Column(Text, nullable=True)
+    previous_status = Column(String(40), nullable=True)
+    new_status = Column(String(40), nullable=True)
+    details_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+    case = relationship("InvestigationCase", back_populates="events")
 
 
 # ---------------------------------------------------------------------------

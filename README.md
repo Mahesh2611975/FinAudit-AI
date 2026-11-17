@@ -13,13 +13,15 @@ See [`FINAL_DELIVERABLES.md`](FINAL_DELIVERABLES.md) for architecture diagrams, 
 - Transaction CSV preview with automatic column mapping, validation, duplicate-safe import, search/date/amount filters, detail view and source file/row provenance.
 - Deterministic bank/ledger reconciliation with matched, unmatched, amount/date difference and possible-match results; uncertain matches require human confirmation.
 - Explainable 0–100 risk alerts with severity, reason, amount, timestamp, source evidence and review statuses: Open, Under investigation, Resolved, False positive and Dismissed.
-- Selective LangGraph assistant with five agents: Orchestrator, Transaction Analysis, Reconciliation, Risk Investigation, and Investigation & Reporting. Only relevant specialists run per question.
-- Local RAG over CSV, PDF, text reports and stored investigation reports. Chunks keep source filename, page, row and transaction IDs for citations.
+- Selective LangGraph assistant with five required roles: Financial Analyst, Risk Investigation, Reconciliation, Evidence Retrieval and Investigation Summary (an Orchestrator selects a subset per question). Per-agent failures and answer history are persisted.
+- Investigation workspace: create cases from risk alerts, assign reviewers, record status/resolution, attach evidence, add notes, request grounded AI explanations, review history and export a case CSV. `/api/cases` remains a compatibility alias.
+- Local RAG over CSV, PDF, text reports and stored investigation reports. Chunks keep source filename, page, row and transaction IDs for citations. Management UI/API supports delete, re-index, per-document status and a retrieval test.
 - Local Ollama generation with grounding rules; no paid API key. When Ollama is offline, answers fall back to explicit evidence-only text.
-- Consolidated PDF/CSV reports containing financial summary, reconciliation, alerts, investigation narratives and evidence references.
+- Consolidated PDF/CSV reports containing financial summary, reconciliation, alerts, investigation narratives and evidence references, plus generation time, filters and calculation provenance.
+- Dedicated filtered CSV exports for transactions and risk alerts, plus a consolidated, secret-free system health endpoint (`/api/system/health`).
 - Invoice/AP audit module remains available through internal navigation from Reports: vendor, PO and receipt masters, CSV/Excel/PDF invoice ingestion, deterministic checks, human review, history and exports.
-- Additive SQLite migrations with automatic pre-migration backups; no destructive schema changes.
-- 114 passing backend tests and a successful frontend production build.
+- Additive SQLite migrations with automatic pre-migration backups; no destructive schema changes. Deployment config for Vercel + Render + Neon PostgreSQL is included (see `DEPLOYMENT.md`).
+- 125 passing backend tests and a successful frontend production build.
 
 ## Architecture
 
@@ -102,21 +104,28 @@ For invoice auditing, import files from `sample_data/invoice_audit/` in this ord
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| GET | `/api/health` | Health check |
+| GET | `/api/health` | Simple health check |
+| GET | `/api/system/health` | Consolidated secret-free DB/LLM/RAG/config status with real probes |
 | GET | `/api/dashboard/overview` | DB-backed KPIs, five charts, recent activity and scope |
 | POST | `/api/transactions/preview` | Validate and preview a CSV before import |
 | POST | `/api/audits` | Import CSV(s); `skip_duplicates=true` prevents re-import |
 | GET | `/api/transactions` | Search and filter transactions |
 | GET | `/api/transactions/{transaction_ref}` | Transaction detail with alerts and reconciliation evidence |
-| POST | `/api/reconciliations` | Run bank/ledger reconciliation |
-| GET | `/api/reconciliations/{id}` | Read reconciliation evidence |
+| GET | `/api/transactions/export.csv` | Filtered transaction CSV with generated_at, filters and provenance |
+| POST | `/api/reconciliations` | Run bank/ledger reconciliation; accepts `bank_mapping`/`ledger_mapping` (JSON) and `date_tolerance_days` |
+| GET | `/api/reconciliations/{id}` | Read reconciliation evidence and applied mappings |
 | POST | `/api/reconciliations/results/{id}/confirm` | Record a human confirmation with reviewer and comment |
 | GET/POST | `/api/risk/analyze`, `/api/risk/alerts`, `/api/risk/alerts/{id}/review` | Run and review deterministic alerts |
+| GET | `/api/risk/alerts/export.csv` | Filtered risk alert CSV with generated_at, filters and provenance |
+| GET/POST | `/api/investigations*`, `/api/cases` | Investigation cases, from-alert, notes, evidence, explain, history and CSV export |
 | POST | `/api/documents/ingest` | Ingest CSV/PDF/text documents into local RAG |
 | POST | `/api/documents/sync-transactions` | Index stored transactions into RAG |
+| GET | `/api/documents/status`, `/api/documents/{id}/status` | Collection and per-document index status |
+| DELETE | `/api/documents/{id}` | Delete a document and its chunks |
+| POST | `/api/documents/reindex`, `/api/documents/retrieval-test` | Rebuild index; debug retrieval without the LLM |
 | GET | `/api/assistant/config`, `/api/assistant/suggestions` | Assistant runtime status and prompts |
-| POST | `/api/assistant/query` | Selective multi-agent answer with citations |
-| GET | `/api/reports/summary`, `/api/reports/full.csv`, `/api/reports/full.pdf` | Consolidated reports and exports |
+| POST | `/api/assistant/query` | Selective multi-agent answer with citations, role/failure trace and persisted history |
+| GET | `/api/reports/summary`, `/api/reports/full.csv`, `/api/reports/full.pdf` | Consolidated reports and exports with generation time and provenance |
 | POST | `/api/agents/run` | Run the legacy persisted investigation workflow |
 | POST/GET | `/api/invoices*`, `/api/invoice-audits/run*`, `/api/discrepancies*` | Invoice audit and review |
 
@@ -124,9 +133,10 @@ The complete endpoint list, including invoice master data and geospatial analyti
 
 ## Reports and exports
 
-- **Full report PDF:** financial summary, metric scope, top alerts, AI explanations and evidence references.
-- **Full report CSV:** transaction, risk-alert and AI-explanation rows.
-- **Focused exports:** transaction analytics, individual audit runs and individual reconciliation runs.
+- **Full report PDF:** financial summary, metric scope, top alerts, AI explanations and evidence references, with generation time, filters, provenance and calculation notes.
+- **Full report CSV:** transaction, risk-alert and AI-explanation rows plus leading metadata rows for generated_at, filters and calculations.
+- **Focused exports:** filtered transactions, filtered risk alerts, individual audit runs and individual reconciliation runs (each self-describing with generated_at and provenance).
+- **Investigation export:** case detail with linked transactions, evidence, notes and history.
 - **Invoice exports:** invoice audit CSV and PDF from the Invoice Agent Center.
 
 Automated findings are investigation leads. They are not proof of fraud and do not authorize financial action.
@@ -140,7 +150,7 @@ cd backend && python3 -m pytest -q
 cd frontend && npm run build
 ```
 
-Current results: **114 passed** backend tests (one unrelated `anyio` deprecation warning) and a successful Vite production build (lucide `"use client"` and bundle-size warnings only). Run backend tests from `backend/` so the test configuration sets an isolated `FINAUDIT_DATABASE_URL` before the app imports.
+Current results: **125 passed** backend tests, including a deterministic end-to-end workflow covering import → reconciliation → risk → investigation → evidence → RAG retrieval → assistant → report export (one unrelated `anyio` deprecation warning), and a successful Vite production build (lucide `"use client"` and bundle-size warnings only). Run backend tests from `backend/` so the test configuration sets an isolated `FINAUDIT_DATABASE_URL` before the app imports.
 
 ## Database safety
 
@@ -153,12 +163,13 @@ Current results: **114 passed** backend tests (one unrelated `anyio` deprecation
 
 - TF-IDF retrieval is lexical rather than semantic; it avoids model downloads and heavy dependencies.
 - PDF extraction uses `pypdf` when available and a lightweight fallback otherwise; scanned/image-only PDFs need manual review.
-- There is no authentication or multi-user access control. Run locally with synthetic or anonymized data.
+- There is no authentication or multi-user access control. Run locally with synthetic or anonymized data; restrict any deployed instance at the network/edge layer.
 - Thresholds are configurable defaults, not universal accounting rules.
 - Overlapping findings can double-count a transaction in flagged-amount KPIs.
 - Currencies are never converted automatically; mismatches become review exceptions.
 - Ollama output can be wrong. Verify cited source rows and have an authorized human approve any financial action.
-- Deployment and production secrets management are out of scope.
+- The RAG store is local SQLite on the backend filesystem; on ephemeral hosts, re-ingest documents after each deploy or mount persistent storage.
+- Deployment configuration and secrets handling are documented in `DEPLOYMENT.md`; no live deployment has been published from this environment.
 
 ## Resume summary
 
@@ -166,8 +177,8 @@ Current results: **114 passed** backend tests (one unrelated `anyio` deprecation
 
 - Built a local-first financial intelligence platform with database-backed KPIs, five charts, CSV import validation, duplicate prevention and full source provenance.
 - Implemented deterministic bank/ledger reconciliation and an explainable risk engine with human review statuses and evidence-backed alert explanations.
-- Built a selective five-agent LangGraph assistant with validated outputs, SQL evidence, local TF-IDF RAG citations and grounded Ollama narration with safe fallbacks.
-- Added consolidated PDF/CSV investigations reports, additive SQLite migrations, invoice/AP audit workflows and 114 passing backend tests.
+- Built a selective five-role LangGraph assistant with validated outputs, SQL evidence, local TF-IDF RAG citations, per-agent failure tracing, persisted answer history and grounded Ollama narration with safe fallbacks.
+- Added an alert-to-case investigation workspace, filtered exports with provenance, consolidated secret-free system health, additive SQLite migrations, invoice/AP audit workflows, deployment configuration and 125 passing backend tests.
 
 ## License
 

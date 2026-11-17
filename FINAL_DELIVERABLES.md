@@ -1,6 +1,6 @@
 # FinAudit AI — Final Deliverables
 
-This document records the completed local financial-intelligence platform, its architecture, user workflows, API surface, migration safety, verification results, limitations and local setup. No deployment work is included.
+This document records the completed local financial-intelligence platform, its architecture, user workflows, API surface, migration safety, verification results, limitations and local setup. Deployment configuration and a smoke-test checklist are in `DEPLOYMENT.md`; no live deployment has been published from this environment.
 
 ## 1. Scope of the completed work
 
@@ -10,11 +10,13 @@ The starter project was extended rather than rebuilt. Existing audit, invoice, r
 - Transaction preview, column mapping, validation, duplicate-safe import, filtering, detail view and source provenance.
 - Deterministic bank/ledger reconciliation with matched, unmatched, amount/date mismatch and ambiguous results, plus human confirmation.
 - Explainable deterministic risk alerts with an explicit review workflow.
-- Selective five-agent LangGraph assistant with validated outputs, SQL evidence, local RAG citations and grounded Ollama narration.
-- Lightweight local RAG over CSV, PDF, text reports and persisted investigation reports.
-- Consolidated report summary and PDF/CSV exports from stored records, including AI narratives and evidence references.
+- Selective five-role LangGraph assistant (Financial Analyst, Risk Investigation, Reconciliation, Evidence Retrieval, Investigation Summary) with validated outputs, SQL evidence, local RAG citations, per-agent failure tracing, persisted answer history and grounded Ollama narration.
+- Lightweight local RAG over CSV, PDF, text reports and persisted investigation reports, with delete, re-index, per-document status and a retrieval-test endpoint.
+- Alert-to-case investigation workspace with reviewers, notes, evidence, status/resolution, grounded AI explanations, history and CSV export.
+- Filtered transaction and risk-alert CSV exports plus consolidated reports with generation time, applied filters and calculation provenance.
+- Consolidated, secret-free system health endpoint reporting real DB/LLM/RAG/config status.
 - Seven-item sidebar navigation; invoice tools remain available through internal Reports navigation.
-- Additive SQLite schema reconciliation with automatic pre-migration backups.
+- Additive SQLite schema reconciliation with automatic pre-migration backups, plus deployment configuration for Vercel + Render + Neon PostgreSQL.
 
 ## 2. System architecture
 
@@ -110,38 +112,41 @@ Possible matches are never silently accepted as reconciled.
 
 **Reports** loads `/api/reports/summary`, showing financial scope, latest reconciliation, top alerts, investigation runs and grounded AI narratives with evidence references. Toolbar links export:
 
-- `GET /api/reports/full.pdf` — summary, scope, alerts, AI explanations and evidence references.
-- `GET /api/reports/full.csv` — transaction, alert and AI-explanation rows.
-- `GET /api/analytics/export.csv`, audit CSV and reconciliation CSV for focused exports.
+- `GET /api/reports/full.pdf` — summary, scope, alerts, AI explanations and evidence references, with generation time, filters and provenance.
+- `GET /api/reports/full.csv` — transaction, alert and AI-explanation rows plus leading metadata rows for generated_at/filters/calculations.
+- `GET /api/transactions/export.csv` and `GET /api/risk/alerts/export.csv` — filtered exports with `generated_at`, applied filters and provenance; plus audit, reconciliation and investigation case CSV exports.
 
 ## 4. Multi-agent design
 
 ```mermaid
 flowchart TD
     Q[User question] --> O[Orchestrator Agent<br/>intent + selective route]
-    O -->|transaction| T[Transaction Analysis Agent]
+    O -->|transaction| T[Financial Analyst Agent]
     O -->|reconciliation| R[Reconciliation Agent]
     O -->|risk| K[Risk Investigation Agent]
+    O -->|evidence| E[Evidence Retrieval Agent]
     O -->|reporting| T2[All specialists]
-    T --> P[Investigation &amp; Reporting Agent]
+    T --> P[Investigation Summary Agent]
     R --> P
     K --> P
+    E --> P
     T2 --> P
     P --> SQL[(Exact SQL values)]
     P --> V[(RAG chunks + metadata)]
     P --> L[Ollama grounded narration]
-    P --> A[Validated answer<br/>facts + citations + sufficiency]
+    P --> A[Validated answer<br/>facts + citations + sufficiency + role/failure trace]
 ```
 
-| Agent | Reads | Produces |
+| Role | Reads | Produces |
 |---|---|---|
 | Orchestrator Agent | Question keywords | Intent, selected route, route reason |
-| Transaction Analysis Agent | `transaction_records` | Vendor/amount/date facts, source row evidence, duplicate lead |
+| Financial Analyst Agent | `transaction_records` | Vendor/amount/date facts, source row evidence, duplicate lead |
 | Reconciliation Agent | `reconciliation_runs/results` | Counts, differences, exception rows, human-confirmation note |
 | Risk Investigation Agent | `risk_alerts` | Rule, score, severity, explanation, transaction and source file |
-| Investigation & Reporting Agent | Specialist outputs, RAG search, Ollama | Narrative, citations, sufficiency, review disclaimer |
+| Evidence Retrieval Agent | RAG chunks | Grounded document citations with filename/chunk provenance |
+| Investigation Summary Agent | Specialist outputs, retrieved evidence, Ollama | Narrative, citations, sufficiency, review disclaimer |
 
-Routing is deterministic and selective: a risk question runs Risk + Reporting, not every agent. Each specialist returns a Pydantic-validated `AgentOutput` containing facts, hypotheses, missing evidence, recommendations and evidence. Reporting is the only node that calls the LLM, and grounding rules forbid invented IDs, amounts, dates or citations. The legacy ten-node invoice workflow and `MultiAgentOrchestrator` remain available for existing endpoints.
+Routing is deterministic and selective: a risk question runs Risk + Summary, not every role. Each role returns a Pydantic-validated `AgentOutput` containing facts, hypotheses, missing evidence, recommendations and evidence. An individual role failure is captured in `agent_failures` and the timeline without hiding it; the summary role is the only node that calls the LLM, and grounding rules forbid invented IDs, amounts, dates or citations. Answers are persisted as `InvestigationRun(task_type="assistant_query")`. Legacy route keys (`transaction`, `reporting`) are preserved for compatibility, and the legacy ten-node invoice workflow and `MultiAgentOrchestrator` remain available for existing endpoints.
 
 ## 5. RAG architecture
 
@@ -187,12 +192,17 @@ The full interactive schema is available at `http://127.0.0.1:8000/docs`. Primar
 | GET/POST | `/api/risk/config`, `/api/risk/analyze` | Risk configuration and deterministic analysis |
 | GET/POST | `/api/risk/alerts`, `/api/risk/alerts/{id}/review` | Filter alerts and save review decisions |
 | GET | `/api/risk/overview`, `/api/risk/channels`, `/api/risk/trends`, `/api/risk/geography*` | Risk analytics and stored-coordinate views |
+| GET | `/api/transactions/export.csv`, `/api/risk/alerts/export.csv` | Filtered CSV exports with generated_at, filters and provenance |
+| GET/POST/PATCH | `/api/investigations*`, `/api/cases` | Cases, from-alert, notes, evidence, explain, history, status/resolution and CSV export |
 | POST | `/api/documents/ingest` | Ingest CSV/PDF/text documents into RAG |
 | POST | `/api/documents/sync-transactions` | Index stored transactions into RAG |
-| GET | `/api/documents` | RAG stats and document list |
+| GET | `/api/documents`, `/api/documents/status`, `/api/documents/{id}/status` | RAG stats, document list and index status |
+| DELETE | `/api/documents/{id}` | Delete a document and its chunks |
+| POST | `/api/documents/reindex`, `/api/documents/retrieval-test` | Rebuild index; debug retrieval without the LLM |
 | GET | `/api/assistant/suggestions`, `/api/assistant/config` | Suggested prompts and runtime configuration |
-| POST | `/api/assistant/query` | Selective multi-agent grounded answer |
-| GET | `/api/reports/summary`, `/api/reports/full.csv`, `/api/reports/full.pdf` | Consolidated reports and exports |
+| POST | `/api/assistant/query` | Selective multi-agent grounded answer with role/failure trace and persisted history |
+| GET | `/api/system/health` | Consolidated secret-free DB/LLM/RAG/config status from real probes |
+| GET | `/api/reports/summary`, `/api/reports/full.csv`, `/api/reports/full.pdf` | Consolidated reports and exports with generation time, filters and provenance |
 | POST | `/api/findings/{id}/explain` | Grounded explanation for an audit finding |
 | POST/GET | `/api/agents/run`, `/api/agents/runs`, `/api/agents/runs/{id}` | Legacy persisted investigation workflow |
 | POST/GET | `/api/vendors`, `/api/purchase-orders`, `/api/goods-receipts`, `/api/invoices*` | Invoice master data and ingestion |
@@ -221,13 +231,13 @@ cd frontend && npm run build
 
 Results after the final code changes:
 
-- Backend: **114 passed**, 1 unrelated warning (`PytestRemovedIn10Warning` from `anyio/pytest_plugin.py`).
+- Backend: **125 passed**, 1 unrelated warning (`PytestRemovedIn10Warning` from `anyio/pytest_plugin.py`).
 - Frontend: **production build succeeded** (Vite 8.3.5). Warnings only: lucide-react `"use client"` directive preservation and a bundle chunk larger than 500 kB.
-- Targeted RAG/assistant/report tests: **5 passed**.
+- Targeted verification: management/RAG/roles **4 passed**, exports/mapping/investigation **6 passed**, deterministic end-to-end workflow **1 passed**.
 
-Test modules: `test_agent_workflow.py`, `test_analytics.py`, `test_api.py`, `test_audit_engine.py`, `test_csv_normalizer.py`, `test_finaudit_platform.py`, `test_geo_api.py`, `test_invoice_audit.py`, `test_llm.py`, `test_reconciliation.py`, `test_risk_api.py`, `test_risk_engine.py`, `test_transaction_enrichment.py`.
+Test modules: `test_agent_workflow.py`, `test_analytics.py`, `test_api.py`, `test_audit_engine.py`, `test_csv_normalizer.py`, `test_finaudit_platform.py`, `test_geo_api.py`, `test_investigation_api.py`, `test_invoice_audit.py`, `test_llm.py`, `test_management_api.py`, `test_reconciliation.py`, `test_risk_api.py`, `test_risk_engine.py`, `test_transaction_enrichment.py`, `test_exports_and_mapping.py`, `test_end_to_end_deterministic.py`.
 
-`test_finaudit_platform.py` covers the Dashboard charts/scope, preview and duplicate prevention, RAG metadata retrieval, selective agent routing with citations, and reports/OpenAPI exposure. LLM tests verify local Ollama behavior and fallback rather than a hosted API key.
+`test_finaudit_platform.py` covers the Dashboard charts/scope, preview and duplicate prevention, RAG metadata retrieval, selective agent routing with citations, and reports/OpenAPI exposure. `test_end_to_end_deterministic.py` covers the full chain: import → reconciliation with independent mapping → deterministic risk alert → create case from alert → attach evidence/note → RAG ingest and retrieval test → five-role assistant with evidence-only fallback and persisted history → report summary, PDF/CSV, transaction/risk/case CSV exports. LLM tests verify local Ollama behavior and fallback rather than a hosted API key.
 
 Run backend tests from `backend/` so `backend/tests/conftest.py` sets `FINAUDIT_DATABASE_URL` before the app is imported.
 
@@ -236,14 +246,16 @@ Run backend tests from `backend/` so `backend/tests/conftest.py` sets `FINAUDIT_
 - Ollama is expected to be offline in this environment. Evidence-only fallback responses are normal and tested; install a local model for grounded narration.
 - TF-IDF retrieval is lexical, not semantic. It is intentionally chosen for an 8 GB RAM laptop; no neural embedding model or ChromaDB is required.
 - PDF extraction is best effort without `pypdf`; scanned/image-only PDFs are not OCR'd and must be reviewed manually.
-- No authentication or multi-user access control exists. Run locally with synthetic or anonymized data.
+- No authentication or multi-user access control exists. Run locally with synthetic or anonymized data; restrict any deployed instance at the network/edge layer.
 - High-value and risk thresholds are configurable defaults, not universal accounting rules.
 - Findings may overlap, so flagged amounts can double-count a transaction across rules.
 - Currencies are never converted automatically; mismatches become review exceptions.
 - Risk scores and AI narratives are investigation leads, not proof of fraud. No AI output approves a payment, resolves a case or authorizes a reconciliation adjustment.
 - The report PDF is a text-based generated PDF, not a designed template.
 - The frontend bundle is large because the existing invoice/geospatial workspaces remain in one build; code splitting is a future optimization.
-- Deployment, multi-instance storage and production secrets management are out of scope.
+- The RAG store is local SQLite on the backend filesystem; on ephemeral hosts, re-ingest documents after each deploy or mount persistent storage.
+- Deployment configuration, secrets handling and a smoke-test checklist are documented in `DEPLOYMENT.md` (Vercel + Render + Neon PostgreSQL). No live deployment has been published from this environment; no deployed URLs are available.
+- Multi-instance/horizontal scaling and authentication are not implemented; this is a single-instance prototype.
 
 ## 10. Local setup
 
@@ -301,10 +313,13 @@ Open `http://localhost:5173`. Set `VITE_API_URL` in `frontend/.env` if the API i
 | `backend/app/dashboard.py` | Database-backed KPIs, five charts and scope definitions |
 | `backend/app/rag.py`, `vector_store.py` | Document ingestion, cleaning, chunking, local TF-IDF search and metadata |
 | `backend/app/llm.py` | Local Ollama generation, grounding rules and fallback |
-| `backend/app/agents/assistant_graph.py` | Selective five-agent LangGraph workflow |
+| `backend/app/agents/assistant_graph.py` | Selective five-role LangGraph workflow with failure trace and compatibility routes |
+| `backend/app/investigation_api.py` | Investigation cases, from-alert, notes, evidence, explain, history and export |
 | `backend/app/agents/orchestrator.py` | Legacy ten-node invoice/investigation workflow with Ollama support |
 | `backend/app/migrations.py` | Additive migrations, backups and schema inspection |
-| `backend/tests/test_finaudit_platform.py` | New end-to-end platform tests |
+| `backend/tests/test_finaudit_platform.py` | Platform tests (dashboard, import, RAG, routing, reports) |
+| `backend/tests/test_end_to_end_deterministic.py` | Full import→reconcile→risk→case→evidence→RAG→assistant→report workflow |
+| `backend/tests/test_management_api.py`, `test_exports_and_mapping.py`, `test_investigation_api.py` | Health/RAG/roles, exports/mapping and investigation workflow tests |
 | `frontend/src/main.jsx` | Seven-item sidebar, routing and secondary workspaces |
 | `frontend/src/Dashboard.jsx`, `Transactions.jsx`, `Assistant.jsx` | Core workspaces |
 | `frontend/src/workspace.css` | Shared workspace/report styling |

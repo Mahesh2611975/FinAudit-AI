@@ -165,6 +165,30 @@ class VectorStore:
             self._rebuild_index()
         return deleted
 
+    def reindex(self) -> dict[str, Any]:
+        """Rebuild the TF-IDF index from stored chunks (safe and repeatable)."""
+        self._rebuild_index()
+        return self.stats()
+
+    def get_document(self, doc_id: str) -> dict[str, Any] | None:
+        """Return one document's ingestion status, or None when absent."""
+        with self._connect() as con:
+            row = con.execute(
+                """SELECT doc_id, source_filename, document_type, file_hash,
+                          chunk_count, upload_timestamp, metadata
+                   FROM rag_documents WHERE doc_id = ?""",
+                (doc_id,),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        try:
+            item["metadata"] = json.loads(item.get("metadata") or "{}")
+        except (TypeError, ValueError):
+            item["metadata"] = {}
+        item["status"] = "indexed" if item.get("chunk_count") else "empty"
+        return item
+
     # ------------------------------------------------------------------
     # Index + retrieval
     # ------------------------------------------------------------------

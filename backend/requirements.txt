@@ -9,6 +9,9 @@ pytest>=8.0
 langgraph>=0.2.0
 python-dotenv
 openpyxl>=3.1.0
+# PostgreSQL driver for hosted databases (Neon, Render Postgres, etc.).
+# The app still runs locally on SQLite without needing this at runtime.
+psycopg2-binary>=2.9,<3.0
 # Optional: enables higher-fidelity PDF text extraction during RAG ingestion.
 # Without it, FinAudit uses a built-in lightweight PDF text extractor.
 pypdf>=5.0,<7.0

@@ -329,3 +329,41 @@ def store_stats() -> dict[str, Any]:
 
 def list_documents(limit: int = 50) -> list[dict[str, Any]]:
     return _store.list_documents(limit)
+
+
+# ----------------------------------------------------------------------
+# Management: deletion, re-indexing and retrieval debugging
+# ----------------------------------------------------------------------
+def delete_document(doc_id: str) -> bool:
+    """Remove a document and all of its chunks, then rebuild the index."""
+    return _store.delete_document(doc_id)
+
+
+def reindex() -> dict[str, Any]:
+    """Rebuild the local TF-IDF index from all stored chunks."""
+    return _store.reindex()
+
+
+def document_status(doc_id: str) -> dict[str, Any] | None:
+    """Return per-document ingestion status, including chunk count."""
+    return _store.get_document(doc_id)
+
+
+def retrieval_test(query: str, top_k: int = 5, **filters: Any) -> dict[str, Any]:
+    """Return retrieved chunks and citations for debugging RAG quality.
+
+    This is a retrieval-only helper. It never invokes the LLM and never
+    fabricates evidence: an empty result is reported explicitly.
+    """
+    query = str(query or "").strip()
+    if not query:
+        raise ValueError("query is required.")
+    chunks = search(query, top_k=max(1, min(top_k, 20)), **filters)
+    return {
+        "query": query,
+        "has_evidence": bool(chunks),
+        "result_count": len(chunks),
+        "chunks": chunks,
+        "stats": store_stats(),
+        "message": None if chunks else "No indexed chunks matched this query.",
+    }

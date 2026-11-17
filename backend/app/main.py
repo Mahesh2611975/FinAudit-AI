@@ -8,7 +8,7 @@ import pandas as pd
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from sqlalchemy import or_
+from sqlalchemy import inspect, or_, text
 from sqlalchemy.orm import Session
 
 from .analytics import AnalyticsInputError, monthly_analysis, monthly_comparison
@@ -19,6 +19,12 @@ from .llm import explain_finding
 from .migrations import backup_sqlite_database, ensure_database_schema, has_pending_schema_changes
 from .models import AuditRun, Finding, ReconciliationResult, ReconciliationRun, RiskAlert, TransactionRecord, InvestigationRun, InvestigationCase
 from .invoice_api import router as invoice_router
+from .investigation_api import (
+    InvestigationCreate,
+    create_investigation,
+    list_investigations,
+    router as investigation_router,
+)
 from .risk_api import router as risk_router
 from .reconciliation import ReconciliationError, reconcile_files
 from .category import categorize_transaction
@@ -66,6 +72,7 @@ app = FastAPI(title="FinAudit AI", version="1.0.0", description="Local-first fin
 app.add_middleware(CORSMiddleware, allow_origins=_cors_origins(), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.include_router(invoice_router)
 app.include_router(risk_router)
+app.include_router(investigation_router)
 
 
 @app.get("/")
@@ -76,6 +83,64 @@ def root():
 @app.get("/api/health")
 def health():
     return {"status": "healthy"}
+
+
+@app.get("/api/system/health")
+def system_health(db: Session = Depends(get_db)):
+    """Consolidated, secret-free status for the Settings screen.
+
+    Every reported value is derived from an actual probe; no credentials,
+    connection strings or environment values are exposed.
+    """
+    database = {"status": "unavailable", "backend": engine.url.get_backend_name()}
+    try:
+        db.execute(text("SELECT 1")).scalar()
+        database = {
+            "status": "connected",
+            "backend": engine.url.get_backend_name(),
+            "tables": len(inspect(engine).get_table_names()),
+            "transaction_records": int(db.query(TransactionRecord).count()),
+            "risk_alerts": int(db.query(RiskAlert).count()),
+            "reconciliation_runs": int(db.query(ReconciliationRun).count()),
+            "investigation_cases": int(db.query(InvestigationCase).count()),
+        }
+    except Exception as exc:  # noqa: BLE001 - health must report, not raise
+        database["error"] = f"{type(exc).__name__}: {exc}"
+
+    llm_available = llm.is_available()
+    rag_stats = rag.store_stats()
+    rag_chunks = int(rag_stats.get("chunks") or 0)
+    configured = bool(os.getenv("FINAUDIT_CORS_ORIGINS", "").strip())
+    return {
+        "status": "operational" if database["status"] == "connected" else "degraded",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "backend": {"status": "running", "api": "healthy"},
+        "database": database,
+        "llm": {
+            "provider": "ollama",
+            "backend": "ollama",
+            "available": llm_available,
+            "connected": llm_available,
+            "model": llm.get_model(),
+            "status": "available" if llm_available else "unavailable",
+            "note": None if llm_available else "Local Ollama is not reachable; deterministic rules and evidence-only answers remain available.",
+        },
+        "rag": {
+            "backend": rag_stats.get("backend", "local-tfidf-sqlite"),
+            "documents": int(rag_stats.get("documents") or 0),
+            "chunks": rag_chunks,
+            "index_exists": bool(rag_stats.get("index_exists")),
+            "status": "indexed" if rag_chunks > 0 else "empty",
+        },
+        "configuration": {
+            "database_url_configured": bool(os.getenv("FINAUDIT_DATABASE_URL", "").strip()),
+            "cors_origins_configured": configured,
+            "ai_provider_configurable": True,
+            "authentication_enabled": False,
+            "secrets_exposed": False,
+        },
+        "deterministic_engine": "operational",
+    }
 
 
 def _files_for_run(run: AuditRun) -> list[str]:
@@ -401,6 +466,55 @@ async def _read_upload_csv(upload: UploadFile, label: str) -> tuple[str, pd.Data
     return filename, frame
 
 
+RECONCILIATION_MAPPING_KEYS = {
+    "date", "amount", "debit", "credit", "withdrawal", "deposit",
+    "reference", "description", "type", "direction",
+}
+
+
+def _apply_reconciliation_mapping(
+    frame: pd.DataFrame, raw_mapping: str | None, label: str
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Rename user-supplied source columns to the canonical engine names."""
+    if not raw_mapping:
+        return frame.copy(), {}
+    try:
+        mapping = json.loads(raw_mapping)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"{label}: mapping must be valid JSON.") from exc
+    if not isinstance(mapping, dict):
+        raise HTTPException(status_code=422, detail=f"{label}: mapping must be a JSON object.")
+    canonical: dict[str, str] = {}
+    for key, source in mapping.items():
+        key_text = str(key).strip().lower()
+        source_text = str(source or "").strip()
+        if key_text not in RECONCILIATION_MAPPING_KEYS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{label}: unsupported mapping field '{key}'.",
+            )
+        if source_text not in frame.columns:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{label}: mapped column '{source_text}' was not found in the CSV.",
+            )
+        if key_text in canonical and canonical[key_text] != source_text:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{label}: only one source column can map to '{key_text}'.",
+            )
+        canonical[key_text] = source_text
+    if not canonical:
+        return frame.copy(), {}
+    reverse = {source: target for target, source in canonical.items()}
+    if len(reverse) != len(canonical):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}: one source column cannot be mapped to multiple fields.",
+        )
+    return frame.rename(columns=reverse).copy(), canonical
+
+
 def reconciliation_summary(run: ReconciliationRun) -> dict:
     return {
         "bank_total": run.bank_total,
@@ -442,6 +556,10 @@ def reconciliation_result_dict(item: ReconciliationResult) -> dict:
         "amount_difference": item.amount_difference,
         "date_difference_days": item.date_difference_days,
         "note": item.note,
+        "review_status": item.review_status,
+        "reviewed_by": item.reviewed_by,
+        "reviewed_at": item.reviewed_at.isoformat() if item.reviewed_at else None,
+        "reviewer_comment": item.reviewer_comment,
         "created_at": item.created_at.isoformat() if item.created_at else None,
     }
 
@@ -474,6 +592,8 @@ async def create_reconciliation(
     bank_file: UploadFile = File(...),
     ledger_file: UploadFile = File(...),
     date_tolerance_days: int = Form(3),
+    bank_mapping: str | None = Form(None),
+    ledger_mapping: str | None = Form(None),
     db: Session = Depends(get_db),
 ):
     if date_tolerance_days < 0 or date_tolerance_days > 365:
@@ -482,8 +602,16 @@ async def create_reconciliation(
             detail="date_tolerance_days must be between 0 and 365.",
         )
 
-    bank = await _read_upload_csv(bank_file, "Bank statement")
-    ledger = await _read_upload_csv(ledger_file, "Accounting ledger")
+    bank_upload = await _read_upload_csv(bank_file, "Bank statement")
+    ledger_upload = await _read_upload_csv(ledger_file, "Accounting ledger")
+    bank_frame, applied_bank_mapping = _apply_reconciliation_mapping(
+        bank_upload[1], bank_mapping, "Bank statement"
+    )
+    ledger_frame, applied_ledger_mapping = _apply_reconciliation_mapping(
+        ledger_upload[1], ledger_mapping, "Accounting ledger"
+    )
+    bank = (bank_upload[0], bank_frame)
+    ledger = (ledger_upload[0], ledger_frame)
 
     try:
         outcome = reconcile_files(
@@ -513,6 +641,8 @@ async def create_reconciliation(
         amount_mismatch_count=summary["amount_mismatch_count"],
         date_mismatch_count=summary["date_mismatch_count"],
         ambiguous_count=summary["ambiguous_count"],
+        bank_mapping=applied_bank_mapping,
+        ledger_mapping=applied_ledger_mapping,
     )
     db.add(run)
     db.flush()
@@ -526,6 +656,8 @@ async def create_reconciliation(
         "bank_file": run.bank_filename,
         "ledger_file": run.ledger_filename,
         "date_tolerance_days": run.date_tolerance_days,
+        "bank_mapping": applied_bank_mapping,
+        "ledger_mapping": applied_ledger_mapping,
         "summary": reconciliation_summary(run),
         "results": [reconciliation_result_dict(item) for item in run.results],
         "warnings": outcome.warnings,
@@ -548,6 +680,8 @@ def list_reconciliations(db: Session = Depends(get_db)):
             "ledger_file": run.ledger_filename,
             "files": [run.bank_filename, run.ledger_filename],
             "date_tolerance_days": run.date_tolerance_days,
+            "bank_mapping": run.bank_mapping or {},
+            "ledger_mapping": run.ledger_mapping or {},
             "summary": reconciliation_summary(run),
             "created_at": run.created_at.isoformat() if run.created_at else None,
         }
@@ -569,6 +703,8 @@ def get_reconciliation(reconciliation_id: int, db: Session = Depends(get_db)):
         "bank_file": run.bank_filename,
         "ledger_file": run.ledger_filename,
         "date_tolerance_days": run.date_tolerance_days,
+        "bank_mapping": run.bank_mapping or {},
+        "ledger_mapping": run.ledger_mapping or {},
         "summary": reconciliation_summary(run),
         "results": [reconciliation_result_dict(item) for item in run.results],
     }
@@ -784,44 +920,15 @@ def get_agent_run(run_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/cases")
-def create_case(payload: dict, db: Session = Depends(get_db)):
-    case = InvestigationCase(
-        title=payload.get("title") or "Investigation Case",
-        description=payload.get("description"),
-        severity=payload.get("severity") or "medium",
-        status=payload.get("status") or "open",
-        audit_run_id=payload.get("audit_run_id"),
-        transaction_id=payload.get("transaction_id"),
-        source_file=payload.get("source_file"),
-        source_row=payload.get("source_row"),
-        reviewer_notes=payload.get("reviewer_notes"),
-    )
-    db.add(case)
-    db.commit()
-    db.refresh(case)
-    return {"id": case.id, "title": case.title, "status": case.status, "severity": case.severity}
+def create_case(payload: InvestigationCreate, db: Session = Depends(get_db)):
+    """Legacy alias; full investigation workflow lives under /api/investigations."""
+    return create_investigation(db, payload)
 
 
 @app.get("/api/cases")
 def list_cases(limit: int = 50, db: Session = Depends(get_db)):
-    cases = db.query(InvestigationCase).order_by(InvestigationCase.id.desc()).limit(min(limit, 200)).all()
-    return [
-        {
-            "id": c.id,
-            "title": c.title,
-            "description": c.description,
-            "severity": c.severity,
-            "status": c.status,
-            "audit_run_id": c.audit_run_id,
-            "transaction_id": c.transaction_id,
-            "source_file": c.source_file,
-            "source_row": c.source_row,
-            "reviewer_notes": c.reviewer_notes,
-            "created_at": c.created_at.isoformat() if c.created_at else None,
-            "updated_at": c.updated_at.isoformat() if c.updated_at else None,
-        }
-        for c in cases
-    ]
+    """Legacy alias returning the historical array shape."""
+    return list_investigations(db, limit, 0, None)["items"]
 
 
 # ---------------------------------------------------------------------------
@@ -835,18 +942,16 @@ def dashboard_metrics(db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # Transaction management: search, filter, provenance and detail
 # ---------------------------------------------------------------------------
-@app.get("/api/transactions")
-def search_transactions(
-    q: str | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
-    min_amount: float | None = None,
-    max_amount: float | None = None,
-    direction: str | None = None,
-    source_file: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
-    db: Session = Depends(get_db),
+def _filtered_transaction_query(
+    db: Session,
+    *,
+    q: str | None,
+    date_from: str | None,
+    date_to: str | None,
+    min_amount: float | None,
+    max_amount: float | None,
+    direction: str | None,
+    source_file: str | None,
 ):
     query = db.query(TransactionRecord)
     if q:
@@ -872,7 +977,32 @@ def search_transactions(
         query = query.filter(TransactionRecord.direction == direction)
     if source_file:
         query = query.filter(TransactionRecord.source_file.ilike(f"%{source_file}%"))
+    return query
 
+
+@app.get("/api/transactions")
+def search_transactions(
+    q: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    min_amount: float | None = None,
+    max_amount: float | None = None,
+    direction: str | None = None,
+    source_file: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    query = _filtered_transaction_query(
+        db,
+        q=q,
+        date_from=date_from,
+        date_to=date_to,
+        min_amount=min_amount,
+        max_amount=max_amount,
+        direction=direction,
+        source_file=source_file,
+    )
     total = query.count()
     rows = (
         query.order_by(TransactionRecord.date.desc(), TransactionRecord.id.desc())
@@ -901,6 +1031,76 @@ def search_transactions(
             for row in rows
         ],
     }
+
+
+@app.get("/api/transactions/export.csv")
+def export_transactions(
+    q: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    min_amount: float | None = None,
+    max_amount: float | None = None,
+    direction: str | None = None,
+    source_file: str | None = None,
+    limit: int = 10000,
+    db: Session = Depends(get_db),
+):
+    query = _filtered_transaction_query(
+        db,
+        q=q,
+        date_from=date_from,
+        date_to=date_to,
+        min_amount=min_amount,
+        max_amount=max_amount,
+        direction=direction,
+        source_file=source_file,
+    )
+    rows = (
+        query.order_by(TransactionRecord.date.desc(), TransactionRecord.id.desc())
+        .limit(min(max(1, limit), 50000))
+        .all()
+    )
+    generated_at = datetime.now(timezone.utc).isoformat()
+    filter_label = json.dumps(
+        {
+            "q": q, "date_from": date_from, "date_to": date_to,
+            "min_amount": min_amount, "max_amount": max_amount,
+            "direction": direction, "source_file": source_file,
+        },
+        ensure_ascii=False,
+    )
+    output = StringIO()
+    pd.DataFrame(
+        [
+            {
+                "generated_at": generated_at,
+                "filters": filter_label,
+                "provenance": f"{row.source_file or 'unknown'}:{row.source_row if row.source_row is not None else '?'}",
+                "record_type": "transaction",
+                "reference": row.transaction_id,
+                "date": row.date,
+                "amount": row.amount,
+                "signed_amount": row.signed_amount,
+                "direction": row.direction,
+                "vendor": row.vendor,
+                "description": row.description,
+                "category": row.category,
+                "duplicate_key": row.duplicate_key,
+                "channel": row.channel,
+            }
+            for row in rows
+        ],
+        columns=[
+            "generated_at", "filters", "provenance", "record_type", "reference",
+            "date", "amount", "signed_amount", "direction", "vendor",
+            "description", "category", "duplicate_key", "channel",
+        ],
+    ).to_csv(output, index=False)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=finaudit_transactions.csv"},
+    )
 
 
 @app.get("/api/transactions/{transaction_ref}")
@@ -1006,7 +1206,65 @@ def sync_transactions_to_rag(db: Session = Depends(get_db)):
 
 @app.get("/api/documents")
 def list_documents(limit: int = 50):
-    return {"stats": rag.store_stats(), "documents": rag.list_documents(limit)}
+    stats = rag.store_stats()
+    return {
+        "stats": stats,
+        "documents": rag.list_documents(limit),
+        "status": "indexed" if stats.get("chunks", 0) > 0 else "empty",
+    }
+
+
+@app.get("/api/documents/status")
+def document_index_status():
+    stats = rag.store_stats()
+    chunks = int(stats.get("chunks") or 0)
+    return {
+        **stats,
+        "status": "indexed" if chunks > 0 else "empty",
+        "healthy": chunks > 0 and bool(stats.get("index_exists")),
+        "message": (
+            f"{stats.get('documents', 0)} document(s), {chunks} chunk(s) indexed."
+            if chunks
+            else "No documents are indexed. Upload a document or sync transactions first."
+        ),
+    }
+
+
+@app.get("/api/documents/{doc_id}/status")
+def document_status(doc_id: str):
+    item = rag.document_status(doc_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return item
+
+
+@app.delete("/api/documents/{doc_id}")
+def delete_document(doc_id: str):
+    if not rag.delete_document(doc_id):
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"deleted": doc_id, "stats": rag.store_stats()}
+
+
+@app.post("/api/documents/reindex")
+def reindex_documents():
+    return {"reindexed": True, "stats": rag.reindex()}
+
+
+@app.post("/api/documents/retrieval-test")
+def retrieval_test(payload: dict):
+    query = str((payload or {}).get("query") or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required.")
+    top_k = int((payload or {}).get("top_k") or 5)
+    filters = {}
+    for key in ("source_filename", "document_type", "transaction_id"):
+        value = (payload or {}).get(key)
+        if value:
+            filters[key] = value
+    try:
+        return rag.retrieval_test(query, top_k=top_k, **filters)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1039,7 +1297,7 @@ def assistant_config():
 
 
 @app.post("/api/assistant/query")
-def assistant_query(payload: dict):
+def assistant_query(payload: dict, db: Session = Depends(get_db)):
     question = str((payload or {}).get("question") or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="question is required.")
@@ -1056,11 +1314,47 @@ def assistant_query(payload: dict):
                     "transaction_id": citation.get("transaction_id"),
                 }
             )
+    # Persist the assistant exchange as investigation history so reviews remain
+    # traceable.  A persistence failure never hides the answer already produced.
+    history_id = None
+    try:
+        now = datetime.now(timezone.utc)
+        run = InvestigationRun(
+            name=question[:120],
+            task_type="assistant_query",
+            status="completed" if not result.get("agent_failures") else "partial",
+            input_state={"question": question},
+            output_state={
+                "answer": result.get("answer"),
+                "intent": result.get("intent"),
+                "agents_selected": result.get("route"),
+                "agent_outputs": result.get("agent_outputs", {}),
+                "citations": result.get("citations", []),
+                "sufficiency": result.get("sufficiency"),
+            },
+            timeline=result.get("timeline", []),
+            events=[],
+            evidence=result.get("sql_evidence", [])[:20],
+            errors=result.get("errors", []),
+            started_at=now,
+            finished_at=now,
+            duration_ms=0,
+        )
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+        history_id = run.id
+    except Exception:  # noqa: BLE001 - history is best-effort, not a response blocker
+        db.rollback()
+
     return {
         "question": question,
         "answer": result.get("answer"),
         "intent": result.get("intent"),
         "agents_selected": result.get("route"),
+        "agent_roles": result.get("agent_roles", []),
+        "required_roles": result.get("required_roles", []),
+        "agent_failures": result.get("agent_failures", []),
         "route_reason": result.get("route_reason"),
         "sufficiency": result.get("sufficiency"),
         "llm": result.get("llm"),
@@ -1070,6 +1364,7 @@ def assistant_query(payload: dict):
         "agent_outputs": result.get("agent_outputs", {}),
         "timeline": result.get("timeline", []),
         "links": links,
+        "history_id": history_id,
         "disclaimer": "AI assists human review. Findings are not proof of fraud and no financial action is authorised by this output.",
     }
 
@@ -1146,6 +1441,18 @@ def report_summary(db: Session = Depends(get_db)):
     alerts = db.query(RiskAlert).order_by(RiskAlert.risk_score.desc()).limit(20).all()
     recent_runs = db.query(InvestigationRun).order_by(InvestigationRun.id.desc()).limit(10).all()
     return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "filters": {
+            "alert_limit": 20,
+            "investigation_limit": 10,
+            "scope": "all stored records",
+        },
+        "provenance": "Computed from persisted transaction_records, risk_alerts, reconciliation_runs and investigation_runs.",
+        "calculations": {
+            "financial_summary": "Deterministic SQL aggregation of transaction_records (see scope).",
+            "risk_alerts": "Top 20 alerts by stored risk_score; severity/score from the risk engine.",
+            "reconciliation": "Latest saved reconciliation run summary.",
+        },
         "financial_summary": overview["metrics"],
         "scope": overview["scope"],
         "reconciliation": {
@@ -1219,6 +1526,45 @@ def report_full_csv(db: Session = Depends(get_db)):
             "source_row": "",
         })
     columns = ["record_type", "reference", "date", "amount", "direction", "description", "severity", "score", "source_file", "source_row"]
+    # Provenance rows carry generation time, applied filters and calculation
+    # notes so an exported report is self-describing for reviewers.
+    generated_at = datetime.now(timezone.utc).isoformat()
+    rows.insert(0, {
+        "record_type": "report_metadata",
+        "reference": "generated_at",
+        "date": generated_at,
+        "amount": "",
+        "direction": "",
+        "description": "Report generated from persisted database records.",
+        "severity": "",
+        "score": "",
+        "source_file": "finaudit.db",
+        "source_row": "",
+    })
+    rows.insert(1, {
+        "record_type": "report_metadata",
+        "reference": "filters",
+        "date": "",
+        "amount": "",
+        "direction": "",
+        "description": json.dumps({"scope": "all stored records", "limit_per_table": 10000}),
+        "severity": "",
+        "score": "",
+        "source_file": "",
+        "source_row": "",
+    })
+    rows.insert(2, {
+        "record_type": "report_metadata",
+        "reference": "calculations",
+        "date": "",
+        "amount": "",
+        "direction": "",
+        "description": "Financial values from deterministic SQL aggregation; risk severity/score from the deterministic risk engine.",
+        "severity": "",
+        "score": "",
+        "source_file": "",
+        "source_row": "",
+    })
     pd.DataFrame(rows, columns=columns).to_csv(output, index=False)
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv",
                              headers={"Content-Disposition": "attachment; filename=finaudit_full_report.csv"})
@@ -1228,6 +1574,11 @@ def report_full_csv(db: Session = Depends(get_db)):
 def report_full_pdf(db: Session = Depends(get_db)):
     overview = dashboard_overview(db)
     lines = ["FINANCIAL INTELLIGENCE REPORT", "Automated indicators for human review - not proof of fraud", ""]
+    lines.append(f"Generated at (UTC): {datetime.now(timezone.utc).isoformat()}")
+    lines.append("Filters: all stored records; top 30 risk alerts; 10 most recent investigations")
+    lines.append("Provenance: persisted SQLite database (transaction_records, risk_alerts, reconciliation_runs, investigation_runs)")
+    lines.append("Calculations: deterministic SQL/Python aggregation; LLM only narrates evidence")
+    lines.append("")
     lines.append("FINANCIAL SUMMARY")
     for key, value in overview["metrics"].items():
         lines.append(f"  {key.replace('_', ' ').title()}: {value}")
