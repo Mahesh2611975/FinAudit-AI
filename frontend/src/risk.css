@@ -1518,6 +1518,12 @@
   background: rgba(34, 197, 94, 0.09);
 }
 
+.geo-flag-chip-imported {
+  color: #fcd34d;
+  border-color: rgba(245, 158, 11, 0.28);
+  background: rgba(245, 158, 11, 0.1);
+}
+
 .geo-detail-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

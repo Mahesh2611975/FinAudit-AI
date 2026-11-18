@@ -44,7 +44,15 @@ const EMPTY_FILTERS = {
   country: '',
   risk_level: '',
   channel: '',
-  min_amount: ''
+  min_amount: '',
+  // Calculated risk follows persisted risk-analysis alerts by default.
+  // "imported" uses the optional CSV risk label as a display classification
+  // only; it never changes which transactions are flagged.
+  risk_source: 'calculated'
+};
+const RISK_SOURCE_LABELS = {
+  calculated: 'Calculated (from risk alerts)',
+  imported: 'Imported CSV label (display only)'
 };
 
 const fmtNumber = (value) => new Intl.NumberFormat('en-IN').format(Number(value) || 0);
@@ -205,6 +213,9 @@ function MarkerDetail({ marker, onClose }) {
           <div className="geo-detail-badges">
             <RiskPill level={marker.risk_level} />
             <span className="risk-score-pill">Score {fmtNumber(marker.risk_score)}</span>
+            {marker.risk_classification_source === 'imported' ? (
+              <span className="geo-flag-chip geo-flag-chip-imported">Imported label</span>
+            ) : null}
             {marker.flagged ? (
               <span className="geo-flag-chip"><Siren size={11} /> Alert linked</span>
             ) : (
@@ -224,7 +235,12 @@ function MarkerDetail({ marker, onClose }) {
         <div><span>State</span><strong>{marker.state || LOCATION_UNAVAILABLE}</strong></div>
         <div><span>Country</span><strong>{marker.country || LOCATION_UNAVAILABLE}</strong></div>
         <div><span>Channel</span><strong>{marker.channel || 'Unknown'}</strong></div>
+        <div><span>Original channel</span><strong>{marker.channel_original || '—'}</strong></div>
         <div><span>Channel source</span><strong>{channelSourceLabel(marker)}</strong></div>
+        <div><span>Risk source</span><strong>{marker.risk_classification_source === 'imported' ? 'Imported CSV label' : 'Calculated from alerts'}</strong></div>
+        <div><span>Calculated level</span><strong>{marker.calculated_risk_level || 'low'}</strong></div>
+        <div><span>Imported label</span><strong>{marker.imported_risk_level || '—'}</strong></div>
+        <div><span>Linked alerts</span><strong>{fmtNumber(marker.linked_alert_count || marker.alert_ids?.length || 0)}</strong></div>
         <div><span>Merchant</span><strong>{marker.merchant || '—'}</strong></div>
         <div><span>Source file</span><strong>{marker.source_file || '—'}</strong></div>
         <div><span>Source row</span><strong>{marker.source_row || '—'}</strong></div>
@@ -496,7 +512,7 @@ export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1
   const unusualLocations = data?.unusual_locations || [];
   const trend = data?.trend || [];
   const channelAnalytics = data?.channel_analytics || null;
-  const options = data?.options || { countries: [], channels: [], risk_levels: [] };
+  const options = data?.options || { countries: [], channels: [], risk_levels: [], risk_sources: [] };
   const geocoding = data?.geocoding || {};
   const available = Boolean(data?.available && markers.length > 0);
 
@@ -510,7 +526,9 @@ export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1
     return [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
   }, [markers]);
 
-  const activeFilterCount = Object.values(filters).filter(Boolean).length;
+  const activeFilterCount = Object.entries(filters).filter(
+    ([key, value]) => Boolean(value) && !(key === 'risk_source' && value === 'calculated')
+  ).length;
 
   const updateFilter = (key, value) => {
     setFilters((current) => ({ ...current, [key]: value }));
@@ -565,10 +583,12 @@ export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1
       attributionControl: true
     });
 
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-      subdomains: 'abcd',
+    // Standard OpenStreetMap tile layer: public, no API key required, and the
+    // attribution below satisfies the OpenStreetMap tile usage policy.
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      subdomains: 'abc',
       maxZoom: 19,
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
     }).addTo(map);
 
     const cluster = L.markerClusterGroup({
@@ -702,6 +722,14 @@ export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1
           </select>
         </label>
         <label>
+          <span>Risk source</span>
+          <select value={filters.risk_source} onChange={(event) => updateFilter('risk_source', event.target.value)}>
+            {(options.risk_sources?.length ? options.risk_sources : ['calculated', 'imported']).map((source) => (
+              <option key={source} value={source}>{RISK_SOURCE_LABELS[source] || source}</option>
+            ))}
+          </select>
+        </label>
+        <label>
           <span>Risk level</span>
           <select value={filters.risk_level} onChange={(event) => updateFilter('risk_level', event.target.value)}>
             <option value="">All risk levels</option>
@@ -738,23 +766,44 @@ export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1
 
       <div className="risk-kpi-grid geo-kpi-grid">
         <GeoKpi
-          label="Total geo transactions"
-          value={summary ? fmtNumber(summary.located_transactions) : '—'}
-          hint={summary ? `${fmtNumber(summary.total_transactions_matched)} matched · ${fmtNumber(summary.unlocated_transactions)} location unavailable` : 'Loading stored records'}
+          label="Total transactions"
+          value={summary ? fmtNumber(summary.total_transactions) : '—'}
+          hint={summary ? `${fmtNumber(summary.transactions_with_location_information)} with location information` : 'Loading stored records'}
           icon={MapPin}
           tone="blue"
         />
         <GeoKpi
+          label="With coordinates"
+          value={summary ? fmtNumber(summary.transactions_with_coordinates) : '—'}
+          hint={summary ? `${fmtNumber(summary.located_transactions)} plotted on the map` : 'Stored or resolved coordinates'}
+          icon={Globe2}
+          tone="cyan"
+        />
+        <GeoKpi
+          label="Without coordinates"
+          value={summary ? fmtNumber(summary.transactions_without_coordinates) : '—'}
+          hint={summary ? `${fmtNumber(summary.unavailable_location_transactions)} unavailable · ${fmtNumber(summary.named_only_transactions)} named only` : 'No coordinates stored'}
+          icon={MapPin}
+          tone="blue"
+        />
+        <GeoKpi
+          label="Linked risk alerts"
+          value={summary ? fmtNumber(summary.transactions_with_linked_alerts) : '—'}
+          hint={summary ? `${fmtNumber(summary.transactions_without_linked_alerts)} without linked alerts` : 'From persisted alert linking'}
+          icon={Siren}
+          tone="red"
+        />
+        <GeoKpi
           label="High-risk transactions"
           value={summary ? fmtNumber(summary.high_risk_transactions) : '—'}
-          hint={summary ? `${fmtNumber(data?.high_risk_countries?.length || 0)} countries with high risk` : 'From linked alerts'}
+          hint={summary ? `${fmtNumber(data?.high_risk_countries?.length || 0)} countries with high risk · source: ${summary.classification_source || 'calculated'}` : 'From linked alerts'}
           icon={Siren}
           tone="red"
         />
         <GeoKpi
           label="Flagged value"
           value={summary ? fmtCurrency(summary.flagged_value, currency) : '—'}
-          hint="Sum of mapped transactions with linked alerts"
+          hint="Mapped transactions with linked alerts · counted once each"
           icon={CircleDollarSign}
           tone="amber"
         />

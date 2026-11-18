@@ -1,114 +1,93 @@
-# FinAudit AI — Project audit and status checklist
+# FinAudit AI — Project Audit (Phase A: baseline, repairs, and verification)
 
-Status: **Phases 1–6 complete (implementation and local verification)**. This
-checklist is based on direct inspection of the repository, the live SQLite
-schema, configuration and the executed test suite. Actual cloud deployment is
-prepared but not published (see Blocker).
+**Baseline audit date:** 2026-11-18 (environment)  
+**Last updated:** 2026-11-18 (Phase A repair/verification pass)  
+**Working directory:** `/mnt/c/Users/Mahesh Yadav/Downloads/FinAudit-AI-starter-v2/FinAudit-AI`  
+**Git state:** pre-existing modified/untracked working files were present at session start and preserved. This session additionally modified `PROJECT_AUDIT.md`, `backend/app/{dashboard,llm,main,risk_engine,vector_store}.py`, and `backend/app/agents/assistant_graph.py`; the live DB was updated by controlled, backed-up repairs (see below). No existing user work was deleted or reverted.
 
-## Repository state
+## 1. Backup and data preservation
 
-- Started from commit `d70060c`. All work since is uncommitted in the working
-  tree and must be preserved (no files were deleted or rebuilt).
-- Stack preserved: React/Vite frontend, Python/FastAPI/SQLAlchemy backend,
-  SQLite local database, LangGraph agents, local TF-IDF RAG, optional Ollama.
-- Live database `backend/data/finaudit.db` was preserved. It had 25 tables at
-  audit start; additive migrations raised it to **28 tables** (investigation
-  notes/evidence/events added). No data was dropped.
-- Pre-refactor backup retained: `backend/data/backups/finaudit-pre-refactor-20261117-135303.db`.
-- `backend/.venv` is Windows-only; system `python3` is used in this environment.
-- `backend/.env` contains legacy `GROQ_*` keys; unused by the current Ollama-only
-  implementation. No credential values appear in source files.
+- **Live database preserved:** `backend/data/finaudit.db` (SQLite). **Not deleted, reset, or recreated.**
+- **Backups created before data-modifying repairs:**  
+  - `backend/data/backups/finaudit-pre-audit-phaseA-20261118-065357.db` (pre-audit copy)  
+  - `backend/data/backups/finaudit-pre-dedup-txns-20261118-065934.db` (pre-transaction dedup)  
+  - `backend/data/backups/finaudit-pre-risk-recompute-20261118-070625.db` (pre-risk recompute/stale-alert cleanup)
+- Existing historical backups in `backend/data/backups/` retained.
+- Additive migration mechanism remains in place (`backend/app/migrations.py`, startup in `backend/app/main.py`). RAG store is separate from main DB: `backend/data/rag/rag.sqlite3`.
 
-## Working features (verified)
+## 2. Phase A actions completed (verified)
 
-### Core backend and data integrity
+### 2.1 Transaction deduplication / data integrity repair
+- **Issue (baseline):** `transaction_records` had 2160 rows with heavy repeated imports (many `transaction_id`/`duplicate_key` repeats across 18 audit runs).
+- **Repair:** Removed **1645 exact provenance-duplicate** rows where both `source_file` and `source_row` matched, keeping the lowest `id` per `(source_file, source_row)` group (controlled, evidence-preserving for unique source rows). **No ambiguous rows were deleted.**
+- **Result:** `transaction_records` reduced **2160 → 515**. Post-repair checks: 0 duplicate `(source_file, source_row)` pairs, 0 duplicate `transaction_id` values, 13 weak `duplicate_key` groups remain (2 rows each, distinct provenance/source rows; preserved).
+- **Current transaction scope:** 515 rows across `transactions (5).csv` (410), `finaudit_geographic_transactions_demo.csv` (100), `transactions.csv` (5); date range `2025-01-12` to `2026-12-02` (future-dated rows remain as source data); coordinates present for 100 / missing for 415 (not fabricated).
 
-- [x] FastAPI app with 100+ REST routes; invoice, risk and investigation routers.
-- [x] DB-backed dashboard aggregates and five chart payloads (`dashboard.py`).
-- [x] CSV normalizer, deterministic audit engine, transaction persistence,
-      preview and duplicate-safe import.
-- [x] Transaction search, date/amount/source filters and detail with provenance.
-- [x] Dedicated filtered transaction CSV export with `generated_at`, filters and
-      provenance (`GET /api/transactions/export.csv`).
-- [x] Deterministic reconciliation engine with independent per-file column
-      mapping, configurable date tolerance (0–365 days), status evidence,
-      human confirm/reject endpoint and CSV export.
-- [x] Dedicated filtered risk alert CSV export with `generated_at`, filters and
-      provenance (`GET /api/risk/alerts/export.csv`).
-- [x] Deterministic risk engine with fingerprints, severity, score, review
-      statuses and alert events; geography endpoints with cached geocoding.
-- [x] Investigation workflow: create, list, detail, from-alert, status/resolution,
-      notes, evidence, explain, history and CSV export. `/api/cases` is a
-      compatibility alias delegating to the same helpers.
-- [x] Consolidated report summary, PDF and CSV exports now include generation
-      time, applied filters and calculation provenance.
-- [x] Additive schema reconciliation with SQLite backups before changes.
+### 2.2 Risk analysis consistency repair
+- **Issue (baseline):** Risk metrics/alerts were stale relative to deduped transaction state (496 alerts computed on 415 analyzed txns; 65 "Unusual Transaction Amount" alerts no longer reproduced by current deterministic rules after dedup; alert-transaction linkage needed re-verification).
+- **Code fix:** `backend/app/risk_engine.py` `run_analysis` now removes **stale machine-generated alerts not reproduced by the current deterministic analysis only when they are unreviewed/open with no assignee/comments/resolution/events**; reviewed/investigating/resolved/dismissed alerts and alerts with recorded events are preserved as evidence/history. Run result now reports `removed_stale`.
+- **Repair executed:** Backed up DB, then ran deterministic risk analysis (`triggered_by='phase-a-consistency-repair'`, run id 3).
+- **Result:** analyzed 515 transactions; alert state **496 → 529** (created 98, updated 431, removed stale 65 unreviewed non-reproduced). Current breakdown: Bank Reconciliation Anomaly 415, Unusual Transaction Amount 80, Missing Approval Evidence 18, Duplicate Payment 11, Unusual Transaction Frequency 5 (critical 23, high 506, medium/low 0), all open/unresolved. All 415 reconciliation-anomaly alerts reference latest reconciliation run (id 4) results and valid `reconciliation_results` rows. Note: earlier query flagging 176 reconciliation alerts as "missing txn links" was a misinterpretation of `transaction_id` semantics for reconciliation alerts (those IDs are statement references, not `transaction_records` keys); their source reconciliation evidence remains intact.
 
-### GenAI, RAG and assistant
+### 2.3 Reconciliation / dashboard metric consistency
+- **Observed:** Reconciliation engine behavior for dissimilar datasets is deterministic (runs 2–4: `transactions (5).csv` vs `transactions.csv` → 0 matched / 410 bank_only / 5 ledger_only; run 1 self-match produced 5 matched). 1250 `reconciliation_results` remain as preserved historical run evidence.
+- **Issue (baseline):** `backend/app/dashboard.py` aggregated reconciliation counts across **all historical** `reconciliation_results`, inflating dashboard matched/unmatched totals.
+- **Fix:** Dashboard reconciliation KPIs now derive from the **latest reconciliation run's** results only (with empty state when no runs), while preserving historical results/runs in DB.
+- **Verified current dashboard scope (latest run):** matched 0, unmatched 415 (bank_only 410, ledger_only 5), possible/ambiguous 0; total transactions 515; spending/received/net computed from persisted transactions; total risk alerts 529.
 
-- [x] Local Ollama-only LLM client with grounding rules and an explicit
-      evidence-only fallback when Ollama is offline. No paid LLM API.
-- [x] Local TF-IDF + SQLite RAG store with full source metadata for citations.
-- [x] RAG management: delete document, re-index, per-document status, collection
-      status and a retrieval-test endpoint (no LLM call, no fabricated evidence).
-- [x] Selective LangGraph assistant aligned to the five required roles:
-      Financial Analyst, Risk Investigation, Reconciliation, Evidence Retrieval
-      and Investigation Summary. Legacy route keys retained for compatibility.
-- [x] Per-agent failure trace (`agent_failures`, failed timeline entries) and
-      assistant answers persisted as `InvestigationRun(task_type="assistant_query")`.
-- [x] Consolidated secret-free `GET /api/system/health` with real DB probe and
-      counts, LLM provider/availability/model, RAG counts/status and config flags.
-- [x] Legacy multi-agent orchestrator and invoice workflow preserved.
+### 2.4 LLM / Ollama and assistant consistency
+- **Fixes:** `backend/app/llm.py` now reports the active model via `get_model()` in successful explanation responses (instead of stale module-level constant usage in response payload). `backend/app/agents/assistant_graph.py` reporting metadata now uses `llm.get_model()` consistently for fallback/success states.
+- **Behavior:** `llm.is_available()` remains a reachability probe to local Ollama (`/api/tags`); generation can still fail if the daemon is reachable but the configured model/response fails, in which case deterministic evidence-only fallbacks are returned. `/api/system/health` and assistant config reflect reachability/model config; frontend/assistant handling should continue to treat LLM output as optional narration over deterministic evidence.
 
-### Frontend
+### 2.5 RAG ingestion/retrieval
+- **Issue found:** CSV/PDF ingestion hashed raw bytes via `vector_store.text_hash` which assumed `str`, causing `AttributeError` on bytes input.
+- **Fix:** `backend/app/vector_store.py` `text_hash` now accepts `str | bytes` safely.
+- **Verification:** Local smoke test ingested a CSV, retrieved matching chunk(s), confirmed `retrieval_test` reports evidence, then deleted the test document (RAG store returned to 0 docs/chunks). RAG APIs/implementation (`rag.py`, `vector_store.py`, document endpoints in `main.py`) support CSV/PDF/TXT/MD/LOG/JSON ingestion, chunk metadata/citations, stats/status, delete/reindex/retrieval-test.
 
-- [x] `CasesPage` is a full investigation workspace wired to `/api/investigations`
-      (create, detail, status, notes, evidence, explain, history, export).
-- [x] `InvestigationsPage` reads persisted cases from `/api/investigations`.
-- [x] Reconciliation page exposes independent column mapping, date tolerance and
-      working confirm/reject actions.
-- [x] Settings uses `/api/system/health`; Reports surfaces the dedicated filtered
-      exports and report metadata.
-- [x] Assistant exposes RAG counts/status/retrieval-test/delete/re-index plus
-      five-role and agent-failure trace.
-- [x] Production build succeeds (`frontend/dist`).
+### 2.6 Import behavior
+- **Verified:** `create_audit` skips duplicates against existing DB by `duplicate_key` and `(source_file, source_row)` provenance when `skip_duplicates=True` (default), supporting idempotent re-imports (e.g. audit run 18 re-imported demo file with 0 new rows). A temporary intra-batch duplicate-key skipping change that broke duplicate-detection/import semantics was reverted after tests exposed regressions; current behavior matches existing API expectations/tests.
 
-### Deployment preparation
+## 3. Verification results
 
-- [x] Backend `Dockerfile` (Render-compatible), `.dockerignore`, `render.yaml`
-      blueprint, Vercel `vercel.json`, production env template
-      (`deploy/.env.production.example`), PostgreSQL driver in requirements.
-- [x] `DEPLOYMENT.md` with Neon/Render/Vercel steps, additive migration notes and
-      a 16-point smoke-test checklist.
-- [x] Deterministic end-to-end test covering import → reconciliation → risk →
-      investigation → evidence → RAG retrieval → assistant → report export.
+- **Backend tests (targeted, passed):**  
+  - `test_risk_engine.py` — 5 passed  
+  - `test_risk_api.py`, `test_reconciliation.py` — 18 passed  
+  - `test_csv_normalizer.py`, `test_llm.py`, `test_api.py` — 28 passed total in batch (after reverting import regression)  
+  - Environment warning observed from site-packages pytest plugin (`CallSpec2` deprecation notice), not from project code.
+- **Full backend suite:** not fully executed to completion in this pass (earlier broad run timed out in environment); additional existing tests remain to be run/fixed as Phase A/B work continues.
+- **Frontend production build:** `npm run build` in `frontend/` completed successfully (exit 0, Vite). Warnings only: large chunk size and `lucide-react` `"use client"` directive notices (non-fatal).
 
-## Verified results
+## 4. Current database snapshot (post-repair)
 
-- Backend pytest (before the final E2E test and review-field additions):
-  **124 passed, 1 warning in 307.31s**.
-- Focused post-change tests: management/RAG/roles **4 passed**; E2E workflow
-  **1 passed**; exports/mapping/investigation **6 passed**.
-- Frontend production build: **succeeded** (warnings only: lucide-react
-  `"use client"` directives and a >500 kB bundle).
+| Table / metric | Value | Notes |
+|---|---:|---|
+| transaction_records | 515 | Deduped by exact `(source_file, source_row)`; 13 weak `duplicate_key` groups preserved |
+| risk_alerts | 529 | Recomputed deterministically (run 3); 23 critical / 506 high / 0 medium / 0 low; all open |
+| risk_analysis_runs | 3 | Latest: completed, 515 txns, 529 alerts, triggered by `phase-a-consistency-repair` |
+| reconciliation_runs | 4 | Historical runs preserved |
+| reconciliation_results | 1250 | bank_only 1230, ledger_only 15, matched 5 across runs (history preserved); latest run = 415 results |
+| audit_runs | 18 | Historical import records preserved (row/finding counts reflect historical runs; not rewritten) |
+| findings | 329 | Historical findings preserved; 9 findings reference `transaction_id` values not present in current deduped transactions |
+| investigation_runs | 10 | Preserved |
+| investigation_cases | 0 | None |
+| RAG documents/chunks | 0 / 0 | Empty until user-ingested/synced |
 
-## Verification still to run
+## 5. Remaining gaps / open issues (Phase A+ / later phases)
 
-- [ ] One final full `cd backend && python3 -m pytest -q` after all Phase 5/6
-      changes (expected 125 tests) and a final `npm run build` if sources change.
+- **Historical consistency artifacts (preserved):** `audit_runs.row_count/finding_count` and `findings` are historical records and are not recalculated to match the deduped current transaction snapshot (9 findings now reference missing transaction IDs). Dashboard/risk current-state metrics use current deterministic computations where repaired, but historical audit evidence remains as stored.
+- **Reconciliation interpretation:** Latest comparison (dissimilar statement/ledger files) legitimately yields 0 matched; engine/mapping/tolerance behavior should continue to be validated against known-good paired datasets and UI messaging/contracts reviewed for clarity.
+- **Ollama:** Reachability-based health can differ from generation success (model missing/timeout/error); fallbacks are deterministic/evidence-only but user-facing status can be further clarified across backend/frontend.
+- **RAG:** Ingestion/retrieval primitives verified; index is empty in current environment and end-to-end assistant evidence quality/citations depend on ingested documents and query relevance. Sync/ingest UX and error reporting warrant broader UI/API contract verification.
+- **Investigation workflow:** Existing case/run/note/evidence/event/assistant infrastructure present, but full target workflow/statuses (`Open, Investigating, Awaiting Review, Approved, Rejected, Resolved, Closed`), explicit human-approval governance (AI cannot approve), audit-trail completeness, and case-centric UI/persistence need alignment and hardening.
+- **Frontend/API contracts:** Broad contract and UX verification (loading/empty/error states, counts/status shapes, all modules) not yet completed.
+- **Schema/production readiness:** SQLite-first; PostgreSQL compatibility path, Alembic migrations, stronger constraints/indexes, tenant model/RBAC groundwork, and Docker Compose/Postgres deployment path remain for later phases.
+- **Security/governance:** No auth/RBAC/tenant isolation; formal approval controls and broader security hardening remain unimplemented and must not be claimed complete.
+- **Testing:** Targeted tests/build passed as noted; full backend suite and broader integration/regression coverage still required.
 
-## Security checks
+## 6. Recommended next steps
 
-- [x] Upload endpoints enforce extension/type and size limits.
-- [x] ORM queries are parameterized; untrusted document text is supplied as data,
-      never as system instructions.
-- [x] CORS origins come from `FINAUDIT_CORS_ORIGINS` with localhost defaults.
-- [x] No secrets in frontend source or committed env files; `/api/system/health`
-      explicitly reports `secrets_exposed: false`.
-- [x] Authentication is **not** implemented; no production auth claim is made.
-
-## Blocker
-
-- No hosting credentials, PostgreSQL connection string, public inference host or
-  user authorization are available. Deployment configuration is complete, but
-  publishing to Vercel/Render/Neon cannot be performed here. No live URLs exist.
+1. Run broader backend test suite and fix regressions; validate reconciliation with known-good matched/unmatched fixtures and confirm UI/API contracts.
+2. Complete Phase A contract/UX checks (transactions, reconciliation, risk, dashboard, reports, assistant/settings, RAG document flows) without removing working features.
+3. Harden investigation case workflow, statuses, human-review/approval controls, and persisted evidence/audit trails (no fabricated traces; deterministic fallback).
+4. Improve Ollama/RAG status messaging and end-to-end evidence-grounded assistant behavior; add/adjust tests for ingestion/retrieval/assistant fallbacks.
+5. After Phase A is stable, proceed to Phase B–F per product spec (investigation engine, evidence intelligence, advanced intelligence, governance, production readiness) with additive migrations, preserved data, and verified claims only.

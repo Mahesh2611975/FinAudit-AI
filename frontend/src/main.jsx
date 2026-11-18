@@ -6,37 +6,43 @@ import {
   AlertTriangle,
   ArrowLeftRight,
   BarChart3,
+  Bot,
   BrainCircuit,
+  Calendar,
   CheckCircle2,
+  ChevronDown,
+  ChevronLeft,
   ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
   CircleDollarSign,
   Clock3,
   Download,
   FileSearch,
+  FileSpreadsheet,
   FileText,
   Filter,
+  GitCompare,
+  Globe2,
+  History,
   LayoutDashboard,
+  Loader2,
   Menu,
+  PackageCheck,
+  PieChart as PieChartIcon,
+  Plus,
+  Receipt,
   RefreshCw,
   Search,
   Settings,
   ShieldAlert,
   ShieldCheck,
+  ShoppingCart,
+  Sparkles,
+  Store,
   Upload,
   Users,
-  Sparkles,
-  Calendar,
-  PieChart as PieChartIcon,
-  ShoppingCart,
-  PackageCheck,
-  Receipt,
-  GitCompare,
-  Store,
-  Bot,
-  Plus,
-  X,
-  Loader2,
-  FileSpreadsheet
+  X
 } from 'lucide-react';
 import {
   Area,
@@ -63,16 +69,6 @@ const API = (
   import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
 ).replace(/\/$/, '');
 
-const NAV_ITEMS = [
-  { id: 'overview', label: 'Dashboard', icon: LayoutDashboard },
-  { id: 'transactions', label: 'Transactions', icon: FileSpreadsheet },
-  { id: 'reconciliation', label: 'Reconciliation', icon: ArrowLeftRight },
-  { id: 'risk-intelligence', label: 'Risk Alerts', icon: ShieldAlert },
-  { id: 'assistant', label: 'AI Assistant', icon: Bot },
-  { id: 'reports', label: 'Reports', icon: FileText },
-  { id: 'settings', label: 'Settings', icon: Settings }
-];
-
 const INVOICE_NAV_ITEMS = [
   { id: 'invoice-management', label: 'Invoice Management', icon: Receipt },
   { id: 'purchase-orders', label: 'Purchase Orders', icon: ShoppingCart },
@@ -84,11 +80,79 @@ const INVOICE_NAV_ITEMS = [
   { id: 'invoice-analytics', label: 'Invoice Analytics', icon: BarChart3 }
 ];
 
-const ALL_NAV_ITEMS = [...NAV_ITEMS, ...INVOICE_NAV_ITEMS, { id: 'analytics' }, { id: 'monitoring' }, { id: 'investigations' }, { id: 'cases' }, { id: 'agents' }, { id: 'compliance' }];
+// Enterprise sidebar structure (active items map to existing, working pages/APIs).
+// Unimplemented workflows are intentionally excluded from active navigation.
+const SIDEBAR_GROUPS = [
+  {
+    id: 'workspace',
+    label: 'Workspace',
+    items: [
+      { navId: 'dashboard', view: 'overview', label: 'Dashboard', icon: LayoutDashboard },
+      { navId: 'transactions', view: 'transactions', label: 'Transactions', icon: FileSpreadsheet },
+      { navId: 'reconciliation', view: 'reconciliation', label: 'Reconciliation', icon: ArrowLeftRight }
+    ]
+  },
+  {
+    id: 'risk-intelligence',
+    label: 'Risk & Intelligence',
+    items: [
+      { navId: 'risk-intelligence', view: 'risk-intelligence', label: 'Risk Intelligence', icon: ShieldAlert },
+      { navId: 'geographic-intelligence', view: 'risk-intelligence', label: 'Geographic Intelligence', icon: Globe2 },
+      { navId: 'vendor-intelligence', view: 'vendor-intelligence', label: 'Vendor Intelligence', icon: Store }
+    ]
+  },
+  {
+    id: 'investigation-center',
+    label: 'Investigation Center',
+    items: [
+      { navId: 'investigation-cases', view: 'cases', label: 'Investigation Cases', icon: Users },
+      { navId: 'ai-investigation-assistant', view: 'assistant', label: 'AI Investigation Assistant', icon: Bot },
+      { navId: 'agent-execution-history', view: 'agents', label: 'Agent Execution History', icon: History }
+    ]
+  },
+  {
+    id: 'evidence-documents',
+    label: 'Evidence & Documents',
+    items: []
+  },
+  {
+    id: 'governance',
+    label: 'Governance',
+    items: [
+      { navId: 'reports-exports', view: 'reports', label: 'Reports & Exports', icon: FileText }
+    ]
+  },
+  {
+    id: 'administration',
+    label: 'Administration',
+    items: [
+      { navId: 'settings', view: 'settings', label: 'Settings', icon: Settings }
+    ]
+  }
+];
+
+const SIDEBAR_NAV_ITEMS = SIDEBAR_GROUPS.flatMap((group) => group.items);
+
+// Preserve all existing routable views (including secondary/invoice workspaces).
+const ALL_NAV_ITEMS = [
+  ...SIDEBAR_NAV_ITEMS.map((item) => ({ id: item.view })),
+  ...INVOICE_NAV_ITEMS,
+  { id: 'analytics' },
+  { id: 'monitoring' },
+  { id: 'investigations' },
+  { id: 'compliance' }
+];
+
+const ROUTABLE_VIEW_IDS = new Set(ALL_NAV_ITEMS.map((item) => item.id));
+
+const PRIMARY_SIDEBAR_VIEWS = new Set(SIDEBAR_NAV_ITEMS.map((item) => item.view));
 
 const SECONDARY_VIEWS = new Set([
-  'analytics', 'monitoring', 'investigations', 'cases', 'agents', 'compliance',
-  ...INVOICE_NAV_ITEMS.map((item) => item.id),
+  'analytics',
+  'monitoring',
+  'investigations',
+  'compliance',
+  ...INVOICE_NAV_ITEMS.filter((item) => !PRIMARY_SIDEBAR_VIEWS.has(item.id)).map((item) => item.id)
 ]);
 
 const RECON_STEPS = [
@@ -441,6 +505,8 @@ function OverviewPage({ audits, reconciliations, loading, onAuditCreated, onNavi
                   try {
                     const formData = new FormData();
                     formData.append('files', uploadFile);
+                    // Re-uploading the same statement must not create duplicate rows.
+                    formData.append('skip_duplicates', 'true');
                     const response = await fetch(`${API}/api/audits`, {
                       method: 'POST',
                       body: formData
@@ -1932,12 +1998,22 @@ function InvoiceAnalyticsPage() {
 
 function App() {
   const [activeView, setActiveView] = useState('overview');
+  const [activeNavId, setActiveNavId] = useState('dashboard');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [expandedGroups, setExpandedGroups] = useState(() =>
+    Object.fromEntries(SIDEBAR_GROUPS.map((group) => [group.id, true]))
+  );
   const [audits, setAudits] = useState([]);
   const [reconciliations, setReconciliations] = useState([]);
   const [reconciliation, setReconciliation] = useState(null);
   const [loadingOverview, setLoadingOverview] = useState(false);
   const [transactionFocus, setTransactionFocus] = useState('');
+  const [backendHealth, setBackendHealth] = useState({
+    state: 'checking',
+    label: 'Checking backend',
+    detail: 'Contacting API…'
+  });
 
   const themeClass = activeView === 'reconciliation' ? 'theme-reconciliation' : 'theme-dashboard';
 
@@ -1968,9 +2044,59 @@ function App() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    const loadHealth = async () => {
+      try {
+        const response = await fetch(`${API}/api/system/health`);
+        const data = await response.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!response.ok) {
+          setBackendHealth({ state: 'offline', label: 'Backend unreachable', detail: `HTTP ${response.status}` });
+          return;
+        }
+        const systemStatus = String(data.status || '').toLower();
+        const dbStatus = String(data.database?.status || '').toLowerCase();
+        const healthy = response.ok && dbStatus === 'connected' && systemStatus !== 'degraded';
+        setBackendHealth({
+          state: healthy ? 'healthy' : 'degraded',
+          label: healthy ? 'Backend healthy' : 'Backend degraded',
+          detail:
+            dbStatus === 'connected'
+              ? `Database connected · LLM ${data.llm?.available ? 'available' : 'unavailable'}`
+              : `Database ${data.database?.status || 'unavailable'}`
+        });
+      } catch {
+        if (!cancelled) {
+          setBackendHealth({ state: 'offline', label: 'Backend offline', detail: 'Unable to reach API' });
+        }
+      }
+    };
+    loadHealth();
+    const interval = window.setInterval(loadHealth, 30000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, []);
+
+  useEffect(() => {
+    const match = SIDEBAR_NAV_ITEMS.find((item) => item.view === activeView);
+    if (match) setActiveNavId(match.navId);
+  }, [activeView]);
+
+  useEffect(() => {
     const handler = (event) => {
-      if (typeof event.detail === 'string' && ALL_NAV_ITEMS.some((item) => item.id === event.detail)) {
-        setActiveView(event.detail);
+      if (typeof event.detail !== 'string') return;
+      const target = event.detail;
+      if (ROUTABLE_VIEW_IDS.has(target)) {
+        setActiveView(target);
+        setMobileMenuOpen(false);
+        return;
+      }
+      const navItem = SIDEBAR_NAV_ITEMS.find((item) => item.navId === target);
+      if (navItem) {
+        setActiveView(navItem.view);
+        setActiveNavId(navItem.navId);
         setMobileMenuOpen(false);
       }
     };
@@ -1978,6 +2104,7 @@ function App() {
       if (typeof event.detail === 'string') {
         setTransactionFocus(`${Date.now()}:${event.detail}`);
         setActiveView('transactions');
+        setActiveNavId('transactions');
         setMobileMenuOpen(false);
       }
     };
@@ -1992,14 +2119,14 @@ function App() {
   const pageTitle = {
     overview: { eyebrow: 'Dashboard', title: 'Financial Intelligence Dashboard', description: 'Database-backed KPIs, five charts and recent evidence from actual records.' },
     transactions: { eyebrow: 'Transactions', title: 'Transaction Management', description: 'Import, validate, search and inspect transactions with full source provenance.' },
-    assistant: { eyebrow: 'AI Assistant', title: 'Grounded AI Assistant', description: 'Selective multi-agent investigation with SQL evidence, RAG citations and human review.' },
+    assistant: { eyebrow: 'AI Assistant', title: 'AI Investigation Assistant', description: 'Selective multi-agent investigation with SQL evidence, RAG citations and human review.' },
     analytics: { eyebrow: 'Analytics', title: 'Financial Analytics', description: 'Monthly spending, categories, trends and transaction details from actual data.' },
     'risk-intelligence': { eyebrow: 'Risk Intelligence', title: 'Financial Risk & Fraud Intelligence', description: 'Deterministic risk scoring, anomaly alerts, channel analytics, trends and geography from stored records.' },
     monitoring: { eyebrow: 'Monitoring', title: 'Audit Activity Monitoring', description: 'Historical audit runs, findings by risk/type, and activity.' },
     investigations: { eyebrow: 'Investigations', title: 'Investigations', description: 'Findings with source evidence and provenance.' },
     cases: { eyebrow: 'Cases', title: 'Investigation Cases', description: 'Create and manage cases linked to findings with status/notes.' },
     reconciliation: { eyebrow: 'Reconciliation', title: 'Bank Reconciliation', description: 'Match bank statements to the accounting ledger.' },
-    agents: { eyebrow: 'AI', title: 'AI Agent Center', description: 'LangGraph multi-agent investigation workflow with evidence and human review.' },
+    agents: { eyebrow: 'AI', title: 'Agent Execution History', description: 'Persisted LangGraph investigation runs with evidence, status, and human review context.' },
     reports: { eyebrow: 'Reports', title: 'Reports & Exports', description: 'Generate and download reports and exports from actual data.' },
     compliance: { eyebrow: 'Compliance', title: 'Compliance', description: 'Actual available audit and evidence information.' },
     settings: { eyebrow: 'Settings', title: 'Settings', description: 'Real configuration status.' },
@@ -2013,46 +2140,108 @@ function App() {
     'invoice-analytics': { eyebrow: 'Invoice Audit', title: 'Invoice Analytics', description: 'Monthly invoice, payment and discrepancy totals from actual data.' }
   }[activeView];
 
+  const handleNavSelect = (item) => {
+    setActiveView(item.view);
+    setActiveNavId(item.navId);
+    setMobileMenuOpen(false);
+  };
+
+  const compactSidebar = sidebarCollapsed && !mobileMenuOpen;
+
   return (
     <div className={`app-shell ${themeClass}`}>
-      <aside className={`sidebar ${mobileMenuOpen ? 'sidebar-open' : ''}`}>
-        <div className="brand">
-          <div className="brand-mark">
-            <ShieldCheck size={24} />
+      <aside
+        className={`sidebar ${mobileMenuOpen ? 'sidebar-open' : ''} ${compactSidebar ? 'sidebar-collapsed' : ''}`}
+      >
+        <div className="sidebar-header-row">
+          <div className="brand">
+            <div className="brand-mark">
+              <ShieldCheck size={24} />
+            </div>
+            {!compactSidebar && (
+              <div className="brand-text">
+                <b>
+                  FinAudit<span> AI</span>
+                </b>
+                <small>Enterprise Risk Platform</small>
+              </div>
+            )}
           </div>
-          <div className="brand-text">
-            <b>
-              FinAudit<span> AI</span>
-            </b>
-            <small>Enterprise Risk Platform</small>
-          </div>
+          <button
+            type="button"
+            className="sidebar-collapse-btn"
+            onClick={() => setSidebarCollapsed((value) => !value)}
+            title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            {sidebarCollapsed ? <ChevronsRight size={16} /> : <ChevronsLeft size={16} />}
+          </button>
         </div>
 
-        <div className="side-label">Navigation</div>
-        {NAV_ITEMS.map((item) => {
-          const Icon = item.icon;
-          return (
-            <button
-              key={item.id}
-              type="button"
-              className={`nav ${activeView === item.id ? 'active' : ''}`}
-              onClick={() => {
-                setActiveView(item.id);
-                setMobileMenuOpen(false);
-              }}
-            >
-              <Icon size={18} />
-              <span>{item.label}</span>
-            </button>
-          );
-        })}
+        <nav className="sidebar-groups" aria-label="Primary navigation">
+          {SIDEBAR_GROUPS.map((group) => {
+            const hasItems = group.items.length > 0;
+            const expanded = expandedGroups[group.id] ?? true;
+            return (
+              <div key={group.id} className="sidebar-group">
+                <button
+                  type="button"
+                  className={`sidebar-group-toggle ${!hasItems ? 'disabled' : ''}`}
+                  onClick={() => {
+                    if (!compactSidebar && hasItems) {
+                      setExpandedGroups((current) => ({ ...current, [group.id]: !expanded }));
+                    }
+                  }}
+                  disabled={!hasItems || compactSidebar}
+                  title={group.label}
+                >
+                  {!compactSidebar && <span className="sidebar-group-label">{group.label}</span>}
+                  {!compactSidebar && hasItems && (
+                    <ChevronDown size={14} className={`sidebar-group-chevron ${expanded ? 'open' : ''}`} />
+                  )}
+                  {compactSidebar && <span className="sidebar-group-dot" aria-hidden="true" />}
+                </button>
+                {(compactSidebar || expanded) && hasItems && (
+                  <div className="sidebar-group-items">
+                    {group.items.map((item) => {
+                      const Icon = item.icon;
+                      const active = activeNavId === item.navId || (!SIDEBAR_NAV_ITEMS.some((nav) => nav.navId === activeNavId) && activeView === item.view);
+                      return (
+                        <button
+                          key={item.navId}
+                          type="button"
+                          className={`nav ${active ? 'active' : ''} ${compactSidebar ? 'nav-collapsed' : ''}`}
+                          onClick={() => handleNavSelect(item)}
+                          title={item.label}
+                          aria-label={item.label}
+                        >
+                          <Icon size={18} />
+                          {!compactSidebar && <span>{item.label}</span>}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </nav>
 
         <div className="sidebar-bottom">
-          <div className="local-badge">
-            <span />
-            API-connected mode
+          <div className={`health-indicator health-${backendHealth.state}`} title={backendHealth.detail}>
+            <span className="health-dot" />
+            {!compactSidebar ? (
+              <div className="health-copy">
+                <strong>{backendHealth.label}</strong>
+                <small>{backendHealth.detail}</small>
+              </div>
+            ) : (
+              <span className="sr-only">{backendHealth.label}</span>
+            )}
           </div>
-          <small>Local-first · Human review required · Findings are investigation leads</small>
+          {!compactSidebar && (
+            <small>Local-first · Human review required · Findings are investigation leads</small>
+          )}
         </div>
       </aside>
 

@@ -47,7 +47,7 @@
 |---|---|
 | `leaflet` 1.9.4 | Interactive map |
 | `leaflet.markercluster` 1.5.3 | Nearby-marker clustering |
-| OpenStreetMap / CARTO dark tiles | Map basemap; no paid map key required |
+| OpenStreetMap standard tiles | Map basemap; public tile server with attribution, no API key required |
 | OpenStreetMap Nominatim | Optional free geocoding, disabled by default |
 
 Install with:
