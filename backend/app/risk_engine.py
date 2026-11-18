@@ -1042,8 +1042,10 @@ def run_analysis(
         existing_alerts = {
             alert.fingerprint: alert for alert in db.query(RiskAlert).all()
         }
+        draft_fingerprints = {draft["fingerprint"] for draft in drafts}
         created = 0
         updated = 0
+        removed_stale = 0
         for index, draft in enumerate(drafts):
             existing = existing_alerts.get(draft["fingerprint"])
             if existing:
@@ -1082,6 +1084,25 @@ def run_analysis(
                 existing_alerts[draft["fingerprint"]] = alert
                 created += 1
 
+        # Remove stale machine-generated alerts that are no longer reproduced by
+        # the current deterministic analysis and have not entered human review.
+        # Reviewed/resolved/assigned alerts and alerts with recorded events are
+        # preserved as evidence/history. Only alerts managed by risk analysis
+        # runs are auto-removed; externally created alerts are preserved.
+        for fingerprint, alert in list(existing_alerts.items()):
+            if fingerprint in draft_fingerprints:
+                continue
+            if alert.last_analysis_run_id is None:
+                continue
+            if alert.review_status != "open":
+                continue
+            if alert.resolved_at is not None or alert.assigned_to or _text(alert.reviewer_comments):
+                continue
+            if alert.events:
+                continue
+            db.delete(alert)
+            removed_stale += 1
+
         db.flush()
         severity_counts = Counter(draft["severity"] for draft in drafts)
         finished = datetime.now(timezone.utc)
@@ -1102,6 +1123,7 @@ def run_analysis(
             "alert_count": run.alert_count,
             "created": created,
             "updated": updated,
+            "removed_stale": removed_stale,
             "critical_count": run.critical_count,
             "high_count": run.high_count,
             "medium_count": run.medium_count,

@@ -38,6 +38,8 @@ CANONICAL_COLUMNS = [
     "source_sms",
     "channel",
     "channel_source",
+    "channel_original",
+    "imported_risk_level",
     "country",
     "state",
     "city",
@@ -48,6 +50,23 @@ CANONICAL_COLUMNS = [
     "source_row",
     "duplicate_key",
 ]
+
+# A CSV ``risk_level`` column is an *imported label*, not a calculated risk
+# score.  It is stored for provenance and never used as proof of fraud.
+IMPORTED_RISK_LEVELS = ("low", "medium", "high", "critical")
+IMPORTED_RISK_ALIASES = {
+    "l": "low",
+    "lo": "low",
+    "low": "low",
+    "m": "medium",
+    "med": "medium",
+    "medium": "medium",
+    "h": "high",
+    "high": "high",
+    "c": "critical",
+    "crit": "critical",
+    "critical": "critical",
+}
 
 # Canonical payment channels used for newly ingested data.
 CANONICAL_CHANNELS = (
@@ -204,6 +223,13 @@ COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
         "payee",
     ),
     "payment_channel": CHANNEL_COLUMNS,
+    "imported_risk_level": (
+        "risk_level",
+        "risk",
+        "risk_rating",
+        "riskrating",
+        "imported_risk_level",
+    ),
     "city": LOCATION_COLUMNS["city"] + ("transaction_city", "merchant_city"),
     "state": LOCATION_COLUMNS["state"] + ("transaction_state", "merchant_state"),
     "country": LOCATION_COLUMNS["country"] + ("transaction_country", "merchant_country"),
@@ -395,6 +421,27 @@ def _infer_channel(row) -> tuple[str, str, str | None]:
     return "Unknown", "unknown", None
 
 
+def _imported_risk_level(row) -> tuple[str | None, str | None]:
+    """Normalise an optional CSV ``risk_level`` label for provenance only.
+
+    The returned value is a label supplied by the source file.  It is stored
+    alongside (never instead of) the calculated risk alerts and is never
+    interpreted as evidence of fraud.  Unrecognised labels are reported as a
+    warning and are not stored as a calculated risk level.
+    """
+    raw = _first_value(row, ("imported_risk_level",))
+    if not raw:
+        return None, None
+    key = re.sub(r"[^a-z0-9]+", "", raw.lower()).strip()
+    level = IMPORTED_RISK_ALIASES.get(key)
+    if level is None:
+        return None, (
+            f"Imported risk label '{raw[:60]}' is not one of "
+            f"{', '.join(IMPORTED_RISK_LEVELS)}; kept as an unclassified label."
+        )
+    return level, None
+
+
 def _parse_coordinate(value) -> float | None:
     if _is_blank(value) or isinstance(value, bool):
         return None
@@ -432,7 +479,11 @@ def _location_value(row) -> tuple[dict[str, object], list[str]]:
 
     has_lat_text = bool(_first_value(row, LOCATION_COLUMNS["latitude"]))
     has_lng_text = bool(_first_value(row, LOCATION_COLUMNS["longitude"]))
-    if bool(values["latitude"]) != bool(values["longitude"]):
+    # Use `is not None`, not truthiness: a valid 0.0 latitude/longitude
+    # (equator / prime meridian) must not be mistaken for a missing value.
+    has_lat = values["latitude"] is not None
+    has_lng = values["longitude"] is not None
+    if has_lat != has_lng:
         if not warnings:
             warnings.append("Incomplete latitude/longitude pair ignored.")
         values["latitude"] = None
@@ -651,6 +702,13 @@ def normalize_files(frames: list[tuple[str, pd.DataFrame]]) -> NormalizationResu
             channel, channel_source, channel_warning = _infer_channel(row)
             if channel_warning:
                 warnings.append(f"{row_label}: {channel_warning}")
+            # Keep the raw imported channel so an unmapped value is not lost.
+            # Normalised ``channel`` is used for analytics; the original is
+            # retained for display and audit provenance.
+            channel_original = _first_value(row, CHANNEL_COLUMNS)[:255] or None
+            imported_risk, imported_risk_warning = _imported_risk_level(row)
+            if imported_risk_warning:
+                warnings.append(f"{row_label}: {imported_risk_warning}")
             currency = _currency_value(row)
             location, location_warnings = _location_value(row)
             for warning in location_warnings:
@@ -698,6 +756,8 @@ def normalize_files(frames: list[tuple[str, pd.DataFrame]]) -> NormalizationResu
                 "source_sms": source_sms,
                 "channel": channel,
                 "channel_source": channel_source,
+                "channel_original": channel_original,
+                "imported_risk_level": imported_risk,
                 "country": location["country"],
                 "state": location["state"],
                 "city": location["city"],

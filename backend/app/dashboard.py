@@ -103,13 +103,22 @@ def dashboard_overview(db: Session, *, activity_months: int = 6, recent_limit: i
     total_spending = _money(total_spending)
     total_received = _money(total_received)
 
-    # Reconciliation counts come from persisted results, not from the UI.
-    recon_rows = (
-        db.query(ReconciliationResult.status, func.count(ReconciliationResult.id))
-        .group_by(ReconciliationResult.status)
-        .all()
+    # Reconciliation counts come from the latest persisted run so the dashboard
+    # reflects current reconciliation state rather than accumulating all history.
+    recon_counts: dict[str, int] = {}
+    latest_recon = (
+        db.query(ReconciliationResult.run_id)
+        .order_by(ReconciliationResult.run_id.desc())
+        .first()
     )
-    recon_counts = {str(status or "unknown"): int(count) for status, count in recon_rows}
+    if latest_recon and latest_recon[0] is not None:
+        recon_rows = (
+            db.query(ReconciliationResult.status, func.count(ReconciliationResult.id))
+            .filter(ReconciliationResult.run_id == latest_recon[0])
+            .group_by(ReconciliationResult.status)
+            .all()
+        )
+        recon_counts = {str(status or "unknown"): int(count) for status, count in recon_rows}
     matched_transactions = sum(
         count for status, count in recon_counts.items() if status in {"matched", "reconciled", "exact"}
     )

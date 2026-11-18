@@ -23,7 +23,9 @@ from sklearn.preprocessing import normalize
 DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "rag"
 
 
-def text_hash(text: str) -> str:
+def text_hash(text: str | bytes) -> str:
+    if isinstance(text, bytes):
+        return hashlib.sha256(text).hexdigest()
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
 

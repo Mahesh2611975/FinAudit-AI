@@ -114,6 +114,12 @@ class TransactionRecord(Base):
     duplicate_key = Column(String(512), nullable=True)
     channel = Column(String(60), nullable=True, index=True)
     channel_source = Column(String(24), nullable=True, default="unknown")
+    # Original channel text from the source file, preserved for provenance when
+    # normalisation maps an unfamiliar value to "Unknown".
+    channel_original = Column(String(255), nullable=True)
+    # Optional CSV-supplied risk label. Stored separately from calculated risk
+    # alerts: it is an imported label, never proof of fraud.
+    imported_risk_level = Column(String(20), nullable=True)
     country = Column(String(100), nullable=True, index=True)
     state = Column(String(100), nullable=True, index=True)
     city = Column(String(100), nullable=True, index=True)

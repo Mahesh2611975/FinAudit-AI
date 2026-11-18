@@ -629,7 +629,7 @@ class AssistantGraph:
         prompt, context_text = llm.build_prompt(question, evidence_blob, prompt_contexts)
 
         narrative = "Evidence summary (Ollama unavailable): " + (" ".join(facts[:5]) if facts else "No stored evidence found.")
-        llm_meta: dict[str, Any] = {"backend": "ollama", "fallback": True, "model": llm.MODEL}
+        llm_meta: dict[str, Any] = {"backend": "ollama", "fallback": True, "model": llm.get_model()}
         if llm.is_available():
             answer = llm.generate(
                 prompt,
@@ -638,7 +638,7 @@ class AssistantGraph:
             )
             if answer:
                 narrative = answer
-                llm_meta = {"backend": "ollama", "fallback": False, "model": llm.MODEL}
+                llm_meta = {"backend": "ollama", "fallback": False, "model": llm.get_model()}
 
         citations: list[dict[str, Any]] = []
         for item in sql_evidence[:12]:

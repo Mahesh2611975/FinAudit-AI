@@ -389,6 +389,7 @@ def _geo_kwargs(
     min_amount: float | None = None,
     max_markers: int = 2000,
     geocode: bool = True,
+    risk_source: str | None = None,
 ) -> dict:
     return {
         "start_date": start_date,
@@ -399,14 +400,17 @@ def _geo_kwargs(
         "min_amount": min_amount,
         "max_markers": max(1, min(max_markers, 5000)),
         "allow_geocode": geocode,
+        "risk_source": risk_source,
     }
 
 
 @router.get("/api/risk/geography/options")
 def risk_geography_options(db: Session = Depends(get_db)):
+    options = geography_filter_options(db)
     return {
-        "options": geography_filter_options(db),
-        "risk_levels": ["high", "medium", "low"],
+        "options": options,
+        "risk_levels": options.get("risk_levels", ["low", "medium", "high", "critical"]),
+        "risk_sources": options.get("risk_sources", ["calculated", "imported"]),
         "geocoding": geocoding_status(),
     }
 
@@ -421,6 +425,7 @@ def risk_geography_summary(
     min_amount: float | None = None,
     max_markers: int = 2000,
     geocode: bool = True,
+    risk_source: str | None = None,
     db: Session = Depends(get_db),
 ):
     try:
@@ -435,6 +440,7 @@ def risk_geography_summary(
                 min_amount,
                 max_markers,
                 geocode,
+                risk_source,
             ),
         )
     except ValueError as exc:
@@ -451,6 +457,7 @@ def risk_geography_map(
     min_amount: float | None = None,
     max_markers: int = 2000,
     geocode: bool = True,
+    risk_source: str | None = None,
     db: Session = Depends(get_db),
 ):
     try:
@@ -465,6 +472,7 @@ def risk_geography_map(
                 min_amount,
                 max_markers,
                 geocode,
+                risk_source,
             ),
         )
     except ValueError as exc:
@@ -479,13 +487,20 @@ def risk_geography_countries(
     risk_level: str | None = None,
     channel: str | None = None,
     min_amount: float | None = None,
+    risk_source: str | None = None,
     db: Session = Depends(get_db),
 ):
     try:
         return geography_countries(
             db,
             **_geo_kwargs(
-                start_date, end_date, country, risk_level, channel, min_amount
+                start_date,
+                end_date,
+                country,
+                risk_level,
+                channel,
+                min_amount,
+                risk_source=risk_source,
             ),
         )
     except ValueError as exc:
@@ -500,13 +515,20 @@ def risk_geography_cities(
     risk_level: str | None = None,
     channel: str | None = None,
     min_amount: float | None = None,
+    risk_source: str | None = None,
     db: Session = Depends(get_db),
 ):
     try:
         return geography_cities(
             db,
             **_geo_kwargs(
-                start_date, end_date, country, risk_level, channel, min_amount
+                start_date,
+                end_date,
+                country,
+                risk_level,
+                channel,
+                min_amount,
+                risk_source=risk_source,
             ),
         )
     except ValueError as exc:
@@ -521,13 +543,20 @@ def risk_geography_high_risk_locations(
     risk_level: str | None = None,
     channel: str | None = None,
     min_amount: float | None = None,
+    risk_source: str | None = None,
     db: Session = Depends(get_db),
 ):
     try:
         return geography_high_risk_locations(
             db,
             **_geo_kwargs(
-                start_date, end_date, country, risk_level, channel, min_amount
+                start_date,
+                end_date,
+                country,
+                risk_level,
+                channel,
+                min_amount,
+                risk_source=risk_source,
             ),
         )
     except ValueError as exc:
@@ -542,13 +571,20 @@ def risk_geography_trend(
     risk_level: str | None = None,
     channel: str | None = None,
     min_amount: float | None = None,
+    risk_source: str | None = None,
     db: Session = Depends(get_db),
 ):
     try:
         return geography_trend(
             db,
             **_geo_kwargs(
-                start_date, end_date, country, risk_level, channel, min_amount
+                start_date,
+                end_date,
+                country,
+                risk_level,
+                channel,
+                min_amount,
+                risk_source=risk_source,
             ),
         )
     except ValueError as exc:

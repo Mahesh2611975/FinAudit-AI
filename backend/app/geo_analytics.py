@@ -33,7 +33,13 @@ from .risk_engine import (
 
 SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 HIGH_RISK_LEVELS = {"high", "critical"}
-VALID_RISK_FILTERS = {"low", "medium", "high", "critical"}
+RISK_LEVEL_ORDER = ("low", "medium", "high", "critical")
+VALID_RISK_FILTERS = set(RISK_LEVEL_ORDER)
+# Risk classification is derived from persisted risk-analysis alerts by
+# default. ``imported`` is an explicitly selectable alternative that uses an
+# optional CSV-supplied label; it never changes which rows are flagged.
+VALID_RISK_SOURCES = ("calculated", "imported")
+DEFAULT_RISK_SOURCE = "calculated"
 VALID_LOCATION_STATUSES = {"mapped", "named_only", "invalid_coordinates", "unavailable"}
 LOCATION_UNAVAILABLE = "Location unavailable"
 CHANNEL_ORDER = {channel: index for index, channel in enumerate(SUPPORTED_CHANNELS)}
@@ -47,6 +53,7 @@ class GeoFilterSet:
     risk_levels: frozenset[str] = frozenset()
     channels: tuple[str, ...] = ()
     min_amount: float | None = None
+    risk_source: str = DEFAULT_RISK_SOURCE
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +63,7 @@ class GeoFilterSet:
             "risk_levels": sorted(self.risk_levels),
             "channels": list(self.channels),
             "min_amount": self.min_amount,
+            "risk_source": self.risk_source,
         }
 
 
@@ -88,6 +96,7 @@ def parse_geo_filters(
     risk_level: str | None = None,
     channel: str | None = None,
     min_amount: float | str | None = None,
+    risk_source: str | None = None,
 ) -> GeoFilterSet:
     start = _as_date(start_date)
     if start_date and start is None:
@@ -114,6 +123,10 @@ def parse_geo_filters(
         if not math.isfinite(minimum) or minimum < 0:
             raise ValueError("min_amount must be zero or greater")
 
+    source = str(risk_source or DEFAULT_RISK_SOURCE).lower()
+    if source not in VALID_RISK_SOURCES:
+        raise ValueError("risk_source must be 'calculated' or 'imported'")
+
     return GeoFilterSet(
         start_date=start,
         end_date=end,
@@ -121,6 +134,7 @@ def parse_geo_filters(
         risk_levels=frozenset(levels),
         channels=_split_values(channel),
         min_amount=minimum,
+        risk_source=source,
     )
 
 
@@ -176,6 +190,37 @@ def _risk_from_alerts(alerts: list[RiskAlert]) -> tuple[str, int, bool, str]:
         if len(reasons) >= 3:
             break
     return level, score, True, " · ".join(reasons)[:900]
+
+
+def _imported_level(record: TransactionRecord) -> str | None:
+    """Return a normalised CSV-supplied risk label, never a calculated score."""
+    value = _text(getattr(record, "imported_risk_level", None)).lower()
+    return value if value in VALID_RISK_FILTERS else None
+
+
+def _select_risk_level(
+    calculated: str, imported: str | None, source: str
+) -> tuple[str, bool]:
+    """Pick the classification level for the selected source.
+
+    ``flagged`` is always derived from linked alerts (see ``_risk_from_alerts``)
+    and is never derived from an imported label, so an imported label can never
+    be presented as proof of fraud.
+    """
+    if source == "imported" and imported:
+        return imported, True
+    return calculated, False
+
+
+def _flagged_value(entry: dict[str, Any]) -> float:
+    """Single source of truth for the value of one flagged transaction.
+
+    One entry represents one stored transaction, and ``amount`` is that
+    transaction's own absolute amount. Multiple alerts linked to the same
+    transaction are de-duplicated in ``_related_alerts`` before this value is
+    used, so a transaction is counted at most once in any aggregate.
+    """
+    return entry["amount"] if entry.get("flagged") else 0.0
 
 
 def _currency_for(record: TransactionRecord, alerts: list[RiskAlert]) -> str:
@@ -268,7 +313,11 @@ def _base_entries(
         amount = abs(_amount(record.amount))
         channel, channel_source = infer_channel_details(record)
         related = _related_alerts(record, by_record, by_transaction)
-        risk_level, risk_score, flagged, reason = _risk_from_alerts(related)
+        calculated_level, risk_score, flagged, reason = _risk_from_alerts(related)
+        imported_level = _imported_level(record)
+        risk_level, risk_is_imported = _select_risk_level(
+            calculated_level, imported_level, filters.risk_source
+        )
         country, state, city, coords, location_source = _merge_location(
             record, related
         )
@@ -298,8 +347,12 @@ def _base_entries(
                 "alert_ids": sorted(
                     alert.alert_code for alert in related if alert.alert_code
                 ),
+                "linked_alert_count": len(related),
                 "risk_level": risk_level,
                 "risk_score": risk_score,
+                "calculated_risk_level": calculated_level,
+                "imported_risk_level": imported_level,
+                "risk_is_imported": risk_is_imported,
                 "flagged": flagged,
                 "reason": reason,
                 "country": country or None,
@@ -340,7 +393,8 @@ def _filter_options(records: Iterable[TransactionRecord]) -> dict[str, Any]:
             key=str.lower,
         ),
         "channels": channels,
-        "risk_levels": ["high", "medium", "low"],
+        "risk_levels": list(RISK_LEVEL_ORDER),
+        "risk_sources": list(VALID_RISK_SOURCES),
     }
 
 
@@ -413,6 +467,11 @@ def _marker(entry: dict[str, Any]) -> dict[str, Any]:
         "currency": entry["currency"],
         "risk_score": entry["risk_score"],
         "risk_level": entry["risk_level"],
+        "risk_classification_source": (
+            "imported" if entry.get("risk_is_imported") else "calculated"
+        ),
+        "calculated_risk_level": entry.get("calculated_risk_level"),
+        "imported_risk_level": entry.get("imported_risk_level"),
         "marker_group": (
             "high"
             if entry["risk_level"] in HIGH_RISK_LEVELS
@@ -431,6 +490,8 @@ def _marker(entry: dict[str, Any]) -> dict[str, Any]:
         "source_row": record.source_row,
         "channel": entry["channel"],
         "channel_source": entry["channel_source"],
+        "channel_original": _text(getattr(record, "channel_original", None)) or None,
+        "linked_alert_count": entry.get("linked_alert_count", len(entry["alerts"])),
         "merchant": entry["merchant"],
         "vendor": record.vendor,
         "description": record.description,
@@ -478,7 +539,7 @@ def _country_aggregates(
         )
         if entry["flagged"]:
             bucket["flagged_count"] += 1
-            bucket["flagged_value"] += entry["amount"]
+            bucket["flagged_value"] += _flagged_value(entry)
         if entry.get("city"):
             bucket["_cities"].add(_text(entry["city"]).lower())
         bucket["_latitudes"].append(entry["latitude"])
@@ -566,7 +627,7 @@ def _city_aggregates(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         bucket["max_risk_score"] = max(bucket["max_risk_score"], entry["risk_score"])
         if entry["flagged"]:
             bucket["flagged_count"] += 1
-            bucket["flagged_value"] += entry["amount"]
+            bucket["flagged_value"] += _flagged_value(entry)
 
     result: list[dict[str, Any]] = []
     for bucket in buckets.values():
@@ -657,7 +718,7 @@ def _trend(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         bucket[entry["risk_level"]] += 1
         if entry["flagged"]:
             bucket["flagged"] += 1
-            bucket["flagged_value"] += entry["amount"]
+            bucket["flagged_value"] += _flagged_value(entry)
     series = []
     for day in sorted(buckets):
         item = buckets[day]
@@ -669,6 +730,7 @@ def _summary(
     entries: list[dict[str, Any]],
     geocoding_stats: dict[str, Any],
     total_records: int,
+    risk_source: str = DEFAULT_RISK_SOURCE,
 ) -> dict[str, Any]:
     located = [entry for entry in entries if entry["latitude"] is not None]
     named = [
@@ -690,7 +752,10 @@ def _summary(
     high_risk = [
         entry for entry in located if entry["risk_level"] in HIGH_RISK_LEVELS
     ]
-    distribution = Counter(entry["risk_level"] for entry in located)
+    # Distribution over every matched transaction so the four levels always add
+    # up to ``total_transactions_matched`` for the selected classification source.
+    distribution = Counter(entry["risk_level"] for entry in entries)
+    mapped_distribution = Counter(entry["risk_level"] for entry in located)
     status_counts = Counter(entry.get("location_status", "unavailable") for entry in entries)
     countries = {_text(entry.get("country")).lower() for entry in located if entry.get("country")}
     cities = {
@@ -702,9 +767,20 @@ def _summary(
         for entry in located
         if entry.get("city")
     }
+    linked = [entry for entry in entries if entry.get("linked_alert_count", 0) > 0]
+    imported_labels = [
+        entry for entry in entries if entry.get("imported_risk_level")
+    ]
     return {
+        "total_transactions": len(entries),
         "total_transactions_matched": len(entries),
         "total_transactions_in_snapshot": total_records,
+        "transactions_with_coordinates": len(located),
+        "transactions_without_coordinates": len(entries) - len(located),
+        "transactions_with_linked_alerts": len(linked),
+        "transactions_without_linked_alerts": len(entries) - len(linked),
+        "classification_source": risk_source,
+        "imported_label_transactions": len(imported_labels),
         "transactions_with_location_information": sum(
             1
             for entry in entries
@@ -727,16 +803,16 @@ def _summary(
         "unavailable_location_transactions": status_counts.get("unavailable", 0),
         "total_mapped_value": round(sum(entry["amount"] for entry in located), 2),
         "flagged_transactions": len(flagged),
-        "flagged_value": round(sum(entry["amount"] for entry in flagged), 2),
+        "flagged_value": round(sum(_flagged_value(entry) for entry in flagged), 2),
         "high_risk_transactions": len(high_risk),
         "high_risk_value": round(sum(entry["amount"] for entry in high_risk), 2),
         "countries_count": len(countries),
         "cities_count": len(cities),
         "risk_distribution": {
-            "critical": distribution.get("critical", 0),
-            "high": distribution.get("high", 0),
-            "medium": distribution.get("medium", 0),
-            "low": distribution.get("low", 0),
+            level: distribution.get(level, 0) for level in RISK_LEVEL_ORDER
+        },
+        "mapped_risk_distribution": {
+            level: mapped_distribution.get(level, 0) for level in RISK_LEVEL_ORDER
         },
         "geocoding": geocoding_stats,
     }
@@ -758,6 +834,7 @@ def geography_insights(
     min_amount: float | str | None = None,
     max_markers: int = 2000,
     allow_geocode: bool = True,
+    risk_source: str | None = None,
 ) -> dict[str, Any]:
     filters = parse_geo_filters(
         start_date=start_date,
@@ -766,6 +843,7 @@ def geography_insights(
         risk_level=risk_level,
         channel=channel,
         min_amount=min_amount,
+        risk_source=risk_source,
     )
     entries, options, records = _base_entries(db, filters)
     geocoding_stats = _resolve_missing_coordinates(
@@ -789,7 +867,7 @@ def geography_insights(
     unusual = _unusual_locations(cities)
     trend = _trend(entries)
     channel_analytics = build_channel_analytics(entries)
-    summary = _summary(entries, geocoding_stats, len(records))
+    summary = _summary(entries, geocoding_stats, len(records), filters.risk_source)
     available = bool(located)
 
     if not entries:
@@ -832,8 +910,10 @@ def geography_insights(
         "options": options,
         "geocoding": geocoding_stats,
         "notice": (
-            "Every marker comes from a stored transaction. Alerts are anomaly "
-            "indicators for human review, not fraud convictions."
+            "Every marker comes from a stored transaction. Risk levels follow "
+            f"the '{filters.risk_source}' classification source; imported CSV "
+            "labels are provenance only and are not proof of fraud. Alerts are "
+            "anomaly indicators for human review, not fraud convictions."
         ),
     }
 

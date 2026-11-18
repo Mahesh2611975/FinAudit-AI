@@ -243,7 +243,10 @@ async def preview_transactions(file: UploadFile = File(...), db: Session = Depen
 async def create_audit(
     files: list[UploadFile] | None = File(None),
     file: UploadFile | None = File(None),
-    skip_duplicates: bool = Form(False),
+    # Repeated uploads are skipped by default so re-importing a statement never
+    # creates duplicate transaction rows. Callers may opt out explicitly when a
+    # genuinely fresh copy of the same file must be analysed as a new snapshot.
+    skip_duplicates: bool = Form(True),
     db: Session = Depends(get_db),
 ):
     uploads = []
@@ -332,6 +335,8 @@ async def create_audit(
                 reference=str(row.get("upi_ref") or "") or None,
                 channel=str(row.get("channel") or "") or None,
                 channel_source=str(row.get("channel_source") or "unknown") or "unknown",
+                channel_original=str(row.get("channel_original") or "") or None,
+                imported_risk_level=str(row.get("imported_risk_level") or "") or None,
                 country=str(row.get("country") or "") or None,
                 state=str(row.get("state") or "") or None,
                 city=str(row.get("city") or "") or None,

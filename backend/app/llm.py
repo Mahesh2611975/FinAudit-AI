@@ -194,7 +194,7 @@ Return: (1) explanation, (2) supporting evidence with source IDs,
         )
     return {
         "answer": answer,
-        "model": MODEL,
+        "model": get_model(),
         "retrieved_sources": sources,
         "fallback": False,
     }
