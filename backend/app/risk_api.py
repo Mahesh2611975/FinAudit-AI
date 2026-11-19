@@ -384,6 +384,7 @@ def _geo_kwargs(
     start_date: str | None = None,
     end_date: str | None = None,
     country: str | None = None,
+    city: str | None = None,
     risk_level: str | None = None,
     channel: str | None = None,
     min_amount: float | None = None,
@@ -391,7 +392,7 @@ def _geo_kwargs(
     geocode: bool = True,
     risk_source: str | None = None,
 ) -> dict:
-    return {
+    kwargs = {
         "start_date": start_date,
         "end_date": end_date,
         "country": country,
@@ -402,6 +403,9 @@ def _geo_kwargs(
         "allow_geocode": geocode,
         "risk_source": risk_source,
     }
+    if city is not None:
+        kwargs["city"] = city
+    return kwargs
 
 
 @router.get("/api/risk/geography/options")
@@ -420,6 +424,7 @@ def risk_geography_summary(
     start_date: str | None = None,
     end_date: str | None = None,
     country: str | None = None,
+    city: str | None = None,
     risk_level: str | None = None,
     channel: str | None = None,
     min_amount: float | None = None,
@@ -435,6 +440,7 @@ def risk_geography_summary(
                 start_date,
                 end_date,
                 country,
+                city,
                 risk_level,
                 channel,
                 min_amount,
@@ -452,6 +458,7 @@ def risk_geography_map(
     start_date: str | None = None,
     end_date: str | None = None,
     country: str | None = None,
+    city: str | None = None,
     risk_level: str | None = None,
     channel: str | None = None,
     min_amount: float | None = None,
@@ -467,6 +474,7 @@ def risk_geography_map(
                 start_date,
                 end_date,
                 country,
+                city,
                 risk_level,
                 channel,
                 min_amount,
@@ -484,6 +492,7 @@ def risk_geography_countries(
     start_date: str | None = None,
     end_date: str | None = None,
     country: str | None = None,
+    city: str | None = None,
     risk_level: str | None = None,
     channel: str | None = None,
     min_amount: float | None = None,
@@ -497,6 +506,7 @@ def risk_geography_countries(
                 start_date,
                 end_date,
                 country,
+                city,
                 risk_level,
                 channel,
                 min_amount,
@@ -512,6 +522,7 @@ def risk_geography_cities(
     start_date: str | None = None,
     end_date: str | None = None,
     country: str | None = None,
+    city: str | None = None,
     risk_level: str | None = None,
     channel: str | None = None,
     min_amount: float | None = None,
@@ -525,6 +536,7 @@ def risk_geography_cities(
                 start_date,
                 end_date,
                 country,
+                city,
                 risk_level,
                 channel,
                 min_amount,
@@ -540,6 +552,7 @@ def risk_geography_high_risk_locations(
     start_date: str | None = None,
     end_date: str | None = None,
     country: str | None = None,
+    city: str | None = None,
     risk_level: str | None = None,
     channel: str | None = None,
     min_amount: float | None = None,
@@ -553,6 +566,7 @@ def risk_geography_high_risk_locations(
                 start_date,
                 end_date,
                 country,
+                city,
                 risk_level,
                 channel,
                 min_amount,
@@ -568,6 +582,7 @@ def risk_geography_trend(
     start_date: str | None = None,
     end_date: str | None = None,
     country: str | None = None,
+    city: str | None = None,
     risk_level: str | None = None,
     channel: str | None = None,
     min_amount: float | None = None,
@@ -581,6 +596,7 @@ def risk_geography_trend(
                 start_date,
                 end_date,
                 country,
+                city,
                 risk_level,
                 channel,
                 min_amount,

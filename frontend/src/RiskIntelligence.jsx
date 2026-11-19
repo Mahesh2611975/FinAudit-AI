@@ -33,7 +33,7 @@ import {
   XAxis,
   YAxis
 } from 'recharts';
-import GeographicRiskIntelligence from './GeographicRiskIntelligence';
+
 import './risk.css';
 
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'];
@@ -507,14 +507,12 @@ export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000' }) 
 
       <div className="risk-kpi-grid">
         <Kpi label="Total alerts" value={overview ? fmtNumber(overview.total_alerts) : '—'} hint={`${fmtNumber(overview?.unresolved_alerts)} unresolved`} icon={Siren} tone="purple" />
-        <Kpi label="Critical" value={overview ? fmtNumber(overview.critical_alerts) : '—'} hint={`${fmtNumber(overview?.high_alerts)} high severity`} icon={AlertOctagon} tone="red" />
+        <Kpi label="Critical / High" value={overview ? `${fmtNumber(overview.critical_alerts)} / ${fmtNumber(overview.high_alerts)}` : '—'} hint={`${fmtNumber(overview?.medium_alerts)} medium · ${fmtNumber(overview?.low_alerts)} low`} icon={AlertOctagon} tone="red" />
         <Kpi label="Flagged value" value={overview ? fmtCurrency(overview.total_flagged_value) : '—'} hint="Sum of stored alert amounts" icon={CircleDollarSign} tone="amber" />
         <Kpi label="Transactions analyzed" value={overview ? fmtNumber(overview.transactions_analyzed) : '—'} hint="Latest snapshot per source file" icon={FileSearch} tone="blue" />
         <Kpi label="Suspicious vendor patterns" value={overview ? fmtNumber(overview.suspicious_vendors) : '—'} hint="Derived from stored alerts" icon={UserCheck} tone="cyan" />
         <Kpi label="Average risk score" value={overview ? `${overview.average_risk_score} / 100` : '—'} hint="Deterministic score across alerts" icon={TrendingUp} tone="green" />
       </div>
-
-      <GeographicRiskIntelligence apiBase={apiBase} refreshSignal={refreshSignal} />
 
       <div className="risk-grid-2">
         <section className="risk-card">

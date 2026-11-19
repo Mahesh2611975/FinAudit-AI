@@ -103,31 +103,46 @@ def dashboard_overview(db: Session, *, activity_months: int = 6, recent_limit: i
     total_spending = _money(total_spending)
     total_received = _money(total_received)
 
-    # Reconciliation counts come from the latest persisted run so the dashboard
+    # Reconciliation metrics come from the latest persisted run so the dashboard
     # reflects current reconciliation state rather than accumulating all history.
     recon_counts: dict[str, int] = {}
+    latest_recon_run_id = None
+    latest_recon_run = None
     latest_recon = (
         db.query(ReconciliationResult.run_id)
         .order_by(ReconciliationResult.run_id.desc())
         .first()
     )
     if latest_recon and latest_recon[0] is not None:
+        latest_recon_run_id = int(latest_recon[0])
         recon_rows = (
             db.query(ReconciliationResult.status, func.count(ReconciliationResult.id))
-            .filter(ReconciliationResult.run_id == latest_recon[0])
+            .filter(ReconciliationResult.run_id == latest_recon_run_id)
             .group_by(ReconciliationResult.status)
             .all()
         )
         recon_counts = {str(status or "unknown"): int(count) for status, count in recon_rows}
-    matched_transactions = sum(
-        count for status, count in recon_counts.items() if status in {"matched", "reconciled", "exact"}
-    )
-    unmatched_transactions = sum(
-        count for status, count in recon_counts.items() if status in {"bank_only", "ledger_only", "unmatched"}
-    )
-    possible_matches = sum(
-        count for status, count in recon_counts.items() if status in {"ambiguous", "possible", "suggested"}
-    )
+        try:
+            from .models import ReconciliationRun
+            latest_recon_run = db.query(ReconciliationRun).filter(ReconciliationRun.id == latest_recon_run_id).first()
+        except Exception:
+            latest_recon_run = None
+
+    # Confirmed matches only. Possible/suggested matches remain pending review.
+    matched_transactions = recon_counts.get("matched", 0) + recon_counts.get("reconciled", 0) + recon_counts.get("exact", 0)
+    unmatched_transactions = recon_counts.get("bank_only", 0) + recon_counts.get("ledger_only", 0) + recon_counts.get("unmatched", 0)
+    possible_matches = recon_counts.get("ambiguous", 0) + recon_counts.get("possible", 0) + recon_counts.get("suggested", 0)
+    amount_mismatch_count = recon_counts.get("amount_mismatch", 0)
+    date_mismatch_count = recon_counts.get("date_mismatch", 0)
+    invalid_record_count = recon_counts.get("invalid_records", 0)
+    duplicate_candidate_count = recon_counts.get("duplicate_candidate", 0)
+    ambiguous_count = recon_counts.get("ambiguous", 0)
+    bank_record_count = int(getattr(latest_recon_run, "bank_record_count", 0) or 0) if latest_recon_run else 0
+    ledger_record_count = int(getattr(latest_recon_run, "ledger_record_count", 0) or 0) if latest_recon_run else 0
+    denom = max(1.0, (bank_record_count + ledger_record_count) / 2.0) if (bank_record_count or ledger_record_count) else 0.0
+    match_rate = round((matched_transactions / denom) * 100, 2) if denom > 0 else None
+    unreconciled_value = getattr(latest_recon_run, "unreconciled_value", None) if latest_recon_run else None
+    total_difference = getattr(latest_recon_run, "difference", None) if latest_recon_run else None
 
     alert_rows = (
         db.query(RiskAlert.severity, func.count(RiskAlert.id))
@@ -156,6 +171,17 @@ def dashboard_overview(db: Session, *, activity_months: int = 6, recent_limit: i
         "matched_transactions": matched_transactions,
         "unmatched_transactions": unmatched_transactions,
         "possible_matches": possible_matches,
+        "reconciliation_match_rate": match_rate,
+        "bank_only_count": recon_counts.get("bank_only", 0),
+        "ledger_only_count": recon_counts.get("ledger_only", 0),
+        "amount_mismatch_count": amount_mismatch_count,
+        "date_mismatch_count": date_mismatch_count,
+        "ambiguous_count": ambiguous_count,
+        "invalid_record_count": invalid_record_count,
+        "duplicate_candidate_count": duplicate_candidate_count,
+        "unreconciled_value": unreconciled_value,
+        "reconciliation_total_difference": total_difference,
+        "latest_reconciliation_run_id": latest_recon_run_id,
         "total_risk_alerts": int(sum(alert_counts.values())),
         "high_risk_alerts": alert_counts.get("high", 0),
         "critical_alerts": alert_counts.get("critical", 0),
@@ -182,6 +208,8 @@ def dashboard_overview(db: Session, *, activity_months: int = 6, recent_limit: i
                     "amount_mismatch",
                     "date_mismatch",
                     "ambiguous",
+                    "duplicate_candidate",
+                    "invalid_records",
                 )
             ],
             "category_distribution": [
@@ -230,9 +258,11 @@ def dashboard_overview(db: Session, *, activity_months: int = 6, recent_limit: i
             "spending": "Sum of absolute amounts for debit-like transactions across all stored imports.",
             "received": "Sum of absolute amounts for credit-like transactions across all stored imports.",
             "net_cash_flow": "total_received - total_spending.",
-            "matched_transactions": "reconciliation_results rows with status matched/reconciled/exact.",
-            "unmatched_transactions": "reconciliation_results rows with status bank_only/ledger_only/unmatched.",
-            "possible_matches": "reconciliation_results rows with status ambiguous/possible/suggested (require human confirmation).",
+            "reconciliation_scope": f"Latest reconciliation run only (run_id={latest_recon_run_id}) when available; no history is accumulated.",
+            "matched_transactions": "Confirmed matched reconciliation results in the latest run. Possible/suggested matches are not counted as confirmed.",
+            "unmatched_transactions": "reconciliation_results rows with status bank_only/ledger_only/unmatched in the latest run.",
+            "possible_matches": "reconciliation_results rows with status ambiguous/possible/suggested in the latest run (require human confirmation).",
+            "reconciliation_metrics": "Match rate, counts, unreconciled value and total difference are derived from the latest persisted reconciliation run/results.",
             "risk_alerts": "All persisted deterministic alerts; severity counted from stored risk_engine output.",
             "activity_charts": f"Grouped by transaction date (YYYY-MM), last {activity_months} populated months.",
             "category_distribution": "Count of persisted transaction rows by stored category, top 10 categories.",

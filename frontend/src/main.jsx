@@ -61,6 +61,7 @@ import {
 import './style.css';
 import './workspace.css';
 import RiskIntelligence from './RiskIntelligence';
+import GeographicRiskIntelligence from './GeographicRiskIntelligence';
 import Dashboard from './Dashboard';
 import Transactions from './Transactions';
 import Assistant from './Assistant';
@@ -97,7 +98,7 @@ const SIDEBAR_GROUPS = [
     label: 'Risk & Intelligence',
     items: [
       { navId: 'risk-intelligence', view: 'risk-intelligence', label: 'Risk Intelligence', icon: ShieldAlert },
-      { navId: 'geographic-intelligence', view: 'risk-intelligence', label: 'Geographic Intelligence', icon: Globe2 },
+      { navId: 'geographic-intelligence', view: 'geographic-intelligence', label: 'Geographic Intelligence', icon: Globe2 },
       { navId: 'vendor-intelligence', view: 'vendor-intelligence', label: 'Vendor Intelligence', icon: Store }
     ]
   },
@@ -154,6 +155,23 @@ const SECONDARY_VIEWS = new Set([
   'compliance',
   ...INVOICE_NAV_ITEMS.filter((item) => !PRIMARY_SIDEBAR_VIEWS.has(item.id)).map((item) => item.id)
 ]);
+
+const VIEW_ROUTE_ALIASES = {
+  dashboard: 'overview',
+  overview: 'overview'
+};
+
+const viewToHash = (viewId) => `#/${viewId || 'overview'}`;
+
+const viewFromHash = () => {
+  if (typeof window === 'undefined') return 'overview';
+  const raw = window.location.hash || '';
+  const cleaned = raw.replace(/^#\/?/, '').split('?')[0].split('/')[0].trim();
+  if (!cleaned) return 'overview';
+  const resolved = VIEW_ROUTE_ALIASES[cleaned] || cleaned;
+  return ROUTABLE_VIEW_IDS.has(resolved) ? resolved : 'overview';
+};
+
 
 const RECON_STEPS = [
   'Select Files',
@@ -828,17 +846,29 @@ function ReconciliationPage({
 }) {
   const [bankFile, setBankFile] = useState(null);
   const [ledgerFile, setLedgerFile] = useState(null);
-  const [tolerance, setTolerance] = useState(3);
+  const [dateTolerance, setDateTolerance] = useState(3);
+  const [amountTolerance, setAmountTolerance] = useState('0.005');
   const [loading, setLoading] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [actionLoadingId, setActionLoadingId] = useState(null);
   const [error, setError] = useState('');
   const [warnings, setWarnings] = useState([]);
+  const [preview, setPreview] = useState(null);
   const [filter, setFilter] = useState('all');
+  const [search, setSearch] = useState('');
   const [showMapping, setShowMapping] = useState(false);
+  const [reviewer, setReviewer] = useState('reviewer');
+  const [activeStep, setActiveStep] = useState(0);
+  const [selectedRunId, setSelectedRunId] = useState(null);
+  const [historyLoadingId, setHistoryLoadingId] = useState(null);
+  const [manualBankId, setManualBankId] = useState('');
+  const [manualLedgerId, setManualLedgerId] = useState('');
+  const [manualNote, setManualNote] = useState('');
+
   const MAPPING_FIELDS = ['date', 'amount', 'debit', 'credit', 'reference', 'description'];
   const emptyMapping = () => MAPPING_FIELDS.reduce((acc, key) => ({ ...acc, [key]: '' }), {});
   const [bankMapping, setBankMapping] = useState(emptyMapping());
   const [ledgerMapping, setLedgerMapping] = useState(emptyMapping());
-  const [reviewer, setReviewer] = useState('reviewer');
 
   const mappingJson = (mapping) => {
     const cleaned = Object.fromEntries(
@@ -849,112 +879,251 @@ function ReconciliationPage({
 
   const results = reconciliation?.results || [];
   const summary = reconciliation?.summary || {};
-  const step = reconciliation ? 3 : bankFile && ledgerFile ? 1 : 0;
+  const reviewActions = reconciliation?.review_actions || [];
+  const runId = reconciliation?.reconciliation_id || reconciliation?.run_id || reconciliation?.id || null;
 
-  const filtered = useMemo(() => {
-    if (filter === 'all') return results;
-    if (filter === 'unmatched') {
-      return results.filter((item) =>
-        ['bank_only', 'ledger_only'].includes(item.status)
-      );
+  useEffect(() => {
+    if (reconciliation) {
+      setSelectedRunId(runId);
+      setWarnings(Array.isArray(reconciliation.warnings) ? reconciliation.warnings : []);
+      if (activeStep < 2) setActiveStep(2);
     }
-    return results.filter((item) => item.status === filter);
-  }, [results, filter]);
+  }, [reconciliation, runId]);
+
+  const stepIndex = reconciliation
+    ? Math.max(activeStep, 2)
+    : preview
+    ? 1
+    : bankFile && ledgerFile
+    ? 1
+    : 0;
+
+  const buildFormData = () => {
+    const formData = new FormData();
+    formData.append('bank_file', bankFile);
+    formData.append('ledger_file', ledgerFile);
+    formData.append('date_tolerance_days', String(dateTolerance));
+    formData.append('amount_tolerance', String(amountTolerance || '0'));
+    const bankMappingJson = mappingJson(bankMapping);
+    const ledgerMappingJson = mappingJson(ledgerMapping);
+    if (bankMappingJson) formData.append('bank_mapping', bankMappingJson);
+    if (ledgerMappingJson) formData.append('ledger_mapping', ledgerMappingJson);
+    return formData;
+  };
+
+  const validateFiles = () => {
+    if (!bankFile || !ledgerFile) {
+      setError('Select both a bank statement CSV and an accounting ledger CSV.');
+      return false;
+    }
+    if (!String(bankFile.name || '').toLowerCase().endsWith('.csv') || !String(ledgerFile.name || '').toLowerCase().endsWith('.csv')) {
+      setError('Both bank and ledger uploads must be .csv files.');
+      return false;
+    }
+    if (Number(dateTolerance) < 0) {
+      setError('Date tolerance must be a non-negative whole number.');
+      return false;
+    }
+    if (Number(amountTolerance) < 0 || Number.isNaN(Number(amountTolerance))) {
+      setError('Amount tolerance must be a non-negative number.');
+      return false;
+    }
+    return true;
+  };
 
   const chooseFile = (side, event) => {
     const selected = event.target.files?.[0] || null;
     if (selected && !selected.name.toLowerCase().endsWith('.csv')) {
-      setError(
-        `${side === 'bank' ? 'Bank statement' : 'Accounting ledger'} must be a .csv file.`
-      );
+      setError(`${side === 'bank' ? 'Bank statement' : 'Accounting ledger'} must be a .csv file.`);
       return;
     }
     setError('');
-    if (side === 'bank') {
-      setBankFile(selected);
-    } else {
-      setLedgerFile(selected);
+    setPreview(null);
+    setReconciliation?.(null);
+    setActiveStep(0);
+    if (side === 'bank') setBankFile(selected);
+    else setLedgerFile(selected);
+  };
+
+  const runPreview = async () => {
+    if (!validateFiles()) return;
+    setPreviewLoading(true);
+    setError('');
+    setWarnings([]);
+    try {
+      const response = await fetch(`${API}/api/reconciliations/preview`, {
+        method: 'POST',
+        body: buildFormData(),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        const detail = Array.isArray(data.detail) ? data.detail.join(' ') : data.detail;
+        throw new Error(detail || 'Preview failed.');
+      }
+      setPreview(data);
+      setWarnings(Array.isArray(data.warnings) ? data.warnings : []);
+      setActiveStep(1);
+    } catch (err) {
+      setError(err.message || 'Could not preview reconciliation.');
+    } finally {
+      setPreviewLoading(false);
     }
   };
 
   const runReconciliation = async () => {
-    if (!bankFile || !ledgerFile) {
-      setError('Select both a bank statement CSV and an accounting ledger CSV.');
-      return;
-    }
-
+    if (!validateFiles()) return;
     setLoading(true);
     setError('');
     setWarnings([]);
-    setReconciliation(null);
-    setFilter('all');
-
+    setPreview(null);
     try {
-      const formData = new FormData();
-      formData.append('bank_file', bankFile);
-      formData.append('ledger_file', ledgerFile);
-      formData.append('date_tolerance_days', String(tolerance));
-      const bankMappingJson = mappingJson(bankMapping);
-      const ledgerMappingJson = mappingJson(ledgerMapping);
-      if (bankMappingJson) formData.append('bank_mapping', bankMappingJson);
-      if (ledgerMappingJson) formData.append('ledger_mapping', ledgerMappingJson);
-
       const response = await fetch(`${API}/api/reconciliations`, {
         method: 'POST',
-        body: formData
+        body: buildFormData(),
       });
       const data = await response.json();
-
       if (!response.ok) {
-        const detail = Array.isArray(data.detail)
-          ? data.detail.join(' ')
-          : data.detail;
+        const detail = Array.isArray(data.detail) ? data.detail.join(' ') : data.detail;
         throw new Error(detail || 'Reconciliation failed.');
       }
-
       setReconciliation(data);
+      setSelectedRunId(data.reconciliation_id || data.run_id || data.id);
       setWarnings(Array.isArray(data.warnings) ? data.warnings : []);
+      setActiveStep(2);
       await loadHistory?.();
     } catch (err) {
-      setError(err.message || 'Could not connect to the backend.');
+      setError(err.message || 'Could not create reconciliation run.');
     } finally {
       setLoading(false);
     }
   };
 
-  const confirmResult = async (resultId, decision) => {
-    if (!reviewer.trim()) {
-      setError('Enter a reviewer name before recording a review decision.');
-      return;
-    }
+  const loadRun = async (id) => {
+    if (!id) return;
+    setHistoryLoadingId(id);
     setError('');
     try {
-      const response = await fetch(
-        `${API}/api/reconciliations/results/${resultId}/confirm`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ decision, reviewer: reviewer.trim() }),
-        }
-      );
+      const response = await fetch(`${API}/api/reconciliations/${id}`);
       const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.detail || 'Could not record review decision.');
-      }
-      // Refresh the run so the recorded review is visible without a re-upload.
-      const refreshed = await fetch(
-        `${API}/api/reconciliations/${reconciliation.reconciliation_id}`
-      );
-      if (refreshed.ok) setReconciliation(await refreshed.json());
-      await loadHistory?.();
+      if (!response.ok) throw new Error(data.detail || 'Could not load reconciliation run.');
+      setReconciliation(data);
+      setSelectedRunId(id);
+      setPreview(null);
+      setActiveStep(2);
     } catch (err) {
-      setError(err.message || 'Could not record review decision.');
+      setError(err.message || 'Could not load reconciliation run.');
+    } finally {
+      setHistoryLoadingId(null);
     }
   };
 
-  const exportHref = reconciliation
-    ? `${API}/api/reconciliations/${reconciliation.reconciliation_id}/export.csv`
-    : null;
+  const refreshCurrentRun = async () => {
+    if (!runId) return;
+    await loadRun(runId);
+    await loadHistory?.();
+  };
+
+  const doReviewAction = async (resultId, action, extra = {}) => {
+    if (!reviewer.trim()) {
+      setError('Enter a reviewer name before recording a review action.');
+      return;
+    }
+    setActionLoadingId(resultId || 'manual');
+    setError('');
+    try {
+      const response = await fetch(`${API}/api/reconciliations/results/${resultId}/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, reviewer: reviewer.trim(), ...extra }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Could not record review action.');
+      await refreshCurrentRun();
+    } catch (err) {
+      setError(err.message || 'Could not record review action.');
+    } finally {
+      setActionLoadingId(null);
+    }
+  };
+
+  const doManualLink = async () => {
+    if (!runId) return;
+    if (!reviewer.trim()) {
+      setError('Enter a reviewer name before manually linking records.');
+      return;
+    }
+    if (!manualBankId || !manualLedgerId) {
+      setError('Select both a bank record and a ledger record to link manually.');
+      return;
+    }
+    setActionLoadingId('manual');
+    setError('');
+    try {
+      const response = await fetch(`${API}/api/reconciliations/${runId}/manual-link`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          reviewer: reviewer.trim(),
+          bank_result_id: Number(manualBankId),
+          ledger_result_id: Number(manualLedgerId),
+          note: manualNote || undefined,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Could not manually link records.');
+      setManualBankId('');
+      setManualLedgerId('');
+      setManualNote('');
+      await refreshCurrentRun();
+    } catch (err) {
+      setError(err.message || 'Could not manually link records.');
+    } finally {
+      setActionLoadingId(null);
+    }
+  };
+
+  const statusLabel = (status) => String(status || '').replaceAll('_', ' ');
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return results.filter((item) => {
+      const status = item.status || '';
+      const reviewStatus = item.review_status || '';
+      let statusMatch = true;
+      if (filter === 'all') statusMatch = true;
+      else if (filter === 'unmatched') statusMatch = ['bank_only', 'ledger_only'].includes(status);
+      else if (filter === 'exceptions') statusMatch = ['amount_mismatch', 'date_mismatch', 'ambiguous', 'duplicate_candidate', 'invalid_records'].includes(status);
+      else if (filter === 'pending_review') statusMatch = ['amount_mismatch', 'date_mismatch', 'ambiguous'].includes(status) && !['confirmed', 'rejected', 'explained', 'linked'].includes(reviewStatus);
+      else if (filter === 'confirmed') statusMatch = reviewStatus === 'confirmed' || item.is_confirmed_match;
+      else statusMatch = status === filter;
+
+      if (!statusMatch) return false;
+      if (!q) return true;
+      const hay = [
+        item.bank_date, item.ledger_date, item.bank_description, item.ledger_description,
+        item.bank_reference, item.ledger_reference, item.bank_source_file, item.ledger_source_file,
+        item.status, item.review_status, item.match_method, item.explanation, item.note,
+        item.bank_amount, item.ledger_amount, item.amount_difference, item.date_difference_days,
+      ].map((v) => String(v ?? '').toLowerCase()).join(' ');
+      return hay.includes(q);
+    });
+  }, [results, filter, search]);
+
+  const exportHref = runId ? `${API}/api/reconciliations/${runId}/export.csv` : null;
+
+  const bankLinkCandidates = results.filter((item) => item.bank_source_file && !item.ledger_source_file && !item.is_confirmed_match && !['linked', 'confirmed', 'explained'].includes(item.review_status) && ['bank_only', 'ambiguous', 'amount_mismatch', 'date_mismatch'].includes(item.status));
+  const ledgerLinkCandidates = results.filter((item) => item.ledger_source_file && !item.bank_source_file && !item.is_confirmed_match && !['linked', 'confirmed', 'explained'].includes(item.review_status) && ['ledger_only', 'ambiguous', 'amount_mismatch', 'date_mismatch'].includes(item.status));
+
+  const summaryCards = [
+    { label: 'Match rate', value: summary.match_rate == null ? '—' : `${summary.match_rate}%`, hint: 'Confirmed matched records', tone: 'matched' },
+    { label: 'Bank-only', value: fmtNumber(summary.bank_only_count || 0), hint: 'No ledger match', tone: 'unmatched' },
+    { label: 'Ledger-only', value: fmtNumber(summary.ledger_only_count || 0), hint: 'No bank match', tone: 'unmatched' },
+    { label: 'Amount mismatch', value: fmtNumber(summary.amount_mismatch_count || 0), hint: 'Review required', tone: 'suggested' },
+    { label: 'Date mismatch', value: fmtNumber(summary.date_mismatch_count || 0), hint: 'Review required', tone: 'suggested' },
+    { label: 'Ambiguous', value: fmtNumber(summary.ambiguous_count || 0), hint: 'Human review only', tone: 'suggested' },
+    { label: 'Unreconciled value', value: fmtCurrency(summary.unreconciled_value ?? summary.unmatched_total ?? 0), hint: 'Not reconciled', tone: 'unmatched' },
+    { label: 'Total difference', value: fmtCurrency(summary.total_difference ?? summary.difference ?? 0), hint: 'Bank − ledger', tone: 'reconciled' },
+  ];
 
   return (
     <>
@@ -967,31 +1136,18 @@ function ReconciliationPage({
       <header className="page-header">
         <div>
           <h1>Bank Statement Reconciliation</h1>
-          <p>
-            Match transactions between your bank statement and accounting ledger.
-            Reference matches are preferred; ambiguous or uncertain matches are
-            surfaced for review.
-          </p>
+          <p>Import bank and ledger CSVs independently, preview validation and proposed matching, review exceptions, and persist run history with audit actions.</p>
         </div>
-        {exportHref && (
-          <a className="secondary-btn" href={exportHref}>
-            <Download size={16} />
-            Export CSV
-          </a>
-        )}
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          {runId && <button className="secondary-btn" type="button" onClick={refreshCurrentRun}><RefreshCw size={16} /> Refresh run</button>}
+          {exportHref && <a className="secondary-btn" href={exportHref}><Download size={16} /> Export CSV</a>}
+        </div>
       </header>
 
       <div className="stepper">
         {RECON_STEPS.map((label, index) => (
-          <div
-            key={label}
-            className={`step-item ${index === step ? 'active' : ''} ${
-              index < step ? 'completed' : ''
-            }`}
-          >
-            <div className="step-circle">
-              {index < step ? <CheckCircle2 size={16} /> : index + 1}
-            </div>
+          <div key={label} className={`step-item ${index === stepIndex ? 'active' : ''} ${index < stepIndex ? 'completed' : ''}`}>
+            <div className="step-circle">{index < stepIndex ? <CheckCircle2 size={16} /> : index + 1}</div>
             <span>{label}</span>
           </div>
         ))}
@@ -999,64 +1155,31 @@ function ReconciliationPage({
 
       <div className="rec-grid">
         <section className="panel upload-card">
-          <div className="section-header">
-            <div>
-              <h2>Bank Statement</h2>
-              <p>Upload the CSV extract from your bank</p>
-            </div>
-          </div>
+          <div className="section-header"><div><h2>1. Select Files — Bank Statement</h2><p>Independent bank CSV upload and column mapping</p></div></div>
           <label className="dropzone-light">
-            <input
-              type="file"
-              accept=".csv,text/csv"
-              onChange={(event) => chooseFile('bank', event)}
-            />
-            <div className="dropzone-icon">
-              <Upload size={22} />
-            </div>
+            <input type="file" accept=".csv,text/csv" onChange={(event) => chooseFile('bank', event)} />
+            <div className="dropzone-icon"><Upload size={22} /></div>
             <strong>{bankFile ? bankFile.name : 'Drop or browse bank CSV'}</strong>
-            <span className="kpi-subtle">
-              Accepts date, amount, debit, credit, reference, narration
-            </span>
+            <span className="kpi-subtle">Supports date/amount/debit/credit/reference/description columns</span>
           </label>
         </section>
 
         <section className="panel upload-card">
-          <div className="section-header">
-            <div>
-              <h2>Accounting Ledger</h2>
-              <p>Upload the CSV extract from your ledger</p>
-            </div>
-          </div>
+          <div className="section-header"><div><h2>1. Select Files — Accounting Ledger</h2><p>Independent ledger CSV upload and column mapping</p></div></div>
           <label className="dropzone-light">
-            <input
-              type="file"
-              accept=".csv,text/csv"
-              onChange={(event) => chooseFile('ledger', event)}
-            />
-            <div className="dropzone-icon">
-              <FileText size={22} />
-            </div>
+            <input type="file" accept=".csv,text/csv" onChange={(event) => chooseFile('ledger', event)} />
+            <div className="dropzone-icon"><FileText size={22} /></div>
             <strong>{ledgerFile ? ledgerFile.name : 'Drop or browse ledger CSV'}</strong>
-            <span className="kpi-subtle">
-              Column mapping is applied independently per file
-            </span>
+            <span className="kpi-subtle">Original source file and row are preserved in results</span>
           </label>
         </section>
       </div>
 
       <section className="panel" style={{ padding: '16px 26px', marginBottom: 22 }}>
-        <button
-          className="text-btn"
-          type="button"
-          onClick={() => setShowMapping((value) => !value)}
-        >
+        <button className="text-btn" type="button" onClick={() => setShowMapping((value) => !value)}>
           {showMapping ? 'Hide' : 'Show'} independent column mapping (optional)
         </button>
-        <p className="kpi-subtle">
-          Map non-standard column names on each file separately. Leave blank to
-          auto-detect common names (date, amount/debit/credit, reference, description).
-        </p>
+        <p className="kpi-subtle">Map columns separately for bank and ledger files. Leave blank to auto-detect common names.</p>
         {showMapping && (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(280px,1fr))', gap: 18, marginTop: 12 }}>
             {[
@@ -1082,255 +1205,189 @@ function ReconciliationPage({
             ))}
           </div>
         )}
-        {reconciliation && (reconciliation.bank_mapping || reconciliation.ledger_mapping) && (
-          <p className="kpi-subtle" style={{ marginTop: 10 }}>
-            Applied mapping — bank: {JSON.stringify(reconciliation.bank_mapping || {})} ·
-            ledger: {JSON.stringify(reconciliation.ledger_mapping || {})}
-          </p>
-        )}
       </section>
 
       <section className="panel" style={{ padding: '18px 26px', marginBottom: 22 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, color: 'var(--rec-text-secondary)' }}>
               Date tolerance
-              <input
-                type="number"
-                min="0"
-                max="365"
-                value={tolerance}
-                onChange={(event) => setTolerance(event.target.value)}
-                style={{
-                  width: 90,
-                  padding: '8px 10px',
-                  borderRadius: 8,
-                  border: '1px solid var(--rec-border-strong)',
-                  background: 'var(--rec-surface)'
-                }}
-              />
-              days
+              <input type="number" min="0" max="365" value={dateTolerance} onChange={(event) => setDateTolerance(event.target.value)} style={{ width: 90, padding: '8px 10px', borderRadius: 8, border: '1px solid var(--rec-border-strong)', background: 'var(--rec-surface)' }} /> days
             </label>
-            <span className="kpi-subtle">Used only when no safe reference match exists</span>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, color: 'var(--rec-text-secondary)' }}>
+              Amount tolerance
+              <input type="number" min="0" step="0.001" value={amountTolerance} onChange={(event) => setAmountTolerance(event.target.value)} style={{ width: 110, padding: '8px 10px', borderRadius: 8, border: '1px solid var(--rec-border-strong)', background: 'var(--rec-surface)' }} />
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, color: 'var(--rec-text-secondary)' }}>
+              Reviewer
+              <input value={reviewer} onChange={(event) => setReviewer(event.target.value)} placeholder="Reviewer name" style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid var(--rec-border-strong)', background: 'var(--rec-surface)' }} />
+            </label>
           </div>
-          <button
-            className="primary-btn"
-            type="button"
-            onClick={runReconciliation}
-            disabled={!bankFile || !ledgerFile || loading}
-          >
-            {loading ? (
-              <>
-                <RefreshCw size={16} className="spin" />
-                Matching transactions...
-              </>
-            ) : (
-              <>
-                <ArrowLeftRight size={16} />
-                Review & Match
-              </>
-            )}
-          </button>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <button className="secondary-btn" type="button" onClick={runPreview} disabled={!bankFile || !ledgerFile || previewLoading || loading}>
+              {previewLoading ? <><RefreshCw size={16} className="spin" /> Previewing...</> : <><Search size={16} /> 2. Preview & Validate</>}
+            </button>
+            <button className="primary-btn" type="button" onClick={runReconciliation} disabled={!bankFile || !ledgerFile || loading || previewLoading}>
+              {loading ? <><RefreshCw size={16} className="spin" /> Running reconciliation...</> : <><ArrowLeftRight size={16} /> 4. Reconcile</>}
+            </button>
+          </div>
         </div>
+        <p className="kpi-subtle" style={{ marginTop: 10 }}>Preview validates mappings, normalization, missing values, duplicates and proposed matches before persisting a reconciliation run.</p>
         {error && <div className="error-box">{error}</div>}
         {warnings.length > 0 && <div className="warning-box">{warnings.join(' ')}</div>}
       </section>
 
+      {preview && (
+        <section className="panel table-card-light" style={{ marginBottom: 22 }}>
+          <div className="table-header">
+            <div>
+              <h2>2. Review & Match (Preview)</h2>
+              <p>Validation and proposed matching before persistence. Invalid rows are preserved and never silently discarded.</p>
+            </div>
+          </div>
+          <div className="summary-grid" style={{ marginBottom: 12 }}>
+            <article className="panel summary-card"><div className="summary-card-header"><span className="kpi-label"><span>Bank records</span></span></div><strong>{fmtNumber(preview.preview?.bank?.record_count || 0)}</strong><span className="kpi-subtle">Valid {fmtNumber(preview.preview?.bank?.valid_count || 0)} · Invalid {fmtNumber(preview.preview?.bank?.invalid_count || 0)} · Duplicates {fmtNumber(preview.preview?.bank?.duplicate_candidate_count || 0)}</span></article>
+            <article className="panel summary-card"><div className="summary-card-header"><span className="kpi-label"><span>Ledger records</span></span></div><strong>{fmtNumber(preview.preview?.ledger?.record_count || 0)}</strong><span className="kpi-subtle">Valid {fmtNumber(preview.preview?.ledger?.valid_count || 0)} · Invalid {fmtNumber(preview.preview?.ledger?.invalid_count || 0)} · Duplicates {fmtNumber(preview.preview?.ledger?.duplicate_candidate_count || 0)}</span></article>
+            <article className="panel summary-card matched"><div className="summary-card-header"><span className="kpi-label"><span>Proposed matched</span></span></div><strong>{fmtNumber(preview.proposed_summary?.matched_count || 0)}</strong><span className="kpi-subtle">Ambiguous {fmtNumber(preview.proposed_summary?.ambiguous_count || 0)}</span></article>
+            <article className="panel summary-card unmatched"><div className="summary-card-header"><span className="kpi-label"><span>Proposed exceptions</span></span></div><strong>{fmtNumber((preview.proposed_summary?.amount_mismatch_count || 0) + (preview.proposed_summary?.date_mismatch_count || 0) + (preview.proposed_summary?.duplicate_candidate_count || 0) + (preview.proposed_summary?.invalid_record_count || preview.proposed_summary?.invalid_records_count || 0))}</strong><span className="kpi-subtle">Bank-only {fmtNumber(preview.proposed_summary?.bank_only_count || 0)} · Ledger-only {fmtNumber(preview.proposed_summary?.ledger_only_count || 0)}</span></article>
+          </div>
+          <p className="kpi-subtle">Files: {preview.bank_file} ↔ {preview.ledger_file} · Date tolerance {preview.date_tolerance_days} day(s) · Amount tolerance {preview.amount_tolerance}</p>
+        </section>
+      )}
+
       {reconciliation && (
         <>
-          <div className="summary-grid">
-            <article className="panel summary-card matched">
-              <div className="summary-card-header">
-                <span className="kpi-label">
-                  <span>Matched</span>
-                </span>
-                <CheckCircle2 size={18} />
-              </div>
-              <strong>{fmtNumber(summary.matched_count || 0)}</strong>
-              <span className="kpi-subtle">{fmtCurrency(summary.matched_total || 0)}</span>
-            </article>
-            <article className="panel summary-card suggested">
-              <div className="summary-card-header">
-                <span className="kpi-label">
-                  <span>Suggested</span>
-                </span>
-                <Search size={18} />
-              </div>
-              <strong>{fmtNumber((summary.amount_mismatch_count || 0) + (summary.date_mismatch_count || 0))}</strong>
-              <span className="kpi-subtle">Needs review (mismatch)</span>
-            </article>
-            <article className="panel summary-card unmatched">
-              <div className="summary-card-header">
-                <span className="kpi-label">
-                  <span>Unmatched</span>
-                </span>
-                <AlertTriangle size={18} />
-              </div>
-              <strong>{fmtNumber((summary.bank_only_count || 0) + (summary.ledger_only_count || 0))}</strong>
-              <span className="kpi-subtle">{fmtCurrency((summary.bank_unmatched_total || 0) + (summary.ledger_unmatched_total || 0))}</span>
-            </article>
-            <article className="panel summary-card reconciled">
-              <div className="summary-card-header">
-                <span className="kpi-label">
-                  <span>Already reconciled</span>
-                </span>
-                <ShieldCheck size={18} />
-              </div>
-              <strong>{fmtNumber(summary.matched_count || 0)}</strong>
-              <span className="kpi-subtle">Difference {fmtCurrency(summary.difference || 0)}</span>
-            </article>
+          <div className="summary-grid" style={{ marginBottom: 22 }}>
+            {summaryCards.map((card) => (
+              <article key={card.label} className={`panel summary-card ${card.tone}`}>
+                <div className="summary-card-header"><span className="kpi-label"><span>{card.label}</span></span></div>
+                <strong>{card.value}</strong>
+                <span className="kpi-subtle">{card.hint}</span>
+              </article>
+            ))}
           </div>
 
+          <section className="panel" style={{ padding: '16px 26px', marginBottom: 22 }}>
+            <div className="section-header"><div><h2>3. Resolve Exceptions</h2><p>Review suggested/ambiguous matches, confirm or reject, manually link records, mark explained, add notes, or reopen exceptions. Every action is recorded with timestamp and audit history.</p></div></div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))', gap: 10, alignItems: 'end' }}>
+              <label style={{ fontSize: 12, color: 'var(--rec-text-secondary)' }}>Bank record to link
+                <select value={manualBankId} onChange={(e) => setManualBankId(e.target.value)} style={{ width: '100%', marginTop: 4, padding: '8px 10px', borderRadius: 8, border: '1px solid var(--rec-border-strong)', background: 'var(--rec-surface)' }}>
+                  <option value="">Select bank record</option>
+                  {bankLinkCandidates.map((item) => <option key={item.id} value={item.id}>#{item.id} · row {item.bank_source_row} · {item.bank_reference || item.bank_description || '—'} · {fmtCurrency(item.bank_amount || 0)}</option>)}
+                </select>
+              </label>
+              <label style={{ fontSize: 12, color: 'var(--rec-text-secondary)' }}>Ledger record to link
+                <select value={manualLedgerId} onChange={(e) => setManualLedgerId(e.target.value)} style={{ width: '100%', marginTop: 4, padding: '8px 10px', borderRadius: 8, border: '1px solid var(--rec-border-strong)', background: 'var(--rec-surface)' }}>
+                  <option value="">Select ledger record</option>
+                  {ledgerLinkCandidates.map((item) => <option key={item.id} value={item.id}>#{item.id} · row {item.ledger_source_row} · {item.ledger_reference || item.ledger_description || '—'} · {fmtCurrency(item.ledger_amount || 0)}</option>)}
+                </select>
+              </label>
+              <label style={{ fontSize: 12, color: 'var(--rec-text-secondary)' }}>Resolution note
+                <input value={manualNote} onChange={(e) => setManualNote(e.target.value)} placeholder="Optional note" style={{ width: '100%', marginTop: 4, padding: '8px 10px', borderRadius: 8, border: '1px solid var(--rec-border-strong)', background: 'var(--rec-surface)' }} />
+              </label>
+              <button className="primary-btn" type="button" onClick={doManualLink} disabled={actionLoadingId === 'manual' || !manualBankId || !manualLedgerId}><CheckCircle2 size={16} /> {actionLoadingId === 'manual' ? 'Linking...' : 'Manually link records'}</button>
+            </div>
+          </section>
+
           <section className="panel table-card-light">
-            <div className="table-header">
+            <div className="table-header" style={{ gap: 12, flexWrap: 'wrap' }}>
               <div>
-                <h2>Transactions</h2>
-                <p>
-                  {reconciliation.bank_file} ↔ {reconciliation.ledger_file} ·{' '}
-                  {reconciliation.date_tolerance_days} day tolerance
-                </p>
-                <label className="kpi-subtle" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginTop: 6 }}>
-                  Reviewer
-                  <input
-                    value={reviewer}
-                    onChange={(event) => setReviewer(event.target.value)}
-                    placeholder="Reviewer name"
-                    style={{ padding: '6px 8px', borderRadius: 6, border: '1px solid var(--rec-border-strong)', background: 'var(--rec-surface)' }}
-                  />
-                </label>
+                <h2>Transactions & Exceptions</h2>
+                <p>Run #{runId} · {reconciliation.bank_file} ↔ {reconciliation.ledger_file} · Date tolerance {reconciliation.date_tolerance_days} day(s) · Amount tolerance {reconciliation.amount_tolerance ?? 0.005}</p>
               </div>
-              <div className="filter-bar" style={{ marginBottom: 0 }}>
-                <button
-                  className={`filter-chip-light ${filter === 'all' ? 'active' : ''}`}
-                  type="button"
-                  onClick={() => setFilter('all')}
-                >
-                  All ({results.length})
-                </button>
-                <button
-                  className={`filter-chip-light ${filter === 'matched' ? 'active' : ''}`}
-                  type="button"
-                  onClick={() => setFilter('matched')}
-                >
-                  Matched ({summary.matched_count || 0})
-                </button>
-                <button
-                  className={`filter-chip-light ${filter === 'unmatched' ? 'active' : ''}`}
-                  type="button"
-                  onClick={() => setFilter('unmatched')}
-                >
-                  Unmatched ({(summary.bank_only_count || 0) + (summary.ledger_only_count || 0)})
-                </button>
-                <button
-                  className={`filter-chip-light ${filter === 'amount_mismatch' ? 'active' : ''}`}
-                  type="button"
-                  onClick={() => setFilter('amount_mismatch')}
-                >
-                  Mismatch ({(summary.amount_mismatch_count || 0) + (summary.date_mismatch_count || 0)})
-                </button>
-                <button
-                  className={`filter-chip-light ${filter === 'ambiguous' ? 'active' : ''}`}
-                  type="button"
-                  onClick={() => setFilter('ambiguous')}
-                >
-                  Ambiguous ({summary.ambiguous_count || 0})
-                </button>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search reference, description, file, status..." style={{ minWidth: 220, padding: '8px 10px', borderRadius: 8, border: '1px solid var(--rec-border-strong)', background: 'var(--rec-surface)' }} />
               </div>
+            </div>
+
+            <div className="filter-bar">
+              {[
+                ['all', `All (${results.length})`],
+                ['matched', `Matched (${summary.matched_count || 0})`],
+                ['bank_only', `Bank only (${summary.bank_only_count || 0})`],
+                ['ledger_only', `Ledger only (${summary.ledger_only_count || 0})`],
+                ['amount_mismatch', `Amount mismatch (${summary.amount_mismatch_count || 0})`],
+                ['date_mismatch', `Date mismatch (${summary.date_mismatch_count || 0})`],
+                ['ambiguous', `Ambiguous (${summary.ambiguous_count || 0})`],
+                ['duplicate_candidate', `Duplicate (${summary.duplicate_candidate_count || 0})`],
+                ['invalid_records', `Invalid (${summary.invalid_record_count || summary.invalid_records_count || 0})`],
+                ['pending_review', 'Pending review'],
+                ['confirmed', 'Confirmed'],
+              ].map(([key, label]) => (
+                <button key={key} className={`filter-chip-light ${filter === key ? 'active' : ''}`} type="button" onClick={() => setFilter(key)}>{label}</button>
+              ))}
             </div>
 
             {filtered.length === 0 ? (
               <div className="empty-state">
-                <div className="empty-icon">
-                  <Filter size={24} />
-                </div>
-                <strong>No transactions in this view</strong>
-                <span>Adjust the filter to review other statuses.</span>
+                <div className="empty-icon"><Filter size={24} /></div>
+                <strong>No records in this view</strong>
+                <span>Adjust filters or search to inspect other reconciliation results.</span>
               </div>
             ) : (
               <div className="table-scroll">
                 <table className="rec-table">
                   <thead>
                     <tr>
-                      <th>Select</th>
-                      <th>Date</th>
-                      <th>Description</th>
-                      <th>Amount</th>
-                      <th>Reference</th>
-                      <th>Match status</th>
-                      <th>Source</th>
-                      <th>Confidence</th>
-                      <th>Note</th>
+                      <th>Status / Review</th>
+                      <th>Match method</th>
+                      <th>Bank record</th>
+                      <th>Ledger record</th>
+                      <th>Amount diff</th>
+                      <th>Date diff</th>
+                      <th>Explanation</th>
+                      <th>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {filtered.map((item, index) => {
-                      const bankSide = item.bank_date || item.bank_amount != null;
-                      const ledgerSide = item.ledger_date || item.ledger_amount != null;
-                      const dateValue = item.bank_date || item.ledger_date;
-                      const descriptionValue = item.bank_description || item.ledger_description;
-                      const amountValue = bankSide ? item.bank_amount : item.ledger_amount;
-                      const referenceValue = item.bank_reference || item.ledger_reference;
-                      const sourceFile = item.bank_source_file || item.ledger_source_file;
-                      const sourceRow = item.bank_source_row || item.ledger_source_row;
-                      const confidence =
-                        item.status === 'matched'
-                          ? 'High'
-                          : item.status === 'ambiguous'
-                          ? 'Unavailable'
-                          : ['amount_mismatch', 'date_mismatch'].includes(item.status)
-                          ? 'Low'
-                          : 'N/A';
-
+                    {filtered.map((item) => {
+                      const paired = Boolean(item.bank_source_file && item.ledger_source_file);
+                      const canConfirm = paired && !item.is_confirmed_match && !['invalid_records', 'duplicate_candidate', 'bank_only', 'ledger_only'].includes(item.status) && item.review_status !== 'confirmed';
+                      const canReject = ['ambiguous', 'amount_mismatch', 'date_mismatch', 'matched'].includes(item.status) && item.review_status !== 'rejected';
+                      const canExplain = ['bank_only', 'ledger_only', 'amount_mismatch', 'date_mismatch', 'ambiguous', 'duplicate_candidate', 'invalid_records'].includes(item.status) && item.review_status !== 'explained';
+                      const canReopen = ['confirmed', 'rejected', 'explained', 'linked'].includes(item.review_status);
+                      const note = window.prompt ? undefined : undefined; // avoid prompts in render
                       return (
-                        <tr key={item.id || index}>
+                        <tr key={item.id}>
                           <td>
-                            {item.id ? (
-                              item.review_status ? (
-                                <StatusBadge status={item.review_status} />
-                              ) : (
-                                <div style={{ display: 'flex', gap: 4 }}>
-                                  <button
-                                    className="text-btn"
-                                    type="button"
-                                    title="Confirm this match for financial action"
-                                    onClick={() => confirmResult(item.id, 'confirmed')}
-                                  >
-                                    Confirm
-                                  </button>
-                                  <button
-                                    className="text-btn"
-                                    type="button"
-                                    title="Reject this match"
-                                    onClick={() => confirmResult(item.id, 'rejected')}
-                                  >
-                                    Reject
-                                  </button>
-                                </div>
-                              )
-                            ) : (
-                              <span className="cell-muted">—</span>
-                            )}
-                          </td>
-                          <td className="cell-primary">{dateValue || '—'}</td>
-                          <td>
-                            <div style={{ maxWidth: 260 }}>
-                              <div className="cell-primary">{descriptionValue || '—'}</div>
+                            <div style={{ display: 'grid', gap: 4 }}>
+                              <StatusBadge status={item.status} />
+                              <span className="cell-muted">Review: {statusLabel(item.review_status || 'pending')}</span>
+                              {item.is_confirmed_match ? <span className="cell-muted">Confirmed match</span> : null}
                             </div>
                           </td>
-                          <td className="cell-primary">{amountValue == null ? '—' : fmtCurrency(amountValue)}</td>
-                          <td className="cell-muted">{referenceValue || '—'}</td>
+                          <td className="cell-muted">{item.match_method || '—'}</td>
                           <td>
-                            <StatusBadge status={item.status} />
+                            <div className="source-stack">
+                              <span className="cell-primary">{item.bank_date || '—'} · {item.bank_amount == null ? '—' : fmtCurrency(item.bank_amount)}</span>
+                              <span className="cell-muted">{item.bank_reference || item.bank_description || '—'}</span>
+                              <span className="cell-muted">{item.bank_source_file || '—'} {item.bank_source_row ? `(row ${item.bank_source_row})` : ''}</span>
+                            </div>
                           </td>
                           <td>
                             <div className="source-stack">
-                              <span className="cell-primary">{sourceFile || '—'}</span>
-                              <span className="cell-muted">Row {sourceRow || '—'}</span>
+                              <span className="cell-primary">{item.ledger_date || '—'} · {item.ledger_amount == null ? '—' : fmtCurrency(item.ledger_amount)}</span>
+                              <span className="cell-muted">{item.ledger_reference || item.ledger_description || '—'}</span>
+                              <span className="cell-muted">{item.ledger_source_file || '—'} {item.ledger_source_row ? `(row ${item.ledger_source_row})` : ''}</span>
                             </div>
                           </td>
-                          <td className="cell-muted">{confidence}</td>
+                          <td className="cell-muted">{item.amount_difference == null ? '—' : fmtCurrency(item.amount_difference)}</td>
+                          <td className="cell-muted">{item.date_difference_days == null ? '—' : `${item.date_difference_days} day(s)`}</td>
                           <td>
-                            <span className="cell-muted">{item.note || '—'}</span>
+                            <div style={{ maxWidth: 340 }}>
+                              <div className="cell-primary" style={{ whiteSpace: 'normal' }}>{item.explanation || item.note || '—'}</div>
+                              {item.resolution_note ? <div className="cell-muted" style={{ whiteSpace: 'normal', marginTop: 4 }}>Resolution: {item.resolution_note}</div> : null}
+                              {item.reviewed_by ? <div className="cell-muted" style={{ marginTop: 4 }}>By {item.reviewed_by}{item.reviewed_at ? ` · ${formatDateTime(item.reviewed_at)}` : ''}</div> : null}
+                            </div>
+                          </td>
+                          <td>
+                            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                              {canConfirm && <button className="text-btn" type="button" disabled={actionLoadingId === item.id} onClick={() => doReviewAction(item.id, 'confirm_match')}>Confirm</button>}
+                              {canReject && <button className="text-btn" type="button" disabled={actionLoadingId === item.id} onClick={() => doReviewAction(item.id, 'reject_match')}>Reject</button>}
+                              {canExplain && <button className="text-btn" type="button" disabled={actionLoadingId === item.id} onClick={() => { const resolution = window.prompt('Resolution note (optional):', item.resolution_note || ''); doReviewAction(item.id, 'mark_explained', { note: resolution || undefined }); }}>Mark explained</button>}
+                              {canReopen && <button className="text-btn" type="button" disabled={actionLoadingId === item.id} onClick={() => doReviewAction(item.id, 'reopen')}>Reopen</button>}
+                              <button className="text-btn" type="button" disabled={actionLoadingId === item.id} onClick={() => { const resolution = window.prompt('Add resolution/review note:', item.resolution_note || item.reviewer_comment || ''); if (resolution != null) doReviewAction(item.id, 'add_note', { note: resolution }); }}>Add note</button>
+                            </div>
                           </td>
                         </tr>
                       );
@@ -1340,8 +1397,65 @@ function ReconciliationPage({
               </div>
             )}
           </section>
+
+          <section className="panel" style={{ padding: '16px 26px', marginTop: 22 }}>
+            <div className="section-header"><div><h2>5. Complete — Run Summary & Audit History</h2><p>Persisted run details, actual backend summary data, and reviewer action history.</p></div></div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))', gap: 10, fontSize: 12 }}>
+              <div><strong>Run ID:</strong> {runId}</div>
+              <div><strong>Status:</strong> {reconciliation.run_status || 'completed'}</div>
+              <div><strong>Created:</strong> {formatDateTime(reconciliation.created_at)}</div>
+              <div><strong>Bank records:</strong> {fmtNumber(summary.bank_record_count || 0)}</div>
+              <div><strong>Ledger records:</strong> {fmtNumber(summary.ledger_record_count || 0)}</div>
+              <div><strong>Matched count:</strong> {fmtNumber(summary.matched_count || 0)}</div>
+              <div><strong>Unmatched count:</strong> {fmtNumber(summary.unmatched_count || ((summary.bank_only_count || 0) + (summary.ledger_only_count || 0)))}</div>
+              <div><strong>Exception count:</strong> {fmtNumber(summary.exception_count || 0)}</div>
+              <div><strong>Difference:</strong> {fmtCurrency(summary.total_difference ?? summary.difference ?? 0)}</div>
+            </div>
+            {reviewActions.length > 0 ? (
+              <div style={{ marginTop: 12, display: 'grid', gap: 6 }}>
+                <strong style={{ fontSize: 12 }}>Reviewer actions</strong>
+                {reviewActions.slice(0, 20).map((action) => (
+                  <div key={action.id} style={{ fontSize: 11, opacity: 0.85, borderBottom: '1px solid rgba(148,163,184,.12)', paddingBottom: 4 }}>
+                    {formatDateTime(action.created_at)} · {action.actor} · {statusLabel(action.action)}{action.result_id ? ` · result #${action.result_id}` : ''}{action.comment ? ` · ${action.comment}` : ''}
+                  </div>
+                ))}
+              </div>
+            ) : <p className="kpi-subtle" style={{ marginTop: 10 }}>No reviewer actions recorded yet for this run.</p>}
+          </section>
         </>
       )}
+
+      <section className="panel table-card-light" style={{ marginTop: 22 }}>
+        <div className="section-header"><div><h2>Reconciliation History</h2><p>Inspect previous runs without overwriting their results.</p></div><button className="secondary-btn" type="button" onClick={loadHistory}><RefreshCw size={16} /> Refresh history</button></div>
+        {!history || history.length === 0 ? (
+          <div className="empty-state"><div className="empty-icon"><ArrowLeftRight size={24} /></div><strong>No reconciliation runs yet</strong><span>Create a run to persist reconciliation history.</span></div>
+        ) : (
+          <div className="data-table-wrap">
+            <table className="data-table">
+              <thead><tr><th>Run</th><th>Files</th><th>Tolerances</th><th>Matched</th><th>Unmatched</th><th>Exceptions</th><th>Difference</th><th>Created</th><th></th></tr></thead>
+              <tbody>
+                {history.map((run) => {
+                  const rid = run.reconciliation_id || run.run_id || run.id;
+                  const s = run.summary || {};
+                  return (
+                    <tr key={rid}>
+                      <td className="table-primary">#{rid}</td>
+                      <td>{run.bank_file || '—'} ↔ {run.ledger_file || '—'}</td>
+                      <td>{run.date_tolerance_days ?? 0}d / {run.amount_tolerance ?? '—'}</td>
+                      <td>{fmtNumber(s.matched_count || 0)}</td>
+                      <td>{fmtNumber(s.unmatched_count || ((s.bank_only_count || 0) + (s.ledger_only_count || 0)))}</td>
+                      <td>{fmtNumber(s.exception_count || 0)}</td>
+                      <td>{fmtCurrency(s.total_difference ?? s.difference ?? 0)}</td>
+                      <td>{formatDateTime(run.created_at)}</td>
+                      <td><button className="text-btn" type="button" onClick={() => loadRun(rid)} disabled={historyLoadingId === rid}>{historyLoadingId === rid ? 'Loading…' : (selectedRunId === rid ? 'Viewing' : 'Inspect')}</button></td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
     </>
   );
 }
@@ -1997,8 +2111,10 @@ function InvoiceAnalyticsPage() {
 }
 
 function App() {
-  const [activeView, setActiveView] = useState('overview');
-  const [activeNavId, setActiveNavId] = useState('dashboard');
+  const initialView = viewFromHash();
+  const initialNav = SIDEBAR_NAV_ITEMS.find((item) => item.view === initialView)?.navId || (initialView === 'overview' ? 'dashboard' : 'dashboard');
+  const [activeView, setActiveViewState] = useState(initialView);
+  const [activeNavId, setActiveNavId] = useState(initialNav);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [expandedGroups, setExpandedGroups] = useState(() =>
@@ -2014,6 +2130,46 @@ function App() {
     label: 'Checking backend',
     detail: 'Contacting API…'
   });
+
+
+
+  const syncHashForView = (viewId, replace = false) => {
+    if (typeof window === 'undefined') return;
+    const nextHash = viewToHash(viewId);
+    if (window.location.hash === nextHash) return;
+    if (replace) {
+      window.history.replaceState(null, '', nextHash);
+    } else {
+      window.history.pushState(null, '', nextHash);
+    }
+  };
+
+  const setActiveView = (viewId, options = {}) => {
+    if (!ROUTABLE_VIEW_IDS.has(viewId)) return;
+    const { navId = null, syncHash = true, replaceHash = false } = options;
+    setActiveViewState(viewId);
+    const resolvedNav = navId || SIDEBAR_NAV_ITEMS.find((item) => item.view === viewId)?.navId || null;
+    if (resolvedNav) setActiveNavId(resolvedNav);
+    if (syncHash) syncHashForView(viewId, replaceHash);
+  };
+
+  useEffect(() => {
+    // Ensure URL reflects the active route on first load and supports refresh/direct links.
+    syncHashForView(activeView, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const onHashChange = () => {
+      const nextView = viewFromHash();
+      const nextNav = SIDEBAR_NAV_ITEMS.find((item) => item.view === nextView)?.navId || (nextView === 'overview' ? 'dashboard' : activeNavId);
+      setActiveViewState(nextView);
+      if (nextNav) setActiveNavId(nextNav);
+      setMobileMenuOpen(false);
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, [activeNavId]);
 
   const themeClass = activeView === 'reconciliation' ? 'theme-reconciliation' : 'theme-dashboard';
 
@@ -2046,29 +2202,42 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     const loadHealth = async () => {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 10000);
       try {
-        const response = await fetch(`${API}/api/system/health`);
+        const response = await fetch(`${API}/api/system/health`, { signal: controller.signal });
         const data = await response.json().catch(() => ({}));
         if (cancelled) return;
         if (!response.ok) {
-          setBackendHealth({ state: 'offline', label: 'Backend unreachable', detail: `HTTP ${response.status}` });
+          setBackendHealth({
+            state: 'degraded',
+            label: 'Backend degraded',
+            detail: `Health check returned HTTP ${response.status}`
+          });
           return;
         }
-        const systemStatus = String(data.status || '').toLower();
+        const systemStatus = String(data.status || '').toLowerCase();
         const dbStatus = String(data.database?.status || '').toLowerCase();
-        const healthy = response.ok && dbStatus === 'connected' && systemStatus !== 'degraded';
+        const dbConnected = dbStatus === 'connected';
+        const healthy = dbConnected && systemStatus === 'operational';
         setBackendHealth({
-          state: healthy ? 'healthy' : 'degraded',
-          label: healthy ? 'Backend healthy' : 'Backend degraded',
-          detail:
-            dbStatus === 'connected'
-              ? `Database connected · LLM ${data.llm?.available ? 'available' : 'unavailable'}`
-              : `Database ${data.database?.status || 'unavailable'}`
+          state: healthy ? 'healthy' : dbConnected ? 'degraded' : 'offline',
+          label: healthy ? 'Backend healthy' : dbConnected ? 'Backend degraded' : 'Backend unreachable',
+          detail: dbConnected
+            ? `Database connected · LLM ${data.llm?.available ? 'available' : 'unavailable'}`
+            : `Database ${data.database?.status || 'unavailable'}`
         });
-      } catch {
+      } catch (err) {
         if (!cancelled) {
-          setBackendHealth({ state: 'offline', label: 'Backend offline', detail: 'Unable to reach API' });
+          const timedOut = err?.name === 'AbortError';
+          setBackendHealth({
+            state: 'offline',
+            label: timedOut ? 'Backend slow/unreachable' : 'Backend offline',
+            detail: timedOut ? 'Health check timed out' : 'Unable to reach API'
+          });
         }
+      } finally {
+        window.clearTimeout(timeout);
       }
     };
     loadHealth();
@@ -2095,16 +2264,14 @@ function App() {
       }
       const navItem = SIDEBAR_NAV_ITEMS.find((item) => item.navId === target);
       if (navItem) {
-        setActiveView(navItem.view);
-        setActiveNavId(navItem.navId);
+        setActiveView(navItem.view, { navId: navItem.navId });
         setMobileMenuOpen(false);
       }
     };
     const transactionHandler = (event) => {
       if (typeof event.detail === 'string') {
         setTransactionFocus(`${Date.now()}:${event.detail}`);
-        setActiveView('transactions');
-        setActiveNavId('transactions');
+        setActiveView('transactions', { navId: 'transactions' });
         setMobileMenuOpen(false);
       }
     };
@@ -2121,7 +2288,8 @@ function App() {
     transactions: { eyebrow: 'Transactions', title: 'Transaction Management', description: 'Import, validate, search and inspect transactions with full source provenance.' },
     assistant: { eyebrow: 'AI Assistant', title: 'AI Investigation Assistant', description: 'Selective multi-agent investigation with SQL evidence, RAG citations and human review.' },
     analytics: { eyebrow: 'Analytics', title: 'Financial Analytics', description: 'Monthly spending, categories, trends and transaction details from actual data.' },
-    'risk-intelligence': { eyebrow: 'Risk Intelligence', title: 'Financial Risk & Fraud Intelligence', description: 'Deterministic risk scoring, anomaly alerts, channel analytics, trends and geography from stored records.' },
+    'risk-intelligence': { eyebrow: 'Risk Intelligence', title: 'Financial Risk & Fraud Intelligence', description: 'Deterministic risk scoring, anomaly alerts, channel analytics, trends and alert review from stored records.' },
+    'geographic-intelligence': { eyebrow: 'Geographic Intelligence', title: 'Geographic Risk Intelligence', description: 'Map, country/city analytics and geographic risk patterns from stored transaction and alert records.' },
     monitoring: { eyebrow: 'Monitoring', title: 'Audit Activity Monitoring', description: 'Historical audit runs, findings by risk/type, and activity.' },
     investigations: { eyebrow: 'Investigations', title: 'Investigations', description: 'Findings with source evidence and provenance.' },
     cases: { eyebrow: 'Cases', title: 'Investigation Cases', description: 'Create and manage cases linked to findings with status/notes.' },
@@ -2141,8 +2309,7 @@ function App() {
   }[activeView];
 
   const handleNavSelect = (item) => {
-    setActiveView(item.view);
-    setActiveNavId(item.navId);
+    setActiveView(item.view, { navId: item.navId });
     setMobileMenuOpen(false);
   };
 
@@ -2246,7 +2413,7 @@ function App() {
       </aside>
 
       <main className="main">
-        <header className="topbar">
+        <header className={`topbar ${activeView === 'geographic-intelligence' ? 'topbar-geo' : ''}`}>
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 16 }}>
             <button
               className="mobile-menu-btn"
@@ -2256,27 +2423,31 @@ function App() {
             >
               <Menu size={20} />
             </button>
-            <div className="topbar-heading">
-              <div className="eyebrow">{pageTitle.eyebrow}</div>
-              <h1>{pageTitle.title}</h1>
-              <p>{pageTitle.description}</p>
-            </div>
+            {activeView !== 'geographic-intelligence' && (
+              <div className="topbar-heading">
+                <div className="eyebrow">{pageTitle.eyebrow}</div>
+                <h1>{pageTitle.title}</h1>
+                <p>{pageTitle.description}</p>
+              </div>
+            )}
           </div>
-          <div className="topbar-actions">
-            <button className="secondary-btn" type="button" onClick={loadOverview} disabled={loadingOverview}>
-              <RefreshCw size={16} className={loadingOverview ? 'spin' : ''} />
-              Refresh
-            </button>
-            <div className="status-pill">
-              <span />
-              {API.replace('http://', '').replace('https://', '')}
+          {activeView !== 'geographic-intelligence' && (
+            <div className="topbar-actions">
+              <button className="secondary-btn" type="button" onClick={loadOverview} disabled={loadingOverview}>
+                <RefreshCw size={16} className={loadingOverview ? 'spin' : ''} />
+                Refresh
+              </button>
+              <div className="status-pill">
+                <span />
+                {API.replace('http://', '').replace('https://', '')}
+              </div>
             </div>
-          </div>
+          )}
         </header>
 
         {SECONDARY_VIEWS.has(activeView) && (
           <div className="workspace-backbar">
-            <button className="secondary-btn" type="button" onClick={() => setActiveView('reports')}>← Reports workspace</button>
+            <button className="secondary-btn" type="button" onClick={() => setActiveView('reports', { navId: 'reports-exports' })}>← Reports workspace</button>
             <span>Additional workspace · reachable from Reports</span>
           </div>
         )}
@@ -2291,7 +2462,7 @@ function App() {
           <MonitoringPage audits={audits} loadOverview={loadOverview} />
         )}
         {activeView === 'investigations' && (
-          <InvestigationsPage audits={audits} onNavigate={setActiveView} />
+          <InvestigationsPage audits={audits} onNavigate={(view) => setActiveView(view)} />
         )}
         {activeView === 'cases' && (
           <CasesPage audits={audits} />
@@ -2310,6 +2481,9 @@ function App() {
         {activeView === 'risk-intelligence' && (
           <RiskIntelligence apiBase={API} />
         )}
+        {activeView === 'geographic-intelligence' && (
+          <GeographicRiskIntelligence apiBase={API} backendHealth={backendHealth} />
+        )}
         {activeView === 'assistant' && (
           <Assistant />
         )}
@@ -2317,7 +2491,7 @@ function App() {
           <AgentsPage />
         )}
         {activeView === 'reports' && (
-          <ReportsPage audits={audits} reconciliations={reconciliations} onNavigate={setActiveView} />
+          <ReportsPage audits={audits} reconciliations={reconciliations} onNavigate={(view) => setActiveView(view)} />
         )}
         {activeView === 'compliance' && (
           <CompliancePage audits={audits} reconciliations={reconciliations} />

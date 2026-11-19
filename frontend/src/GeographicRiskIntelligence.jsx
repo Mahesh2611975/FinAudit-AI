@@ -42,6 +42,7 @@ const EMPTY_FILTERS = {
   start_date: '',
   end_date: '',
   country: '',
+  city: '',
   risk_level: '',
   channel: '',
   min_amount: '',
@@ -146,11 +147,11 @@ function RiskPill({ level }) {
 
 function GeoKpi({ label, value, hint, icon: Icon, tone = 'blue' }) {
   return (
-    <article className="risk-kpi">
+    <article className="risk-kpi geo-kpi-card">
       <div className="risk-kpi-top">
-        <div>
+        <div className="geo-kpi-copy">
           <span>{label}</span>
-          <strong>{value}</strong>
+          <strong className="geo-kpi-value">{value}</strong>
         </div>
         <div className={`risk-kpi-icon risk-kpi-icon-${tone}`}><Icon size={20} /></div>
       </div>
@@ -414,7 +415,7 @@ function GeoChannelPanel({ analytics, currency }) {
     <section className="risk-card geo-panel">
       <div className="risk-card-header">
         <div>
-          <h2>Channel analytics for this map filter</h2>
+          <h2>Payment channel analytics</h2>
           <p>Counts and flagged values by payment channel, with source provenance.</p>
         </div>
         <span className="risk-meta-pill"><Layers size={13} /> {fmtNumber(analytics?.transactions_analyzed)} txns</span>
@@ -493,7 +494,7 @@ function GeoTrendPanel({ trend }) {
   );
 }
 
-export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1:8000', refreshSignal = 0 }) {
+export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1:8000', refreshSignal = 0, backendHealth = null }) {
   const [data, setData] = useState(null);
   const [filters, setFilters] = useState(EMPTY_FILTERS);
   const [loading, setLoading] = useState(true);
@@ -502,6 +503,7 @@ export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1
   const [localRefresh, setLocalRefresh] = useState(0);
 
   const mapContainerRef = useRef(null);
+  const mapShellRef = useRef(null);
   const mapRef = useRef(null);
   const clusterRef = useRef(null);
 
@@ -512,7 +514,7 @@ export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1
   const unusualLocations = data?.unusual_locations || [];
   const trend = data?.trend || [];
   const channelAnalytics = data?.channel_analytics || null;
-  const options = data?.options || { countries: [], channels: [], risk_levels: [], risk_sources: [] };
+  const options = data?.options || { countries: [], cities: [], channels: [], risk_levels: [], risk_sources: [] };
   const geocoding = data?.geocoding || {};
   const available = Boolean(data?.available && markers.length > 0);
 
@@ -617,12 +619,21 @@ export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1
     mapRef.current = map;
     clusterRef.current = cluster;
 
-    const invalidate = () => map.invalidateSize();
+    const invalidate = () => {
+      if (mapRef.current) mapRef.current.invalidateSize();
+    };
     requestAnimationFrame(invalidate);
     window.addEventListener('resize', invalidate);
 
+    let observer;
+    if (typeof ResizeObserver !== 'undefined' && mapShellRef.current) {
+      observer = new ResizeObserver(() => requestAnimationFrame(invalidate));
+      observer.observe(mapShellRef.current);
+    }
+
     return () => {
       window.removeEventListener('resize', invalidate);
+      if (observer) observer.disconnect();
       map.remove();
       mapRef.current = null;
       clusterRef.current = null;
@@ -672,40 +683,47 @@ export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1
       } else {
         map.fitBounds(bounds, { padding: [36, 36], maxZoom: 6 });
       }
-      requestAnimationFrame(() => map.invalidateSize());
     }
+    requestAnimationFrame(() => map.invalidateSize());
   }, [markers, currency]);
 
-  const geocodingLabel = geocoding.enabled
-    ? `Geocoding on · ${fmtNumber(geocoding.cache_hits || 0)} cached`
-    : 'Geocoding off · cached + stored coordinates';
+  const backendState = backendHealth?.state || 'checking';
+  const backendLabel = backendHealth?.label || 'Checking backend';
+  const backendDetail = backendHealth?.detail || 'Contacting API…';
 
   return (
-    <section className="geo-section">
-      <div className="geo-heading">
-        <div>
-          <div className="geo-heading-title"><Globe2 size={20} /> Geographic risk intelligence</div>
+    <section className="geo-section geo-page">
+      <header className="geo-page-header">
+        <div className="geo-page-header-copy">
+          <div className="geo-page-title-row">
+            <Globe2 size={22} />
+            <h1>Geographic Risk Intelligence</h1>
+          </div>
           <p>
-            Interactive world map of stored transactions. Marker colour shows risk; marker size reflects transaction value.
-            No coordinates or locations are invented.
+            Map and analyze transaction risk by location using stored coordinates and linked alert evidence.
+            Filters, markers, and analytics update from persisted backend records only.
           </p>
         </div>
-        <div className="geo-heading-meta">
-          <span className={`geo-status-pill ${geocoding.enabled ? 'geo-status-on' : ''}`}>
-            <Layers size={13} /> {geocodingLabel}
-          </span>
+        <div className="geo-page-header-actions">
+          <div className={`geo-backend-status geo-backend-status-${backendState}`} title={backendDetail}>
+            <span className="geo-backend-dot" />
+            <div>
+              <strong>{backendLabel}</strong>
+              <small>{backendDetail}</small>
+            </div>
+          </div>
           <button
             type="button"
-            className="secondary-btn"
+            className="secondary-btn geo-refresh-btn"
             onClick={() => setLocalRefresh((value) => value + 1)}
             disabled={loading}
           >
-            <RefreshCw size={15} className={loading ? 'spin' : ''} /> Reload map
+            <RefreshCw size={15} className={loading ? 'spin' : ''} /> Refresh
           </button>
         </div>
-      </div>
+      </header>
 
-      <div className="risk-filter-bar geo-filter-bar">
+      <div className="risk-filter-bar geo-filter-bar" aria-label="Geographic filters">
         <label>
           <span><Filter size={13} /> From date</span>
           <input type="date" value={filters.start_date} onChange={(event) => updateFilter('start_date', event.target.value)} />
@@ -719,6 +737,13 @@ export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1
           <select value={filters.country} onChange={(event) => updateFilter('country', event.target.value)}>
             <option value="">All countries</option>
             {options.countries.map((country) => <option key={country} value={country}>{country}</option>)}
+          </select>
+        </label>
+        <label>
+          <span>City</span>
+          <select value={filters.city || ''} onChange={(event) => updateFilter('city', event.target.value)}>
+            <option value="">All cities</option>
+            {(options.cities || []).map((city) => <option key={city} value={city}>{city}</option>)}
           </select>
         </label>
         <label>
@@ -740,7 +765,7 @@ export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1
           </select>
         </label>
         <label>
-          <span>Channel</span>
+          <span>Payment channel</span>
           <select value={filters.channel} onChange={(event) => updateFilter('channel', event.target.value)}>
             <option value="">All channels</option>
             {options.channels.map((channel) => <option key={channel} value={channel}>{channel}</option>)}
@@ -764,154 +789,183 @@ export default function GeographicRiskIntelligence({ apiBase = 'http://127.0.0.1
 
       {error && <div className="error-box">{error}</div>}
 
-      <div className="risk-kpi-grid geo-kpi-grid">
-        <GeoKpi
-          label="Total transactions"
-          value={summary ? fmtNumber(summary.total_transactions) : '—'}
-          hint={summary ? `${fmtNumber(summary.transactions_with_location_information)} with location information` : 'Loading stored records'}
-          icon={MapPin}
-          tone="blue"
-        />
-        <GeoKpi
-          label="With coordinates"
-          value={summary ? fmtNumber(summary.transactions_with_coordinates) : '—'}
-          hint={summary ? `${fmtNumber(summary.located_transactions)} plotted on the map` : 'Stored or resolved coordinates'}
-          icon={Globe2}
-          tone="cyan"
-        />
-        <GeoKpi
-          label="Without coordinates"
-          value={summary ? fmtNumber(summary.transactions_without_coordinates) : '—'}
-          hint={summary ? `${fmtNumber(summary.unavailable_location_transactions)} unavailable · ${fmtNumber(summary.named_only_transactions)} named only` : 'No coordinates stored'}
-          icon={MapPin}
-          tone="blue"
-        />
-        <GeoKpi
-          label="Linked risk alerts"
-          value={summary ? fmtNumber(summary.transactions_with_linked_alerts) : '—'}
-          hint={summary ? `${fmtNumber(summary.transactions_without_linked_alerts)} without linked alerts` : 'From persisted alert linking'}
-          icon={Siren}
-          tone="red"
-        />
-        <GeoKpi
-          label="High-risk transactions"
-          value={summary ? fmtNumber(summary.high_risk_transactions) : '—'}
-          hint={summary ? `${fmtNumber(data?.high_risk_countries?.length || 0)} countries with high risk · source: ${summary.classification_source || 'calculated'}` : 'From linked alerts'}
-          icon={Siren}
-          tone="red"
-        />
-        <GeoKpi
-          label="Flagged value"
-          value={summary ? fmtCurrency(summary.flagged_value, currency) : '—'}
-          hint="Mapped transactions with linked alerts · counted once each"
-          icon={CircleDollarSign}
-          tone="amber"
-        />
-        <GeoKpi
-          label="High-risk value"
-          value={summary ? fmtCurrency(summary.high_risk_value, currency) : '—'}
-          hint="Mapped value rated high or critical"
-          icon={AlertTriangle}
-          tone="purple"
-        />
-        <GeoKpi
-          label="Countries mapped"
-          value={summary ? fmtNumber(summary.countries_count) : '—'}
-          hint={summary ? `${fmtNumber(summary.cities_count)} cities with coordinates` : 'Stored coordinates only'}
-          icon={Globe2}
-          tone="cyan"
-        />
-        <GeoKpi
-          label="Total mapped value"
-          value={summary ? fmtCurrency(summary.total_mapped_value, currency) : '—'}
-          hint={summary ? `${fmtNumber(summary.geocoded_transactions)} resolved by cached geocoder` : 'No fabricated totals'}
-          icon={Building2}
-          tone="green"
-        />
-      </div>
+      <section className="geo-block" aria-label="Geographic KPI overview">
+        <div className="geo-section-title-row">
+          <h2>Geographic KPI overview</h2>
+          <p>Summary metrics from the current filtered geographic dataset.</p>
+        </div>
+        <div className="risk-kpi-grid geo-kpi-grid">
+          <GeoKpi
+            label="Total transactions"
+            value={summary ? fmtNumber(summary.total_transactions) : '—'}
+            hint={summary ? `${fmtNumber(summary.transactions_with_location_information)} with location information` : 'Loading stored records'}
+            icon={MapPin}
+            tone="blue"
+          />
+          <GeoKpi
+            label="With coordinates"
+            value={summary ? fmtNumber(summary.transactions_with_coordinates) : '—'}
+            hint={summary ? `${fmtNumber(summary.located_transactions)} plotted on the map` : 'Stored or resolved coordinates'}
+            icon={Globe2}
+            tone="cyan"
+          />
+          <GeoKpi
+            label="Without coordinates"
+            value={summary ? fmtNumber(summary.transactions_without_coordinates) : '—'}
+            hint={summary ? `${fmtNumber(summary.unavailable_location_transactions)} unavailable · ${fmtNumber(summary.named_only_transactions)} named only` : 'No coordinates stored'}
+            icon={MapPin}
+            tone="blue"
+          />
+          <GeoKpi
+            label="Linked risk alerts"
+            value={summary ? fmtNumber(summary.transactions_with_linked_alerts) : '—'}
+            hint={summary ? `${fmtNumber(summary.transactions_without_linked_alerts)} without linked alerts` : 'From persisted alert linking'}
+            icon={Siren}
+            tone="red"
+          />
+          <GeoKpi
+            label="High-risk transactions"
+            value={summary ? fmtNumber(summary.high_risk_transactions) : '—'}
+            hint={summary ? `${fmtNumber(data?.high_risk_countries?.length || 0)} countries with high risk · source: ${summary.classification_source || 'calculated'}` : 'From linked alerts'}
+            icon={Siren}
+            tone="red"
+          />
+          <GeoKpi
+            label="Flagged value"
+            value={summary ? fmtCurrency(summary.flagged_value, currency) : '—'}
+            hint="Mapped transactions with linked alerts · counted once each"
+            icon={CircleDollarSign}
+            tone="amber"
+          />
+          <GeoKpi
+            label="High-risk value"
+            value={summary ? fmtCurrency(summary.high_risk_value, currency) : '—'}
+            hint="Mapped value rated high or critical"
+            icon={AlertTriangle}
+            tone="purple"
+          />
+          <GeoKpi
+            label="Countries mapped"
+            value={summary ? fmtNumber(summary.countries_count) : '—'}
+            hint={summary ? `${fmtNumber(summary.cities_count)} cities with coordinates` : 'Stored coordinates only'}
+            icon={Globe2}
+            tone="cyan"
+          />
+          <GeoKpi
+            label="Total mapped value"
+            value={summary ? fmtCurrency(summary.total_mapped_value, currency) : '—'}
+            hint={summary ? `${fmtNumber(summary.geocoded_transactions)} resolved by cached geocoder` : 'No fabricated totals'}
+            icon={Building2}
+            tone="green"
+          />
+        </div>
+      </section>
 
-      <div className="geo-map-layout">
-        <section className="risk-card geo-map-card">
-          <div className="risk-card-header">
-            <div>
-              <h2>Transaction risk map</h2>
-              <p>Click a marker for transaction ID, date, amount, risk reason, location and source file.</p>
+      <section className="geo-block" aria-label="Transaction risk map">
+        <div className="geo-section-title-row">
+          <h2>Transaction risk map</h2>
+          <p>Select a marker to inspect transaction location, risk reason, and source provenance.</p>
+        </div>
+        <div className="geo-map-detail-grid">
+          <section className="risk-card geo-map-card">
+            <div className="risk-card-header">
+              <div>
+                <h2>Interactive map</h2>
+                <p>Marker colour shows risk; marker size reflects transaction value. No coordinates are invented.</p>
+              </div>
+              <span className="risk-meta-pill">
+                <MapPin size={13} /> {fmtNumber(markers.length)} plotted
+              </span>
             </div>
-            <span className="risk-meta-pill">
-              <MapPin size={13} /> {fmtNumber(markers.length)} plotted
-            </span>
-          </div>
 
-          <div className="geo-map-shell">
-            <div ref={mapContainerRef} className="geo-map" role="application" aria-label="Interactive geographic risk map" />
-            <div className="geo-map-legend">
-              <span><i className="geo-legend-dot geo-legend-high" /> High / critical</span>
-              <span><i className="geo-legend-dot geo-legend-medium" /> Medium</span>
-              <span><i className="geo-legend-dot geo-legend-low" /> Low</span>
-              <small>Marker size = transaction value</small>
+            <div className="geo-map-shell" ref={mapShellRef}>
+              <div ref={mapContainerRef} className="geo-map" role="application" aria-label="Interactive geographic risk map" />
+              <div className="geo-map-legend">
+                <span><i className="geo-legend-dot geo-legend-high" /> High / critical</span>
+                <span><i className="geo-legend-dot geo-legend-medium" /> Medium</span>
+                <span><i className="geo-legend-dot geo-legend-low" /> Low</span>
+                <small>Marker size = transaction value</small>
+              </div>
+
+              {(!data || loading) && (
+                <div className="geo-map-overlay">
+                  <Loader2 size={24} className="spin" />
+                  <strong>{data ? 'Updating map…' : 'Loading geographic risk data…'}</strong>
+                  <span>Reading stored transactions and linked alerts.</span>
+                </div>
+              )}
+
+              {error && !loading && !data && (
+                <div className="geo-map-overlay geo-map-overlay-empty">
+                  <div className="risk-empty-icon"><AlertTriangle size={24} /></div>
+                  <strong>Map data unavailable</strong>
+                  <span>{error}</span>
+                </div>
+              )}
+
+              {data && !loading && !available && (
+                <div className="geo-map-overlay geo-map-overlay-empty">
+                  <div className="risk-empty-icon"><Globe2 size={24} /></div>
+                  <strong>{summary?.total_transactions_matched ? 'Location unavailable' : 'No transactions match these filters'}</strong>
+                  <span>{data.reason || 'No stored transaction has usable coordinates for this selection.'}</span>
+                  <span className="geo-overlay-hint">
+                    Import latitude/longitude columns, or enable optional cached geocoding with
+                    {' '}<code>FINAUDIT_GEOCODING_ENABLED=true</code>. No coordinates are inferred from IP addresses.
+                  </span>
+                </div>
+              )}
             </div>
 
-            {(!data || loading) && (
-              <div className="geo-map-overlay">
-                <Loader2 size={24} className="spin" />
-                <strong>{data ? 'Updating map…' : 'Loading geographic risk data…'}</strong>
-                <span>Reading stored transactions and linked alerts.</span>
-              </div>
-            )}
+            {data?.notice && <p className="geo-map-notice"><AlertTriangle size={13} /> {data.notice}</p>}
+          </section>
 
-            {error && !loading && !data && (
-              <div className="geo-map-overlay geo-map-overlay-empty">
-                <div className="risk-empty-icon"><AlertTriangle size={24} /></div>
-                <strong>Map data unavailable</strong>
-                <span>{error}</span>
-              </div>
-            )}
-
-            {data && !loading && !available && (
-              <div className="geo-map-overlay geo-map-overlay-empty">
-                <div className="risk-empty-icon"><Globe2 size={24} /></div>
-                <strong>{summary?.total_transactions_matched ? 'Location unavailable' : 'No transactions match these filters'}</strong>
-                <span>{data.reason || 'No stored transaction has usable coordinates for this selection.'}</span>
-                <span className="geo-overlay-hint">
-                  Import latitude/longitude columns, or enable optional cached geocoding with
-                  {' '}<code>FINAUDIT_GEOCODING_ENABLED=true</code>. No coordinates are inferred from IP addresses.
-                </span>
-              </div>
-            )}
+          <div className="geo-detail-slot">
+            <MarkerDetail marker={selectedMarker} onClose={() => setSelectedMarker(null)} />
           </div>
+        </div>
+      </section>
 
-          {data?.notice && <p className="geo-map-notice"><AlertTriangle size={13} /> {data.notice}</p>}
-        </section>
+      <section className="geo-block" aria-label="Regional analytics">
+        <div className="geo-section-title-row">
+          <h2>Regional analytics</h2>
+          <p>Country and city risk distribution from the current filtered map data.</p>
+        </div>
+        <div className="geo-panel-grid">
+          <CountryRiskPanel countries={countries} currency={currency} />
+          <HighRiskCitiesPanel cities={cities} markers={markers} onSelect={setSelectedMarker} />
+        </div>
+      </section>
 
-        <MarkerDetail marker={selectedMarker} onClose={() => setSelectedMarker(null)} />
-      </div>
+      <section className="geo-block" aria-label="Transaction analytics">
+        <div className="geo-section-title-row">
+          <h2>Transaction analytics</h2>
+          <p>Payment channel patterns and geographic activity trends for the current filter selection.</p>
+        </div>
+        <div className="geo-panel-grid">
+          <GeoChannelPanel analytics={channelAnalytics} currency={currency} />
+          <GeoTrendPanel trend={trend} />
+        </div>
+      </section>
 
-      <div className="geo-panel-grid">
-        <CountryRiskPanel countries={countries} currency={currency} />
-        <HighRiskCitiesPanel cities={cities} markers={markers} onSelect={setSelectedMarker} />
-      </div>
+      <section className="geo-block" aria-label="Geographic anomaly analysis">
+        <div className="geo-section-title-row">
+          <h2>Geographic anomaly analysis</h2>
+          <p>Locations with unusually high mapped activity relative to the current filtered dataset.</p>
+        </div>
+        <div className="geo-panel-grid geo-panel-grid-single">
+          <UnusualLocationsPanel locations={unusualLocations} />
+        </div>
+      </section>
 
-      <div className="geo-panel-grid">
-        <GeoChannelPanel analytics={channelAnalytics} currency={currency} />
-        <GeoTrendPanel trend={trend} />
-      </div>
-
-      <div className="geo-panel-grid">
-        <UnusualLocationsPanel locations={unusualLocations} />
-      </div>
-
-      <div className="geo-footnote">
+      <footer className="geo-footnote" aria-label="Geographic data provenance">
         <Globe2 size={14} />
         <span>
           {summary
-            ? `${fmtNumber(summary.coordinate_transactions)} markers use stored or alert coordinates; ${fmtNumber(summary.geocoded_transactions)} use cached geocoding. ${fmtNumber(summary.unavailable_location_transactions)} unavailable, ${fmtNumber(summary.named_only_transactions)} named-only and ${fmtNumber(summary.invalid_coordinate_transactions)} invalid-coordinate transactions are reported without invented markers. ${fmtPercent(
-              summary.transactions_with_location_information
-                ? (summary.located_transactions / summary.transactions_with_location_information) * 100
-                : 0
-            )} of matched transactions with location information are plotted.`
-            : 'Geographic statistics load from the backend; no demo values are shown.'}
+            ? `${fmtNumber(summary.transactions_with_coordinates)} of ${fmtNumber(summary.total_transactions_matched)} matched transactions have usable coordinates (${fmtNumber(summary.coordinate_transactions)} from stored/alert coordinates, ${fmtNumber(summary.geocoded_transactions)} from cached geocoding). ${fmtNumber(summary.transactions_without_coordinates)} lack usable coordinates (${fmtNumber(summary.unavailable_location_transactions)} unavailable, ${fmtNumber(summary.named_only_transactions)} named-only, ${fmtNumber(summary.invalid_coordinate_transactions)} invalid-coordinate). No location or coordinate is invented; unlocated records are reported without markers.`
+            : 'Geographic statistics and markers load from persisted backend records only; no location or coordinate is invented.'}
         </span>
-      </div>
+      </footer>
     </section>
   );
 }
+

@@ -37,6 +37,15 @@ class ReconciliationRun(Base):
     bank_filename = Column(String(255), nullable=False)
     ledger_filename = Column(String(255), nullable=False)
     date_tolerance_days = Column(Integer, default=3)
+    amount_tolerance = Column(Float, default=0.005)
+    run_status = Column(String(30), default="completed")
+    bank_record_count = Column(Integer, default=0)
+    ledger_record_count = Column(Integer, default=0)
+    invalid_record_count = Column(Integer, default=0)
+    duplicate_candidate_count = Column(Integer, default=0)
+    unmatched_count = Column(Integer, default=0)
+    exception_count = Column(Integer, default=0)
+    unreconciled_value = Column(Float, default=0)
     bank_total = Column(Float, default=0)
     ledger_total = Column(Float, default=0)
     matched_total = Column(Float, default=0)
@@ -53,9 +62,16 @@ class ReconciliationRun(Base):
     ambiguous_count = Column(Integer, default=0)
     bank_mapping = Column(JSON, nullable=True)
     ledger_mapping = Column(JSON, nullable=True)
+    warnings = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     results = relationship(
         "ReconciliationResult",
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+    review_actions = relationship(
+        "ReconciliationReviewAction",
         back_populates="run",
         cascade="all, delete-orphan",
     )
@@ -64,8 +80,8 @@ class ReconciliationRun(Base):
 class ReconciliationResult(Base):
     __tablename__ = "reconciliation_results"
     id = Column(Integer, primary_key=True, index=True)
-    run_id = Column(Integer, ForeignKey("reconciliation_runs.id"), nullable=False)
-    status = Column(String(30), nullable=False)
+    run_id = Column(Integer, ForeignKey("reconciliation_runs.id"), nullable=False, index=True)
+    status = Column(String(30), nullable=False, index=True)
     bank_date = Column(String(10), nullable=True)
     bank_amount = Column(Float, nullable=True)
     bank_direction = Column(String(20), nullable=True)
@@ -82,13 +98,42 @@ class ReconciliationResult(Base):
     ledger_source_row = Column(Integer, nullable=True)
     amount_difference = Column(Float, nullable=True)
     date_difference_days = Column(Integer, nullable=True)
+    match_method = Column(String(80), nullable=True)
+    explanation = Column(Text, nullable=True)
     note = Column(Text, nullable=True)
-    review_status = Column(String(30), nullable=True, default="pending")
+    review_status = Column(String(30), nullable=True, default="pending", index=True)
     reviewed_by = Column(String(255), nullable=True)
     reviewed_at = Column(DateTime, nullable=True)
     reviewer_comment = Column(Text, nullable=True)
+    resolution_note = Column(Text, nullable=True)
+    is_confirmed_match = Column(Integer, default=0, index=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     run = relationship("ReconciliationRun", back_populates="results")
+    review_actions = relationship(
+        "ReconciliationReviewAction",
+        back_populates="result",
+        cascade="all, delete-orphan",
+    )
+
+
+class ReconciliationReviewAction(Base):
+    __tablename__ = "reconciliation_review_actions"
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("reconciliation_runs.id"), nullable=False, index=True)
+    result_id = Column(Integer, ForeignKey("reconciliation_results.id"), nullable=True, index=True)
+    action = Column(String(50), nullable=False, index=True)
+    actor = Column(String(255), nullable=False)
+    comment = Column(Text, nullable=True)
+    previous_status = Column(String(30), nullable=True)
+    new_status = Column(String(30), nullable=True)
+    previous_review_status = Column(String(30), nullable=True)
+    new_review_status = Column(String(30), nullable=True)
+    details_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+    run = relationship("ReconciliationRun", back_populates="review_actions")
+    result = relationship("ReconciliationResult", back_populates="review_actions")
 
 
 class TransactionRecord(Base):

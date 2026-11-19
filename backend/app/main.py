@@ -17,7 +17,7 @@ from .csv_normalizer import COLUMN_ALIASES, normalize_files, safe_filename
 from .database import Base, engine, get_db
 from .llm import explain_finding
 from .migrations import backup_sqlite_database, ensure_database_schema, has_pending_schema_changes
-from .models import AuditRun, Finding, ReconciliationResult, ReconciliationRun, RiskAlert, TransactionRecord, InvestigationRun, InvestigationCase
+from .models import AuditRun, Finding, ReconciliationResult, ReconciliationRun, ReconciliationReviewAction, RiskAlert, TransactionRecord, InvestigationRun, InvestigationCase
 from .invoice_api import router as invoice_router
 from .investigation_api import (
     InvestigationCreate,
@@ -26,7 +26,7 @@ from .investigation_api import (
     router as investigation_router,
 )
 from .risk_api import router as risk_router
-from .reconciliation import ReconciliationError, reconcile_files
+from .reconciliation import ReconciliationError, reconcile_files, STATUSES as RECON_STATUSES
 from .category import categorize_transaction
 from .dashboard import dashboard_overview
 from . import llm, rag
@@ -520,7 +520,30 @@ def _apply_reconciliation_mapping(
     return frame.rename(columns=reverse).copy(), canonical
 
 
+def _recon_count(run: ReconciliationRun, status: str) -> int:
+    attr = f"{status}_count"
+    if hasattr(run, attr):
+        value = getattr(run, attr)
+        if value is not None:
+            return int(value)
+    return 0
+
+
 def reconciliation_summary(run: ReconciliationRun) -> dict:
+    matched_count = _recon_count(run, "matched")
+    bank_only_count = _recon_count(run, "bank_only")
+    ledger_only_count = _recon_count(run, "ledger_only")
+    amount_mismatch_count = _recon_count(run, "amount_mismatch")
+    date_mismatch_count = _recon_count(run, "date_mismatch")
+    ambiguous_count = _recon_count(run, "ambiguous")
+    invalid_record_count = _recon_count(run, "invalid_records") or int(getattr(run, "invalid_record_count", 0) or 0)
+    duplicate_candidate_count = _recon_count(run, "duplicate_candidate") or int(getattr(run, "duplicate_candidate_count", 0) or 0)
+    unmatched_count = int(getattr(run, "unmatched_count", 0) or (bank_only_count + ledger_only_count))
+    exception_count = int(getattr(run, "exception_count", 0) or (amount_mismatch_count + date_mismatch_count + ambiguous_count + invalid_record_count + duplicate_candidate_count))
+    bank_record_count = int(getattr(run, "bank_record_count", 0) or 0)
+    ledger_record_count = int(getattr(run, "ledger_record_count", 0) or 0)
+    denom = max(1.0, (bank_record_count + ledger_record_count) / 2.0) if (bank_record_count or ledger_record_count) else max(1.0, float(run.result_count or 1))
+    match_rate = round((matched_count / denom) * 100, 2)
     return {
         "bank_total": run.bank_total,
         "ledger_total": run.ledger_total,
@@ -529,21 +552,34 @@ def reconciliation_summary(run: ReconciliationRun) -> dict:
         "ledger_unmatched_total": run.ledger_unmatched_total,
         "unmatched_total": run.unmatched_total,
         "difference": run.difference,
+        "reconciliation_difference": getattr(run, "difference", 0),
+        "total_difference": getattr(run, "difference", 0),
         "result_count": run.result_count,
-        "matched_count": run.matched_count,
-        "bank_only_count": run.bank_only_count,
-        "ledger_only_count": run.ledger_only_count,
-        "amount_mismatch_count": run.amount_mismatch_count,
-        "date_mismatch_count": run.date_mismatch_count,
-        "ambiguous_count": run.ambiguous_count,
+        "matched_count": matched_count,
+        "bank_only_count": bank_only_count,
+        "ledger_only_count": ledger_only_count,
+        "amount_mismatch_count": amount_mismatch_count,
+        "date_mismatch_count": date_mismatch_count,
+        "ambiguous_count": ambiguous_count,
+        "invalid_record_count": invalid_record_count,
+        "duplicate_candidate_count": duplicate_candidate_count,
+        "unmatched_count": unmatched_count,
+        "exception_count": exception_count,
+        "unreconciled_value": getattr(run, "unreconciled_value", None),
+        "bank_record_count": bank_record_count,
+        "ledger_record_count": ledger_record_count,
+        "match_rate": match_rate,
     }
 
 
 def reconciliation_result_dict(item: ReconciliationResult) -> dict:
+    explanation = getattr(item, "explanation", None) or item.note
     return {
         "id": item.id,
         "run_id": item.run_id,
         "status": item.status,
+        "match_method": getattr(item, "match_method", None),
+        "explanation": explanation,
         "bank_date": item.bank_date,
         "bank_amount": item.bank_amount,
         "bank_direction": item.bank_direction,
@@ -565,13 +601,18 @@ def reconciliation_result_dict(item: ReconciliationResult) -> dict:
         "reviewed_by": item.reviewed_by,
         "reviewed_at": item.reviewed_at.isoformat() if item.reviewed_at else None,
         "reviewer_comment": item.reviewer_comment,
+        "resolution_note": getattr(item, "resolution_note", None),
+        "is_confirmed_match": bool(getattr(item, "is_confirmed_match", 0)),
         "created_at": item.created_at.isoformat() if item.created_at else None,
+        "updated_at": item.updated_at.isoformat() if getattr(item, "updated_at", None) else None,
     }
 
 
 RECONCILIATION_EXPORT_COLUMNS = [
     "id",
     "status",
+    "match_method",
+    "explanation",
     "bank_date",
     "bank_amount",
     "bank_direction",
@@ -588,8 +629,205 @@ RECONCILIATION_EXPORT_COLUMNS = [
     "ledger_source_row",
     "amount_difference",
     "date_difference_days",
+    "review_status",
+    "reviewed_by",
+    "reviewed_at",
+    "reviewer_comment",
+    "resolution_note",
     "note",
 ]
+
+
+def reconciliation_run_dict(run: ReconciliationRun, include_results: bool = False, include_actions: bool = False) -> dict:
+    data = {
+        "id": run.id,
+        "reconciliation_id": run.id,
+        "run_id": run.id,
+        "bank_file": run.bank_filename,
+        "ledger_file": run.ledger_filename,
+        "files": [run.bank_filename, run.ledger_filename],
+        "date_tolerance_days": run.date_tolerance_days,
+        "amount_tolerance": getattr(run, "amount_tolerance", 0.005),
+        "run_status": getattr(run, "run_status", "completed"),
+        "bank_mapping": run.bank_mapping or {},
+        "ledger_mapping": run.ledger_mapping or {},
+        "warnings": getattr(run, "warnings", None) or [],
+        "summary": reconciliation_summary(run),
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+        "updated_at": run.updated_at.isoformat() if getattr(run, "updated_at", None) else None,
+    }
+    if include_results:
+        data["results"] = [reconciliation_result_dict(item) for item in run.results]
+    if include_actions:
+        actions = getattr(run, "review_actions", []) or []
+        data["review_actions"] = [reconciliation_action_dict(a) for a in sorted(actions, key=lambda x: (x.created_at or datetime.min, x.id or 0), reverse=True)]
+    return data
+
+
+def reconciliation_action_dict(action: ReconciliationReviewAction) -> dict:
+    return {
+        "id": action.id,
+        "run_id": action.run_id,
+        "result_id": action.result_id,
+        "action": action.action,
+        "actor": action.actor,
+        "comment": action.comment,
+        "previous_status": action.previous_status,
+        "new_status": action.new_status,
+        "previous_review_status": action.previous_review_status,
+        "new_review_status": action.new_review_status,
+        "details": action.details_json or {},
+        "created_at": action.created_at.isoformat() if action.created_at else None,
+    }
+
+
+def _record_source_key(result: ReconciliationResult, side: str) -> tuple[str, str, int] | None:
+    if side == "bank":
+        if result.bank_source_file and result.bank_source_row:
+            return ("bank", str(result.bank_source_file), int(result.bank_source_row))
+        return None
+    if side == "ledger":
+        if result.ledger_source_file and result.ledger_source_row:
+            return ("ledger", str(result.ledger_source_file), int(result.ledger_source_row))
+        return None
+    return None
+
+
+def _recon_confirmed_conflict(db: Session, run_id: int, candidate: ReconciliationResult, exclude_ids: set[int] | None = None) -> str | None:
+    exclude_ids = exclude_ids or set()
+    confirmed = (
+        db.query(ReconciliationResult)
+        .filter(
+            ReconciliationResult.run_id == run_id,
+            ReconciliationResult.is_confirmed_match == 1,
+        )
+        .all()
+    )
+    candidate_bank = _record_source_key(candidate, "bank")
+    candidate_ledger = _record_source_key(candidate, "ledger")
+    for row in confirmed:
+        if row.id in exclude_ids or row.id == candidate.id:
+            continue
+        if candidate_bank and candidate_bank == _record_source_key(row, "bank"):
+            return "Bank record is already linked to a confirmed match."
+        if candidate_ledger and candidate_ledger == _record_source_key(row, "ledger"):
+            return "Ledger record is already linked to a confirmed match."
+    return None
+
+
+def _log_reconciliation_action(
+    db: Session,
+    run_id: int,
+    result_id: int | None,
+    action: str,
+    actor: str,
+    comment: str | None = None,
+    previous_status: str | None = None,
+    new_status: str | None = None,
+    previous_review_status: str | None = None,
+    new_review_status: str | None = None,
+    details: dict | None = None,
+):
+    db.add(
+        ReconciliationReviewAction(
+            run_id=run_id,
+            result_id=result_id,
+            action=action,
+            actor=actor,
+            comment=comment,
+            previous_status=previous_status,
+            new_status=new_status,
+            previous_review_status=previous_review_status,
+            new_review_status=new_review_status,
+            details_json=details or {},
+            created_at=datetime.now(timezone.utc),
+        )
+    )
+
+
+def _refresh_reconciliation_run(db: Session, run: ReconciliationRun):
+    results = list(run.results or db.query(ReconciliationResult).filter(ReconciliationResult.run_id == run.id).all())
+    counts = {status: 0 for status in RECON_STATUSES}
+    for item in results:
+        counts[item.status] = counts.get(item.status, 0) + 1
+    run.matched_count = counts.get("matched", 0)
+    run.bank_only_count = counts.get("bank_only", 0)
+    run.ledger_only_count = counts.get("ledger_only", 0)
+    run.amount_mismatch_count = counts.get("amount_mismatch", 0)
+    run.date_mismatch_count = counts.get("date_mismatch", 0)
+    run.ambiguous_count = counts.get("ambiguous", 0)
+    run.invalid_record_count = counts.get("invalid_records", 0)
+    run.duplicate_candidate_count = counts.get("duplicate_candidate", 0)
+    run.result_count = len(results)
+    run.unmatched_count = run.bank_only_count + run.ledger_only_count
+    run.exception_count = (
+        run.amount_mismatch_count
+        + run.date_mismatch_count
+        + run.ambiguous_count
+        + run.invalid_record_count
+        + run.duplicate_candidate_count
+    )
+    # derive totals from results where possible if counts fields missing; keep stored bank/ledger totals/record counts
+    reconciled_results = [r for r in results if r.status == "matched" or bool(getattr(r, "is_confirmed_match", 0))]
+    run.matched_total = round(sum(float(r.bank_amount or r.ledger_amount or 0.0) for r in reconciled_results), 2)
+    bank_open = [r for r in results if r.bank_amount is not None and r.status not in {"matched", "invalid_records", "duplicate_candidate"} and not bool(getattr(r, "is_confirmed_match", 0))]
+    ledger_open = [r for r in results if r.ledger_amount is not None and r.status not in {"matched", "invalid_records", "duplicate_candidate"} and not bool(getattr(r, "is_confirmed_match", 0))]
+    run.bank_unmatched_total = round(sum(float(r.bank_amount or 0.0) for r in bank_open), 2)
+    run.ledger_unmatched_total = round(sum(float(r.ledger_amount or 0.0) for r in ledger_open), 2)
+    run.unmatched_total = round(run.bank_unmatched_total + run.ledger_unmatched_total, 2)
+    # unreconciled value based on difference between totals and reconciled amounts
+    bank_reconciled = sum(float(r.bank_amount or 0.0) for r in reconciled_results if r.bank_amount is not None)
+    ledger_reconciled = sum(float(r.ledger_amount or 0.0) for r in reconciled_results if r.ledger_amount is not None)
+    run.unreconciled_value = round(abs(float(run.bank_total or 0.0) - bank_reconciled) + abs(float(run.ledger_total or 0.0) - ledger_reconciled), 2)
+    run.updated_at = datetime.now(timezone.utc)
+
+
+def _parse_reconciliation_inputs(
+    bank_upload: tuple[str, pd.DataFrame],
+    ledger_upload: tuple[str, pd.DataFrame],
+    bank_mapping_raw: str | None,
+    ledger_mapping_raw: str | None,
+):
+    bank_frame, applied_bank_mapping = _apply_reconciliation_mapping(bank_upload[1], bank_mapping_raw, "Bank statement")
+    ledger_frame, applied_ledger_mapping = _apply_reconciliation_mapping(ledger_upload[1], ledger_mapping_raw, "Accounting ledger")
+    return (bank_upload[0], bank_frame), (ledger_upload[0], ledger_frame), applied_bank_mapping, applied_ledger_mapping
+
+
+@app.post("/api/reconciliations/preview")
+async def preview_reconciliation(
+    bank_file: UploadFile = File(...),
+    ledger_file: UploadFile = File(...),
+    date_tolerance_days: int = Form(3),
+    amount_tolerance: float = Form(0.005),
+    bank_mapping: str | None = Form(None),
+    ledger_mapping: str | None = Form(None),
+):
+    if date_tolerance_days < 0 or date_tolerance_days > 365:
+        raise HTTPException(status_code=400, detail="date_tolerance_days must be between 0 and 365.")
+    if amount_tolerance < 0:
+        raise HTTPException(status_code=400, detail="amount_tolerance must be non-negative.")
+    bank_upload = await _read_upload_csv(bank_file, "Bank statement")
+    ledger_upload = await _read_upload_csv(ledger_file, "Accounting ledger")
+    bank, ledger, applied_bank_mapping, applied_ledger_mapping = _parse_reconciliation_inputs(bank_upload, ledger_upload, bank_mapping, ledger_mapping)
+    try:
+        outcome = reconcile_files(bank, ledger, date_tolerance_days=date_tolerance_days, amount_tolerance=amount_tolerance)
+    except ReconciliationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors) from exc
+    # preview before reconciliation: show parsed/validated/detected issues and proposed matching summary/results preview
+    preview = outcome.preview
+    return {
+        "bank_file": bank[0],
+        "ledger_file": ledger[0],
+        "date_tolerance_days": outcome.date_tolerance_days,
+        "amount_tolerance": outcome.amount_tolerance,
+        "bank_mapping": applied_bank_mapping,
+        "ledger_mapping": applied_ledger_mapping,
+        "preview": preview,
+        "proposed_summary": outcome.summary,
+        "proposed_results": outcome.results,
+        "warnings": outcome.warnings,
+        "validation_errors": [],
+    }
 
 
 @app.post("/api/reconciliations")
@@ -597,33 +835,21 @@ async def create_reconciliation(
     bank_file: UploadFile = File(...),
     ledger_file: UploadFile = File(...),
     date_tolerance_days: int = Form(3),
+    amount_tolerance: float = Form(0.005),
     bank_mapping: str | None = Form(None),
     ledger_mapping: str | None = Form(None),
     db: Session = Depends(get_db),
 ):
     if date_tolerance_days < 0 or date_tolerance_days > 365:
-        raise HTTPException(
-            status_code=400,
-            detail="date_tolerance_days must be between 0 and 365.",
-        )
-
+        raise HTTPException(status_code=400, detail="date_tolerance_days must be between 0 and 365.")
+    if amount_tolerance < 0:
+        raise HTTPException(status_code=400, detail="amount_tolerance must be non-negative.")
     bank_upload = await _read_upload_csv(bank_file, "Bank statement")
     ledger_upload = await _read_upload_csv(ledger_file, "Accounting ledger")
-    bank_frame, applied_bank_mapping = _apply_reconciliation_mapping(
-        bank_upload[1], bank_mapping, "Bank statement"
-    )
-    ledger_frame, applied_ledger_mapping = _apply_reconciliation_mapping(
-        ledger_upload[1], ledger_mapping, "Accounting ledger"
-    )
-    bank = (bank_upload[0], bank_frame)
-    ledger = (ledger_upload[0], ledger_frame)
+    bank, ledger, applied_bank_mapping, applied_ledger_mapping = _parse_reconciliation_inputs(bank_upload, ledger_upload, bank_mapping, ledger_mapping)
 
     try:
-        outcome = reconcile_files(
-            bank,
-            ledger,
-            date_tolerance_days=date_tolerance_days,
-        )
+        outcome = reconcile_files(bank, ledger, date_tolerance_days=date_tolerance_days, amount_tolerance=amount_tolerance)
     except ReconciliationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors) from exc
 
@@ -631,114 +857,332 @@ async def create_reconciliation(
     run = ReconciliationRun(
         bank_filename=bank[0],
         ledger_filename=ledger[0],
-        date_tolerance_days=date_tolerance_days,
-        bank_total=summary["bank_total"],
-        ledger_total=summary["ledger_total"],
-        matched_total=summary["matched_total"],
-        bank_unmatched_total=summary["bank_unmatched_total"],
-        ledger_unmatched_total=summary["ledger_unmatched_total"],
-        unmatched_total=summary["unmatched_total"],
-        difference=summary["difference"],
-        result_count=summary["result_count"],
-        matched_count=summary["matched_count"],
-        bank_only_count=summary["bank_only_count"],
-        ledger_only_count=summary["ledger_only_count"],
-        amount_mismatch_count=summary["amount_mismatch_count"],
-        date_mismatch_count=summary["date_mismatch_count"],
-        ambiguous_count=summary["ambiguous_count"],
+        date_tolerance_days=outcome.date_tolerance_days,
+        amount_tolerance=outcome.amount_tolerance,
+        run_status="completed",
+        bank_record_count=int(summary.get("bank_record_count", 0)),
+        ledger_record_count=int(summary.get("ledger_record_count", 0)),
+        invalid_record_count=int(summary.get("invalid_record_count", 0) or summary.get("invalid_records_count", 0) or 0),
+        duplicate_candidate_count=int(summary.get("duplicate_candidate_count", 0) or 0),
+        unmatched_count=int(summary.get("unmatched_count", 0) or 0),
+        exception_count=int(summary.get("exception_count", 0) or 0),
+        unreconciled_value=float(summary.get("unreconciled_value", 0) or 0),
+        bank_total=float(summary.get("bank_total", 0) or 0),
+        ledger_total=float(summary.get("ledger_total", 0) or 0),
+        matched_total=float(summary.get("matched_total", 0) or 0),
+        bank_unmatched_total=float(summary.get("bank_unmatched_total", 0) or 0),
+        ledger_unmatched_total=float(summary.get("ledger_unmatched_total", 0) or 0),
+        unmatched_total=float(summary.get("unmatched_total", 0) or 0),
+        difference=float(summary.get("difference", 0) or 0),
+        result_count=int(summary.get("result_count", 0) or 0),
+        matched_count=int(summary.get("matched_count", 0) or 0),
+        bank_only_count=int(summary.get("bank_only_count", 0) or 0),
+        ledger_only_count=int(summary.get("ledger_only_count", 0) or 0),
+        amount_mismatch_count=int(summary.get("amount_mismatch_count", 0) or 0),
+        date_mismatch_count=int(summary.get("date_mismatch_count", 0) or 0),
+        ambiguous_count=int(summary.get("ambiguous_count", 0) or 0),
         bank_mapping=applied_bank_mapping,
         ledger_mapping=applied_ledger_mapping,
+        warnings=outcome.warnings,
     )
     db.add(run)
     db.flush()
     for item in outcome.results:
         db.add(ReconciliationResult(run_id=run.id, **item))
+    _log_reconciliation_action(
+        db,
+        run.id,
+        None,
+        "run_created",
+        "system",
+        "Reconciliation run created from uploaded bank and ledger files.",
+        details={
+            "bank_file": run.bank_filename,
+            "ledger_file": run.ledger_filename,
+            "date_tolerance_days": run.date_tolerance_days,
+            "amount_tolerance": run.amount_tolerance,
+            "result_count": run.result_count,
+        },
+    )
     db.commit()
     db.refresh(run)
-
-    return {
-        "reconciliation_id": run.id,
-        "bank_file": run.bank_filename,
-        "ledger_file": run.ledger_filename,
-        "date_tolerance_days": run.date_tolerance_days,
-        "bank_mapping": applied_bank_mapping,
-        "ledger_mapping": applied_ledger_mapping,
-        "summary": reconciliation_summary(run),
-        "results": [reconciliation_result_dict(item) for item in run.results],
-        "warnings": outcome.warnings,
-    }
+    return {**reconciliation_run_dict(run, include_results=True), "preview": outcome.preview}
 
 
 @app.get("/api/reconciliations")
 def list_reconciliations(db: Session = Depends(get_db)):
-    runs = (
-        db.query(ReconciliationRun)
-        .order_by(ReconciliationRun.id.desc())
-        .limit(50)
-        .all()
-    )
-    return [
-        {
-            "id": run.id,
-            "reconciliation_id": run.id,
-            "bank_file": run.bank_filename,
-            "ledger_file": run.ledger_filename,
-            "files": [run.bank_filename, run.ledger_filename],
-            "date_tolerance_days": run.date_tolerance_days,
-            "bank_mapping": run.bank_mapping or {},
-            "ledger_mapping": run.ledger_mapping or {},
-            "summary": reconciliation_summary(run),
-            "created_at": run.created_at.isoformat() if run.created_at else None,
-        }
-        for run in runs
-    ]
+    runs = db.query(ReconciliationRun).order_by(ReconciliationRun.id.desc()).limit(50).all()
+    return [reconciliation_run_dict(run, include_results=False) for run in runs]
 
 
 @app.get("/api/reconciliations/{reconciliation_id}")
 def get_reconciliation(reconciliation_id: int, db: Session = Depends(get_db)):
-    run = (
-        db.query(ReconciliationRun)
-        .filter(ReconciliationRun.id == reconciliation_id)
-        .first()
-    )
+    run = db.query(ReconciliationRun).filter(ReconciliationRun.id == reconciliation_id).first()
     if not run:
         raise HTTPException(status_code=404, detail="Reconciliation not found")
-    return {
-        "reconciliation_id": run.id,
-        "bank_file": run.bank_filename,
-        "ledger_file": run.ledger_filename,
-        "date_tolerance_days": run.date_tolerance_days,
-        "bank_mapping": run.bank_mapping or {},
-        "ledger_mapping": run.ledger_mapping or {},
-        "summary": reconciliation_summary(run),
-        "results": [reconciliation_result_dict(item) for item in run.results],
-    }
+    return reconciliation_run_dict(run, include_results=True, include_actions=True)
 
 
 @app.get("/api/reconciliations/{reconciliation_id}/export.csv")
 def export_reconciliation(reconciliation_id: int, db: Session = Depends(get_db)):
-    run = (
-        db.query(ReconciliationRun)
-        .filter(ReconciliationRun.id == reconciliation_id)
-        .first()
-    )
+    run = db.query(ReconciliationRun).filter(ReconciliationRun.id == reconciliation_id).first()
     if not run:
         raise HTTPException(status_code=404, detail="Reconciliation not found")
-
     rows = [reconciliation_result_dict(item) for item in run.results]
     output = StringIO()
-    pd.DataFrame(rows, columns=RECONCILIATION_EXPORT_COLUMNS).to_csv(
-        output, index=False
-    )
+    pd.DataFrame(rows, columns=RECONCILIATION_EXPORT_COLUMNS).to_csv(output, index=False)
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
-        headers={
-            "Content-Disposition": (
-                f"attachment; filename=finaudit_reconciliation_{reconciliation_id}.csv"
-            )
-        },
+        headers={"Content-Disposition": f"attachment; filename=finaudit_reconciliation_{reconciliation_id}.csv"},
     )
+
+
+@app.post("/api/reconciliations/results/{result_id}/review")
+def review_reconciliation_result(result_id: int, payload: dict, db: Session = Depends(get_db)):
+    payload = payload or {}
+    action = str(payload.get("action") or payload.get("decision") or "").strip().lower()
+    reviewer = str(payload.get("reviewer") or payload.get("reviewed_by") or "").strip()
+    comment = payload.get("comment")
+    note = payload.get("note") or payload.get("resolution_note")
+    if not reviewer:
+        raise HTTPException(status_code=400, detail="reviewer is required")
+    allowed = {"confirm", "confirm_match", "reject", "reject_match", "mark_explained", "explained", "reopen", "add_note", "note"}
+    if action not in allowed:
+        raise HTTPException(status_code=400, detail=f"Unsupported review action: {action}")
+
+    try:
+        row = db.query(ReconciliationResult).filter(ReconciliationResult.id == result_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Reconciliation result not found")
+        run = db.query(ReconciliationRun).filter(ReconciliationRun.id == row.run_id).first()
+        if not run:
+            raise HTTPException(status_code=404, detail="Reconciliation run not found")
+        prev_status = row.status
+        prev_review = row.review_status
+        now = datetime.now(timezone.utc)
+
+        if action in {"confirm", "confirm_match"}:
+            if row.bank_source_file is None or row.ledger_source_file is None:
+                raise HTTPException(status_code=400, detail="Only paired bank/ledger results can be confirmed as a match. Use manual link for separate records.")
+            if row.status in {"invalid_records", "duplicate_candidate", "bank_only", "ledger_only"}:
+                raise HTTPException(status_code=400, detail="This result cannot be confirmed as a match.")
+            row.is_confirmed_match = 1
+            if row.status in {"ambiguous", "amount_mismatch", "date_mismatch"}:
+                row.status = "matched"
+                row.match_method = row.match_method or "manual_confirmation"
+                row.explanation = row.explanation or row.note or "Confirmed by reviewer."
+                row.note = row.explanation
+            conflict = _recon_confirmed_conflict(db, run.id, row, exclude_ids={row.id})
+            if conflict:
+                raise HTTPException(status_code=409, detail=conflict)
+            row.review_status = "confirmed"
+            row.reviewed_by = reviewer
+            row.reviewed_at = now
+            row.reviewer_comment = comment
+            if note:
+                row.resolution_note = str(note)
+            log_action = "confirm_match"
+            log_comment = comment or note
+        elif action in {"reject", "reject_match"}:
+            row.is_confirmed_match = 0
+            row.review_status = "rejected"
+            row.reviewed_by = reviewer
+            row.reviewed_at = now
+            row.reviewer_comment = comment
+            if note:
+                row.resolution_note = str(note)
+            log_action = "reject_match"
+            log_comment = comment or note
+        elif action in {"mark_explained", "explained"}:
+            row.is_confirmed_match = 0
+            row.review_status = "explained"
+            row.reviewed_by = reviewer
+            row.reviewed_at = now
+            row.reviewer_comment = comment
+            if note:
+                row.resolution_note = str(note)
+            log_action = "mark_explained"
+            log_comment = comment or note
+        elif action == "reopen":
+            row.is_confirmed_match = 0
+            row.review_status = "pending"
+            row.reviewed_by = reviewer
+            row.reviewed_at = now
+            row.reviewer_comment = comment
+            if note:
+                row.resolution_note = str(note)
+            log_action = "reopen_exception"
+            log_comment = comment or note
+        else:
+            if note:
+                row.resolution_note = (f"{row.resolution_note}\n{note}" if row.resolution_note else str(note))
+            if comment:
+                row.reviewer_comment = comment
+            row.reviewed_by = reviewer
+            row.reviewed_at = now
+            row.review_status = row.review_status or "pending"
+            log_action = "add_note"
+            log_comment = comment or note
+
+        row.updated_at = now
+        _log_reconciliation_action(
+            db,
+            run.id,
+            row.id,
+            log_action,
+            reviewer,
+            log_comment,
+            previous_status=prev_status,
+            new_status=row.status,
+            previous_review_status=prev_review,
+            new_review_status=row.review_status,
+            details={"result_id": row.id},
+        )
+        db.flush()
+        db.refresh(run)
+        run.results  # ensure loaded
+        _refresh_reconciliation_run(db, run)
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(row)
+    return {"result": reconciliation_result_dict(row), "run_summary": reconciliation_summary(run)}
+
+
+@app.post("/api/reconciliations/{reconciliation_id}/manual-link")
+def manual_link_reconciliation(reconciliation_id: int, payload: dict, db: Session = Depends(get_db)):
+    payload = payload or {}
+    reviewer = str(payload.get("reviewer") or "").strip()
+    bank_result_id = payload.get("bank_result_id")
+    ledger_result_id = payload.get("ledger_result_id")
+    comment = payload.get("comment")
+    note = payload.get("note") or payload.get("resolution_note")
+    if not reviewer:
+        raise HTTPException(status_code=400, detail="reviewer is required")
+    if not bank_result_id or not ledger_result_id:
+        raise HTTPException(status_code=400, detail="bank_result_id and ledger_result_id are required")
+
+    try:
+        run = db.query(ReconciliationRun).filter(ReconciliationRun.id == reconciliation_id).first()
+        if not run:
+            raise HTTPException(status_code=404, detail="Reconciliation not found")
+        bank_row = db.query(ReconciliationResult).filter(ReconciliationResult.id == int(bank_result_id), ReconciliationResult.run_id == reconciliation_id).first()
+        ledger_row = db.query(ReconciliationResult).filter(ReconciliationResult.id == int(ledger_result_id), ReconciliationResult.run_id == reconciliation_id).first()
+        if not bank_row or not ledger_row:
+            raise HTTPException(status_code=404, detail="Selected bank or ledger result not found")
+        if bank_row.bank_source_file is None:
+            raise HTTPException(status_code=400, detail="Selected bank result does not contain a bank record")
+        if ledger_row.ledger_source_file is None:
+            raise HTTPException(status_code=400, detail="Selected ledger result does not contain a ledger record")
+        if bank_row.id == ledger_row.id:
+            raise HTTPException(status_code=400, detail="Select different bank and ledger records")
+
+        now = datetime.now(timezone.utc)
+        amount_difference = None
+        if bank_row.bank_amount is not None and ledger_row.ledger_amount is not None:
+            amount_difference = round(float(bank_row.bank_amount) - float(ledger_row.ledger_amount), 2)
+        date_difference_days = None
+        try:
+            if bank_row.bank_date and ledger_row.ledger_date:
+                from datetime import date as _date
+                date_difference_days = abs((_date.fromisoformat(bank_row.bank_date) - _date.fromisoformat(ledger_row.ledger_date)).days)
+        except Exception:
+            date_difference_days = None
+
+        explanation = "Manually linked by reviewer as a confirmed match."
+        if comment:
+            explanation += f" Comment: {comment}"
+        manual = ReconciliationResult(
+            run_id=reconciliation_id,
+            status="matched",
+            match_method="manual_link",
+            explanation=explanation,
+            note=explanation,
+            bank_date=bank_row.bank_date,
+            bank_amount=bank_row.bank_amount,
+            bank_direction=bank_row.bank_direction,
+            bank_reference=bank_row.bank_reference,
+            bank_description=bank_row.bank_description,
+            bank_source_file=bank_row.bank_source_file,
+            bank_source_row=bank_row.bank_source_row,
+            ledger_date=ledger_row.ledger_date,
+            ledger_amount=ledger_row.ledger_amount,
+            ledger_direction=ledger_row.ledger_direction,
+            ledger_reference=ledger_row.ledger_reference,
+            ledger_description=ledger_row.ledger_description,
+            ledger_source_file=ledger_row.ledger_source_file,
+            ledger_source_row=ledger_row.ledger_source_row,
+            amount_difference=amount_difference,
+            date_difference_days=date_difference_days,
+            review_status="confirmed",
+            reviewed_by=reviewer,
+            reviewed_at=now,
+            reviewer_comment=comment,
+            resolution_note=str(note) if note else None,
+            is_confirmed_match=1,
+        )
+        db.add(manual)
+        db.flush()
+        conflict = _recon_confirmed_conflict(db, reconciliation_id, manual, exclude_ids={manual.id})
+        if conflict:
+            raise HTTPException(status_code=409, detail=conflict)
+
+        for src, side in ((bank_row, "bank"), (ledger_row, "ledger")):
+            prev_status = src.status
+            prev_review = src.review_status
+            src.is_confirmed_match = 0
+            src.review_status = "linked"
+            src.reviewed_by = reviewer
+            src.reviewed_at = now
+            src.reviewer_comment = comment
+            if note:
+                src.resolution_note = (f"{src.resolution_note}\n{note}" if src.resolution_note else str(note))
+            src.updated_at = now
+            _log_reconciliation_action(
+                db,
+                reconciliation_id,
+                src.id,
+                "manual_link_source",
+                reviewer,
+                comment or note,
+                previous_status=prev_status,
+                new_status=src.status,
+                previous_review_status=prev_review,
+                new_review_status=src.review_status,
+                details={"linked_result_id": manual.id, "side": side},
+            )
+
+        _log_reconciliation_action(
+            db,
+            reconciliation_id,
+            manual.id,
+            "manual_link",
+            reviewer,
+            comment or note,
+            previous_status=None,
+            new_status=manual.status,
+            previous_review_status=None,
+            new_review_status=manual.review_status,
+            details={"bank_result_id": bank_row.id, "ledger_result_id": ledger_row.id},
+        )
+        db.flush()
+        db.refresh(run)
+        run.results
+        _refresh_reconciliation_run(db, run)
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(manual)
+    return {"result": reconciliation_result_dict(manual), "run_summary": reconciliation_summary(run)}
 
 
 # Analytics endpoints
@@ -1375,31 +1819,29 @@ def assistant_query(payload: dict, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# Human confirmation of uncertain reconciliation matches
+# Human confirmation/review of reconciliation matches and exceptions
 # ---------------------------------------------------------------------------
 @app.post("/api/reconciliations/results/{result_id}/confirm")
 def confirm_reconciliation_result(result_id: int, payload: dict, db: Session = Depends(get_db)):
-    row = db.query(ReconciliationResult).filter(ReconciliationResult.id == result_id).first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Reconciliation result not found")
-    decision = str((payload or {}).get("decision") or "").strip().lower()
-    if decision not in {"confirmed", "rejected"}:
+    payload = dict(payload or {})
+    decision = str(payload.get("decision") or payload.get("action") or "").strip().lower()
+    if decision == "confirmed":
+        payload["action"] = "confirm_match"
+    elif decision == "rejected":
+        payload["action"] = "reject_match"
+    elif not payload.get("action"):
         raise HTTPException(status_code=400, detail="decision must be 'confirmed' or 'rejected'")
-    reviewer = str((payload or {}).get("reviewer") or "").strip()
-    if not reviewer:
-        raise HTTPException(status_code=400, detail="reviewer is required")
-    row.review_status = decision
-    row.reviewed_by = reviewer
-    row.reviewed_at = datetime.now(timezone.utc)
-    row.reviewer_comment = (payload or {}).get("comment")
-    if row.note:
-        row.note = f"{row.note}\nReview: {decision} by {reviewer}. {row.reviewer_comment or ''}".strip()
-    else:
-        row.note = f"Review: {decision} by {reviewer}. {row.reviewer_comment or ''}".strip()
-    db.commit()
-    db.refresh(row)
-    return {**reconciliation_result_dict(row), "review_status": row.review_status,
-            "reviewed_by": row.reviewed_by, "reviewed_at": row.reviewed_at.isoformat() if row.reviewed_at else None}
+    response = review_reconciliation_result(result_id, payload, db)
+    result = response.get("result", {})
+    # backward-compatible flat shape for existing clients/tests
+    result.update({
+        "review_status": result.get("review_status"),
+        "reviewed_by": result.get("reviewed_by"),
+        "reviewed_at": result.get("reviewed_at"),
+        "reviewer_comment": result.get("reviewer_comment"),
+        "run_summary": response.get("run_summary"),
+    })
+    return result
 
 
 # ---------------------------------------------------------------------------

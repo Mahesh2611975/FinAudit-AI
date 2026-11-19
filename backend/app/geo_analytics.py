@@ -50,6 +50,7 @@ class GeoFilterSet:
     start_date: date | None = None
     end_date: date | None = None
     countries: tuple[str, ...] = ()
+    cities: tuple[str, ...] = ()
     risk_levels: frozenset[str] = frozenset()
     channels: tuple[str, ...] = ()
     min_amount: float | None = None
@@ -60,6 +61,7 @@ class GeoFilterSet:
             "start_date": self.start_date.isoformat() if self.start_date else None,
             "end_date": self.end_date.isoformat() if self.end_date else None,
             "countries": list(self.countries),
+            "cities": list(self.cities),
             "risk_levels": sorted(self.risk_levels),
             "channels": list(self.channels),
             "min_amount": self.min_amount,
@@ -93,6 +95,7 @@ def parse_geo_filters(
     start_date: str | None = None,
     end_date: str | None = None,
     country: str | None = None,
+    city: str | None = None,
     risk_level: str | None = None,
     channel: str | None = None,
     min_amount: float | str | None = None,
@@ -131,6 +134,7 @@ def parse_geo_filters(
         start_date=start,
         end_date=end,
         countries=_split_values(country),
+        cities=_split_values(city),
         risk_levels=frozenset(levels),
         channels=_split_values(channel),
         min_amount=minimum,
@@ -324,6 +328,10 @@ def _base_entries(
 
         if filters.countries and _text(country).lower() not in {
             item.lower() for item in filters.countries
+        }:
+            continue
+        if filters.cities and _text(city).lower() not in {
+            item.lower() for item in filters.cities
         }:
             continue
         if filters.min_amount is not None and amount < filters.min_amount:
@@ -829,6 +837,7 @@ def geography_insights(
     start_date: str | None = None,
     end_date: str | None = None,
     country: str | None = None,
+    city: str | None = None,
     risk_level: str | None = None,
     channel: str | None = None,
     min_amount: float | str | None = None,
@@ -840,6 +849,7 @@ def geography_insights(
         start_date=start_date,
         end_date=end_date,
         country=country,
+        city=city,
         risk_level=risk_level,
         channel=channel,
         min_amount=min_amount,
