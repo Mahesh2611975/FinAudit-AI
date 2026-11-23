@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -143,6 +144,43 @@ def _amount_close(left: float | None, right: float | None, tolerance: float) -> 
     if left is None or right is None:
         return False
     return abs(left - right) <= (tolerance + AMOUNT_EPSILON)
+
+
+def _amount_difference(bank: ParsedRecord, ledger: ParsedRecord) -> float | None:
+    """Absolute amount difference, or None when either side has no valid amount."""
+    if bank.amount is None or ledger.amount is None:
+        return None
+    return abs(float(bank.amount) - float(ledger.amount))
+
+
+def _amount_validation(bank: ParsedRecord, ledger: ParsedRecord, amount_tolerance: float) -> tuple[bool, str]:
+    """Single source of truth for the amount check applied to every pair.
+
+    Returns whether the amounts may support a confirmed match and a human-readable
+    reason. A missing/invalid amount can never satisfy the check.
+    """
+    difference = _amount_difference(bank, ledger)
+    if difference is None:
+        return False, "a valid amount is missing on one side"
+    if difference <= AMOUNT_EPSILON:
+        return True, "amounts are equal"
+    if difference <= amount_tolerance + AMOUNT_EPSILON:
+        return True, (
+            f"amount difference {difference:.2f} is within the configured "
+            f"amount tolerance {amount_tolerance:g}"
+        )
+    return False, (
+        f"amount difference {difference:.2f} exceeds the configured "
+        f"amount tolerance {amount_tolerance:g}"
+    )
+
+
+def _directions_conflict(bank: ParsedRecord, ledger: ParsedRecord) -> bool:
+    return (
+        bank.direction != ledger.direction
+        and bank.direction != "unknown"
+        and ledger.direction != "unknown"
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -398,21 +436,64 @@ def _descriptions_compatible(bank: ParsedRecord, ledger: ParsedRecord) -> bool:
 
 
 def _pair_status(bank: ParsedRecord, ledger: ParsedRecord, date_tolerance_days: int, amount_tolerance: float) -> tuple[str, str, str]:
-    amount_diff = abs((bank.amount or 0.0) - (ledger.amount or 0.0))
-    date_diff = abs((bank.date - ledger.date).days) if bank.date and ledger.date else 999999
-    direction_conflict = bank.direction != ledger.direction and bank.direction != "unknown" and ledger.direction != "unknown"
+    """Classify a pair with a shared reference.
 
-    if bank.reference_key and ledger.reference_key and bank.reference_key == ledger.reference_key:
-        if direction_conflict or amount_diff > (amount_tolerance + AMOUNT_EPSILON):
-            return "amount_mismatch", "reference_amount_mismatch", "Reference matched but amount or direction differs."
-        if amount_diff <= AMOUNT_EPSILON and date_diff <= date_tolerance_days:
-            return "matched", "exact_reference_amount", "Matched using exact reference and exact amount."
-        if amount_diff <= (amount_tolerance + AMOUNT_EPSILON) and date_diff <= date_tolerance_days:
-            return "matched", "reference_amount_tolerance", "Matched using exact reference within configured amount tolerance."
-        if amount_diff <= (amount_tolerance + AMOUNT_EPSILON):
-            return "date_mismatch", "reference_date_mismatch", f"Reference and amount matched but dates differ by {date_diff} day(s) beyond tolerance."
+    A reference is only an identifier. It never bypasses amount validation:
+    amounts outside the configured tolerance (or an invalid amount) produce an
+    amount_mismatch, not a matched/confirmed result. Direction and date problems
+    are reported separately and also prevent an automatic match.
+    """
+    if not (bank.reference_key and ledger.reference_key and bank.reference_key == ledger.reference_key):
+        return "no_match", "", ""
 
-    return "no_match", "", ""
+    reference = bank.reference_key
+    amount_ok, amount_reason = _amount_validation(bank, ledger, amount_tolerance)
+    direction_conflict = _directions_conflict(bank, ledger)
+
+    # Amount is checked first: a reference match alone is never sufficient.
+    if not amount_ok:
+        return (
+            "amount_mismatch",
+            "reference_amount_mismatch",
+            f"Reference '{reference}' matched, but {amount_reason}. "
+            "Not confirmed as a financial match.",
+        )
+    if direction_conflict:
+        return (
+            "amount_mismatch",
+            "reference_direction_mismatch",
+            f"Reference '{reference}' matched and {amount_reason}, but the directions differ. "
+            "Not confirmed as a financial match.",
+        )
+
+    if bank.date is None or ledger.date is None:
+        return (
+            "date_mismatch",
+            "reference_date_mismatch",
+            f"Reference '{reference}' matched and {amount_reason}, but a transaction date is missing. "
+            "Not confirmed as a financial match.",
+        )
+    date_diff = abs((bank.date - ledger.date).days)
+    if date_diff > date_tolerance_days:
+        return (
+            "date_mismatch",
+            "reference_date_mismatch",
+            f"Reference '{reference}' matched and {amount_reason}, but the dates differ by "
+            f"{date_diff} day(s) beyond the {date_tolerance_days}-day date tolerance. "
+            "Not confirmed as a financial match.",
+        )
+
+    if (_amount_difference(bank, ledger) or 0.0) <= AMOUNT_EPSILON:
+        return (
+            "matched",
+            "exact_reference_amount",
+            f"Matched using exact reference '{reference}' and equal amounts.",
+        )
+    return (
+        "matched",
+        "reference_amount_tolerance",
+        f"Matched using exact reference '{reference}'; {amount_reason}.",
+    )
 
 
 def _summarise(bank_records: list[ParsedRecord], ledger_records: list[ParsedRecord], results: list[dict], date_tolerance_days: int, amount_tolerance: float) -> dict:
@@ -479,10 +560,12 @@ def reconcile_frames(
         raise ReconciliationError(["Date tolerance must be a non-negative whole number."])
     try:
         amount_tolerance = float(amount_tolerance)
-    except Exception:
-        raise ReconciliationError(["Amount tolerance must be a non-negative number."])
-    if amount_tolerance < 0:
-        raise ReconciliationError(["Amount tolerance must be a non-negative number."])
+    except (TypeError, ValueError):
+        raise ReconciliationError(["Amount tolerance must be a non-negative finite number."])
+    # NaN/Infinity silently defeat comparison-based amount checks (NaN makes every
+    # comparison false and Infinity accepts any difference), so reject them here.
+    if not math.isfinite(amount_tolerance) or amount_tolerance < 0:
+        raise ReconciliationError(["Amount tolerance must be a non-negative finite number."])
 
     bank_valid, bank_invalid, _, bank_warnings, bank_errors, bank_files = parse_side_records(bank_frames, "bank statement")
     ledger_valid, ledger_invalid, _, ledger_warnings, ledger_errors, ledger_files = parse_side_records(ledger_frames, "accounting ledger")
@@ -520,6 +603,34 @@ def reconcile_frames(
         used_bank.add(b.identity())
         used_ledger.add(l.identity())
 
+    def append_pair_result(
+        b: ParsedRecord,
+        l: ParsedRecord,
+        status: str,
+        method: str | None,
+        explanation: str,
+    ) -> None:
+        """Record a pair, re-checking the amount gate for every automatic match.
+
+        This is defence in depth: reference, multi-reference and amount/date
+        paths all pass through here, so a future matching rule cannot turn a
+        reference into a confirmed financial match without amount validation.
+        """
+        if status == "matched":
+            amount_ok, amount_reason = _amount_validation(b, l, amount_tolerance)
+            direction_conflict = _directions_conflict(b, l)
+            if not amount_ok or direction_conflict:
+                if b.reference_key and l.reference_key and b.reference_key == l.reference_key:
+                    method = "reference_amount_mismatch"
+                else:
+                    method = "amount_validation_mismatch"
+                details = amount_reason
+                if direction_conflict:
+                    details += "; directions differ"
+                status = "amount_mismatch"
+                explanation = f"Automatic match rejected: {details}. Not confirmed as a financial match."
+        results.append(_result_record(b, l, status, method, explanation))
+
     # handle unique reference pairs first by priority logic
     for ref in sorted(set(bank_by_ref) & set(ledger_by_ref)):
         bgroup = [r for r in bank_by_ref[ref] if r.identity() not in used_bank]
@@ -529,14 +640,7 @@ def reconcile_frames(
         if len(bgroup) == 1 and len(lgroup) == 1:
             b, l = bgroup[0], lgroup[0]
             status, method, explanation = _pair_status(b, l, date_tolerance_days, amount_tolerance)
-            if status == "no_match":
-                # exact reference but outside amount tolerance/date rules => mismatch/ambiguous by rule
-                amount_diff = abs((b.amount or 0) - (l.amount or 0))
-                if amount_diff > (amount_tolerance + AMOUNT_EPSILON) or (b.direction != l.direction and b.direction != 'unknown' and l.direction != 'unknown'):
-                    status, method, explanation = "amount_mismatch", "reference_amount_mismatch", "Reference matched but amount or direction differs."
-                else:
-                    status, method, explanation = "date_mismatch", "reference_date_mismatch", "Reference and amount matched but dates differ beyond configured tolerance."
-            results.append(_result_record(b, l, status, method, explanation))
+            append_pair_result(b, l, status, method, explanation)
             pop_pair(b, l)
             continue
         # non-unique reference groups: ambiguous unless we can find unique exact matches by amount/date inside group
@@ -547,13 +651,21 @@ def reconcile_frames(
         while made:
             made = False
             for b in list(unmatched_b):
-                candidates = [l for l in unmatched_l if _pair_status(b, l, date_tolerance_days, amount_tolerance)[0] == 'matched' and abs((b.amount or 0)-(l.amount or 0)) <= AMOUNT_EPSILON and abs((b.date-l.date).days) <= date_tolerance_days]
-                # prefer true exact amount exact date
-                candidates = [l for l in candidates if abs((b.amount or 0)-(l.amount or 0)) <= AMOUNT_EPSILON]
+                # Inside a repeated-reference group only a uniquely identifiable
+                # exact-amount/date pair may be auto-matched; amounts are checked
+                # again by _pair_status and by append_pair_result.
+                candidates = [
+                    l for l in unmatched_l
+                    if _pair_status(b, l, date_tolerance_days, amount_tolerance)[0] == "matched"
+                    and (_amount_difference(b, l) or 0.0) <= AMOUNT_EPSILON
+                    and b.date is not None
+                    and l.date is not None
+                    and abs((b.date - l.date).days) <= date_tolerance_days
+                ]
                 if len(candidates) == 1:
                     l = candidates[0]
                     status, method, explanation = _pair_status(b, l, date_tolerance_days, amount_tolerance)
-                    results.append(_result_record(b, l, status, method, explanation))
+                    append_pair_result(b, l, status, method, explanation)
                     pop_pair(b, l)
                     unmatched_b.remove(b)
                     unmatched_l.remove(l)
@@ -619,8 +731,11 @@ def reconcile_frames(
         if len(banks) == 1 and len(ledgers) == 1:
             b = remaining_bank[banks[0]]
             l = remaining_ledger[ledgers[0]]
-            explanation = "Matched using exact amount, compatible direction/description and date within configured tolerance."
-            results.append(_result_record(b, l, "matched", "amount_date_description", explanation))
+            explanation = (
+                f"Matched using equal amounts ({b.amount_value:.2f}), compatible "
+                "direction/description and date within configured tolerance."
+            )
+            append_pair_result(b, l, "matched", "amount_date_description", explanation)
             used_bank.add(b.identity())
             used_ledger.add(l.identity())
         else:

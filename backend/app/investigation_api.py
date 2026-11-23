@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from .auth import actor_name, get_current_active_user
 from .database import get_db
 from .llm import explain_finding
 from .models import (
@@ -27,6 +28,7 @@ from .models import (
     RiskAlert,
     RiskAlertEvent,
     TransactionRecord,
+    User,
 )
 
 router = APIRouter()
@@ -62,7 +64,7 @@ class InvestigationCreate(BaseModel):
     source_row: int | None = None
     assigned_to: str | None = Field(default=None, max_length=255)
     reviewer_notes: str | None = None
-    created_by: str = "system"
+    created_by: str | None = "system"
     audit_run_id: int | None = None
 
 
@@ -72,11 +74,11 @@ class InvestigationUpdate(BaseModel):
     severity: str | None = None
     resolution: str | None = None
     reviewer_notes: str | None = None
-    actor: str = "reviewer"
+    actor: str | None = "reviewer"
 
 
 class NoteCreate(BaseModel):
-    author: str = Field(..., min_length=1, max_length=255)
+    author: str | None = Field(default=None, max_length=255)
     note: str = Field(..., min_length=1)
 
 
@@ -122,12 +124,14 @@ def _event(
     previous_status: str | None = None,
     new_status: str | None = None,
     metadata: dict[str, Any] | None = None,
+    actor_user_id: int | None = None,
 ) -> None:
     db.add(
         InvestigationEvent(
             case_id=case.id,
             action=action,
             actor=actor,
+            actor_user_id=actor_user_id,
             comment=comment,
             previous_status=previous_status,
             new_status=new_status,
@@ -146,6 +150,7 @@ def _add_evidence(
     excerpt: str | None,
     metadata: dict[str, Any] | None,
     added_by: str | None,
+    added_by_user_id: int | None = None,
 ) -> InvestigationEvidence:
     item = InvestigationEvidence(
         case_id=case.id,
@@ -155,6 +160,7 @@ def _add_evidence(
         excerpt=excerpt,
         details_json=metadata,
         added_by=added_by,
+        added_by_user_id=added_by_user_id,
     )
     db.add(item)
     return item
@@ -287,10 +293,11 @@ def list_investigations(db: Session, limit: int, offset: int, status: str | None
     }
 
 
-def create_investigation(db: Session, payload: InvestigationCreate) -> dict[str, Any]:
+def create_investigation(db: Session, payload: InvestigationCreate, current_user: User | None = None) -> dict[str, Any]:
     status = _normalize_status(payload.status)
     if status not in CASE_STATUSES:
         raise HTTPException(status_code=422, detail=f"status must be one of {list(CASE_STATUSES)}")
+    creator = actor_name(current_user) if current_user else (payload.created_by or "system")
     case = InvestigationCase(
         title=(payload.title or "Financial investigation").strip(),
         description=payload.description,
@@ -302,7 +309,7 @@ def create_investigation(db: Session, payload: InvestigationCreate) -> dict[str,
         source_file=payload.source_file,
         source_row=payload.source_row,
         assigned_to=payload.assigned_to,
-        created_by=payload.created_by,
+        created_by=creator,
         reviewer_notes=payload.reviewer_notes,
     )
     db.add(case)
@@ -312,11 +319,17 @@ def create_investigation(db: Session, payload: InvestigationCreate) -> dict[str,
         db.add(
             InvestigationNote(
                 case_id=case.id,
-                author=payload.created_by,
+                author=creator,
+                author_user_id=current_user.id if current_user else None,
                 note=payload.reviewer_notes,
             )
         )
-    _event(db, case, "created", payload.created_by, previous_status=None, new_status=status)
+    _event(db, case, "created", creator, previous_status=None, new_status=status, metadata={"actor_user_id": current_user.id} if current_user else None)
+    if current_user:
+        # store actor_user_id on the event just created
+        evt = db.query(InvestigationEvent).filter(InvestigationEvent.case_id == case.id).order_by(InvestigationEvent.id.desc()).first()
+        if evt:
+            evt.actor_user_id = current_user.id
     db.commit()
     db.refresh(case)
     return _serialize_case(db, case, detailed=True)
@@ -333,18 +346,28 @@ def list_cases_endpoint(
 
 
 @router.post("/api/investigations", status_code=201)
-def create_case_endpoint(payload: InvestigationCreate, db: Session = Depends(get_db)):
-    return create_investigation(db, payload)
+def create_case_endpoint(
+    payload: InvestigationCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    return create_investigation(db, payload, current_user=current_user)
 
 
 @router.post("/api/investigations/from-alert/{alert_ref}", status_code=201)
-def create_case_from_alert(alert_ref: str, payload: dict | None = None, db: Session = Depends(get_db)):
+def create_case_from_alert(
+    alert_ref: str,
+    payload: dict | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
     payload = payload or {}
     alert = _alert_or_404(db, alert_ref)
     evidence = alert.evidence if isinstance(alert.evidence, dict) else {}
     source_file = evidence.get("source_file")
     source_row = evidence.get("source_row")
     severity = "high" if alert.severity in {"critical", "high"} else alert.severity
+    creator = actor_name(current_user)
     case = InvestigationCase(
         title=str(payload.get("title") or f"Investigation: {alert.risk_category}").strip(),
         description=str(payload.get("description") or alert.explanation),
@@ -356,7 +379,7 @@ def create_case_from_alert(alert_ref: str, payload: dict | None = None, db: Sess
         source_file=str(source_file) if source_file else None,
         source_row=int(source_row) if str(source_row or "").isdigit() else None,
         assigned_to=payload.get("assigned_to"),
-        created_by=str(payload.get("created_by") or "system"),
+        created_by=creator,
     )
     db.add(case)
     db.flush()
@@ -376,7 +399,8 @@ def create_case_from_alert(alert_ref: str, payload: dict | None = None, db: Sess
             "source_file": source_file,
             "source_row": source_row,
         },
-        added_by=case.created_by,
+        added_by=creator,
+        added_by_user_id=current_user.id,
     )
     transaction = (
         db.query(TransactionRecord)
@@ -399,17 +423,19 @@ def create_case_from_alert(alert_ref: str, payload: dict | None = None, db: Sess
                 "date": transaction.date,
                 "vendor": transaction.vendor,
             },
-            added_by=case.created_by,
+            added_by=creator,
+            added_by_user_id=current_user.id,
         )
     _event(
         db,
         case,
         "created_from_alert",
-        case.created_by,
+        creator,
         comment=f"Created from alert {alert.alert_code}",
         previous_status=None,
         new_status="open",
-        metadata={"alert_code": alert.alert_code},
+        metadata={"alert_code": alert.alert_code, "actor_user_id": current_user.id},
+        actor_user_id=current_user.id,
     )
     if alert.review_status == "open":
         alert.review_status = "investigating"
@@ -418,7 +444,8 @@ def create_case_from_alert(alert_ref: str, payload: dict | None = None, db: Sess
             RiskAlertEvent(
                 alert_id=alert.id,
                 action="investigation_created",
-                actor=case.created_by,
+                actor=creator,
+                actor_user_id=current_user.id,
                 comment=f"Investigation {case.case_number} created",
                 previous_status="open",
                 new_status="investigating",
@@ -435,9 +462,15 @@ def get_case(case_ref: str, db: Session = Depends(get_db)):
 
 
 @router.patch("/api/investigations/{case_ref}")
-def update_case(case_ref: str, payload: InvestigationUpdate, db: Session = Depends(get_db)):
+def update_case(
+    case_ref: str,
+    payload: InvestigationUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
     case = _case_or_404(db, case_ref)
     previous_status = case.status
+    actor = actor_name(current_user)
     if payload.status is not None:
         status = _normalize_status(payload.status)
         if status not in CASE_STATUSES:
@@ -455,7 +488,8 @@ def update_case(case_ref: str, payload: InvestigationUpdate, db: Session = Depen
         db.add(
             InvestigationNote(
                 case_id=case.id,
-                author=payload.actor,
+                author=actor,
+                author_user_id=current_user.id,
                 note=payload.reviewer_notes,
             )
         )
@@ -463,10 +497,11 @@ def update_case(case_ref: str, payload: InvestigationUpdate, db: Session = Depen
         db,
         case,
         "status_change" if payload.status is not None else "updated",
-        payload.actor,
+        actor,
         comment=payload.resolution or payload.reviewer_notes,
         previous_status=previous_status,
         new_status=case.status,
+        actor_user_id=current_user.id,
     )
     db.commit()
     db.refresh(case)
@@ -474,19 +509,31 @@ def update_case(case_ref: str, payload: InvestigationUpdate, db: Session = Depen
 
 
 @router.post("/api/investigations/{case_ref}/notes", status_code=201)
-def add_note(case_ref: str, payload: NoteCreate, db: Session = Depends(get_db)):
+def add_note(
+    case_ref: str,
+    payload: NoteCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
     case = _case_or_404(db, case_ref)
-    note = InvestigationNote(case_id=case.id, author=payload.author, note=payload.note)
+    author = actor_name(current_user)
+    note = InvestigationNote(case_id=case.id, author=author, author_user_id=current_user.id, note=payload.note)
     db.add(note)
-    _event(db, case, "note_added", payload.author, comment=payload.note[:300])
+    _event(db, case, "note_added", author, comment=payload.note[:300], actor_user_id=current_user.id)
     db.commit()
     db.refresh(note)
     return {"id": note.id, "author": note.author, "note": note.note, "created_at": _iso(note.created_at)}
 
 
 @router.post("/api/investigations/{case_ref}/evidence", status_code=201)
-def add_evidence(case_ref: str, payload: EvidenceCreate, db: Session = Depends(get_db)):
+def add_evidence(
+    case_ref: str,
+    payload: EvidenceCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
     case = _case_or_404(db, case_ref)
+    actor = actor_name(current_user)
     item = _add_evidence(
         db,
         case,
@@ -495,15 +542,17 @@ def add_evidence(case_ref: str, payload: EvidenceCreate, db: Session = Depends(g
         source_reference=payload.source_reference,
         excerpt=payload.excerpt,
         metadata=payload.metadata,
-        added_by=payload.added_by or "reviewer",
+        added_by=actor,
+        added_by_user_id=current_user.id,
     )
     _event(
         db,
         case,
         "evidence_added",
-        payload.added_by or "reviewer",
+        actor,
         comment=payload.source_reference,
         metadata={"source_type": payload.source_type, "source_id": payload.source_id},
+        actor_user_id=current_user.id,
     )
     db.commit()
     db.refresh(item)

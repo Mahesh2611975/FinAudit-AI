@@ -1,11 +1,14 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey, JSON, Numeric
+from sqlalchemy import Boolean, Column, Integer, String, Float, DateTime, Text, ForeignKey, JSON, Numeric
 from sqlalchemy.orm import relationship
 from .database import Base
 
 
 class AuditRun(Base):
     __tablename__ = "audit_runs"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String(255), nullable=False)
     source_files = Column(Text, nullable=True)
@@ -18,6 +21,9 @@ class AuditRun(Base):
 
 class Finding(Base):
     __tablename__ = "findings"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(Integer, ForeignKey("audit_runs.id"), nullable=False)
     transaction_id = Column(String(100), nullable=True)
@@ -33,6 +39,9 @@ class Finding(Base):
 
 class ReconciliationRun(Base):
     __tablename__ = "reconciliation_runs"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     bank_filename = Column(String(255), nullable=False)
     ledger_filename = Column(String(255), nullable=False)
@@ -79,6 +88,9 @@ class ReconciliationRun(Base):
 
 class ReconciliationResult(Base):
     __tablename__ = "reconciliation_results"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(Integer, ForeignKey("reconciliation_runs.id"), nullable=False, index=True)
     status = Column(String(30), nullable=False, index=True)
@@ -124,6 +136,7 @@ class ReconciliationReviewAction(Base):
     result_id = Column(Integer, ForeignKey("reconciliation_results.id"), nullable=True, index=True)
     action = Column(String(50), nullable=False, index=True)
     actor = Column(String(255), nullable=False)
+    actor_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     comment = Column(Text, nullable=True)
     previous_status = Column(String(30), nullable=True)
     new_status = Column(String(30), nullable=True)
@@ -138,6 +151,9 @@ class ReconciliationReviewAction(Base):
 
 class TransactionRecord(Base):
     __tablename__ = "transaction_records"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     audit_run_id = Column(Integer, ForeignKey("audit_runs.id"), nullable=True)
     transaction_id = Column(String(100), nullable=True)
@@ -177,6 +193,9 @@ class TransactionRecord(Base):
 
 class InvestigationRun(Base):
     __tablename__ = "investigation_runs"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(255), nullable=True)
     task_type = Column(String(80), nullable=True)
@@ -201,6 +220,9 @@ class InvestigationRun(Base):
 
 class InvestigationCase(Base):
     __tablename__ = "investigation_cases"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     case_number = Column(String(40), nullable=True, unique=True, index=True)
     title = Column(String(255), nullable=False)
@@ -232,6 +254,7 @@ class InvestigationNote(Base):
     id = Column(Integer, primary_key=True, index=True)
     case_id = Column(Integer, ForeignKey("investigation_cases.id"), nullable=False, index=True)
     author = Column(String(255), nullable=False)
+    author_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     note = Column(Text, nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
@@ -248,6 +271,7 @@ class InvestigationEvidence(Base):
     excerpt = Column(Text, nullable=True)
     details_json = Column(JSON, nullable=True)
     added_by = Column(String(255), nullable=True)
+    added_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
     case = relationship("InvestigationCase", back_populates="evidence")
@@ -259,6 +283,7 @@ class InvestigationEvent(Base):
     case_id = Column(Integer, ForeignKey("investigation_cases.id"), nullable=False, index=True)
     action = Column(String(50), nullable=False, index=True)
     actor = Column(String(255), nullable=True)
+    actor_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     comment = Column(Text, nullable=True)
     previous_status = Column(String(40), nullable=True)
     new_status = Column(String(40), nullable=True)
@@ -276,6 +301,9 @@ class InvestigationEvent(Base):
 
 class Vendor(Base):
     __tablename__ = "vendors"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     vendor_code = Column(String(80), nullable=True, unique=True, index=True)
     vendor_name = Column(String(255), nullable=False, index=True)
@@ -295,6 +323,9 @@ class Vendor(Base):
 
 class PurchaseOrder(Base):
     __tablename__ = "purchase_orders"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     purchase_order_number = Column(String(100), nullable=False, unique=True, index=True)
     vendor_id = Column(Integer, ForeignKey("vendors.id"), nullable=False, index=True)
@@ -333,6 +364,9 @@ class PurchaseOrderItem(Base):
 
 class GoodsReceipt(Base):
     __tablename__ = "goods_receipts"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     receipt_number = Column(String(100), nullable=False, unique=True, index=True)
     purchase_order_id = Column(Integer, ForeignKey("purchase_orders.id"), nullable=False, index=True)
@@ -365,6 +399,9 @@ class GoodsReceiptItem(Base):
 
 class Invoice(Base):
     __tablename__ = "invoices"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     vendor_id = Column(Integer, ForeignKey("vendors.id"), nullable=True, index=True)
     purchase_order_id = Column(Integer, ForeignKey("purchase_orders.id"), nullable=True, index=True)
@@ -415,6 +452,9 @@ class InvoiceItem(Base):
 
 class InvoiceDocument(Base):
     __tablename__ = "invoice_documents"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True, index=True)
     filename = Column(String(255), nullable=False)
@@ -450,6 +490,9 @@ class InvoiceMatch(Base):
 
 class InvoiceDiscrepancy(Base):
     __tablename__ = "invoice_discrepancies"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=False, index=True)
     audit_run_id = Column(Integer, ForeignKey("invoice_audit_runs.id"), nullable=True, index=True)
@@ -488,6 +531,9 @@ class InvoicePayment(Base):
 
 class InvoiceAuditRun(Base):
     __tablename__ = "invoice_audit_runs"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=False, index=True)
     workflow_run_id = Column(Integer, ForeignKey("investigation_runs.id"), nullable=True, index=True)
@@ -523,6 +569,7 @@ class InvoiceReviewAction(Base):
     id = Column(Integer, primary_key=True, index=True)
     discrepancy_id = Column(Integer, ForeignKey("invoice_discrepancies.id"), nullable=False, index=True)
     reviewer_name = Column(String(255), nullable=False)
+    reviewer_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     decision = Column(String(40), nullable=False)
     comment = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -538,6 +585,9 @@ class InvoiceReviewAction(Base):
 
 class RiskAnalysisRun(Base):
     __tablename__ = "risk_analysis_runs"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     status = Column(String(30), nullable=False, default="running", index=True)
     triggered_by = Column(String(80), nullable=True)
@@ -557,6 +607,9 @@ class RiskAnalysisRun(Base):
 
 class RiskAlert(Base):
     __tablename__ = "risk_alerts"
+
+    # Additive ownership column: NULL preserves pre-migration shared records.
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     id = Column(Integer, primary_key=True, index=True)
     alert_code = Column(String(60), nullable=False, unique=True, index=True)
     fingerprint = Column(String(128), nullable=False, unique=True, index=True)
@@ -597,6 +650,7 @@ class RiskAlertEvent(Base):
     alert_id = Column(Integer, ForeignKey("risk_alerts.id"), nullable=False, index=True)
     action = Column(String(40), nullable=False)
     actor = Column(String(255), nullable=True)
+    actor_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     comment = Column(Text, nullable=True)
     previous_status = Column(String(30), nullable=True)
     new_status = Column(String(30), nullable=True)
@@ -630,3 +684,62 @@ class GeocodeCache(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
+
+
+# ---------------------------------------------------------------------------
+# Authentication and RBAC. Passwords are stored only as strong hashes.
+# ---------------------------------------------------------------------------
+
+ROLE_ADMIN = "admin"
+ROLE_USER = "user"
+ROLE_LENDER = "lender"
+# Legacy RBAC roles are retained so existing accounts keep their permissions.
+ROLE_FINANCE_ANALYST = "finance_analyst"
+ROLE_AUDITOR = "auditor"
+ROLE_REVIEWER = "reviewer"
+ALL_ROLES = (
+    ROLE_ADMIN,
+    ROLE_USER,
+    ROLE_LENDER,
+    ROLE_FINANCE_ANALYST,
+    ROLE_AUDITOR,
+    ROLE_REVIEWER,
+)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(150), nullable=False, unique=True, index=True)
+    email = Column(String(255), nullable=True, unique=True, index=True)
+    full_name = Column(String(255), nullable=True)
+    hashed_password = Column(String(255), nullable=False)
+    role = Column(String(40), nullable=False, default=ROLE_AUDITOR, index=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    is_provisioned = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+    last_login_at = Column(DateTime, nullable=True)
+
+
+class RevokedToken(Base):
+    """Server-side revocation records for JWT logout/invalidation.
+
+    Tokens are also rejected by expiry/signature checks; this table provides
+    explicit logout and administrative revocation.
+    """
+
+    __tablename__ = "revoked_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    jti = Column(String(64), nullable=False, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    token_type = Column(String(20), nullable=False, default="access")
+    revoked_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    expires_at = Column(DateTime, nullable=True, index=True)
+    reason = Column(String(120), nullable=True)

@@ -15,6 +15,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .agents.invoice_workflow import InvoiceAuditOrchestrator
+from .auth import actor_name, get_current_active_user, require_permissions
 from .csv_normalizer import safe_filename
 from .database import get_db
 from .invoice_audit import (
@@ -43,6 +44,7 @@ from .models import (
     InvoiceReviewAction,
     PurchaseOrder,
     PurchaseOrderItem,
+    User,
     Vendor,
 )
 from .pdf_utils import build_text_pdf
@@ -225,6 +227,7 @@ def _discrepancy_dict(item: InvoiceDiscrepancy, include_reviews: bool = True) ->
             {
                 "id": action.id,
                 "reviewer_name": action.reviewer_name,
+                "reviewer_user_id": action.reviewer_user_id,
                 "decision": action.decision,
                 "comment": action.comment,
                 "created_at": action.created_at.isoformat() if action.created_at else None,
@@ -1069,7 +1072,7 @@ def get_invoice(invoice_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/api/invoices/{invoice_id}/payments")
-def create_invoice_payment(invoice_id: int, payload: dict, db: Session = Depends(get_db)):
+def create_invoice_payment(invoice_id: int, payload: dict, db: Session = Depends(get_db), current_user: User = Depends(require_permissions("invoice:write"))):
     invoice = db.get(Invoice, invoice_id)
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
@@ -1099,7 +1102,7 @@ def create_invoice_payment(invoice_id: int, payload: dict, db: Session = Depends
 
 
 @router.post("/api/invoice-payments/{payment_id}/verify")
-def verify_invoice_payment(payment_id: int, payload: dict | None = None, db: Session = Depends(get_db)):
+def verify_invoice_payment(payment_id: int, payload: dict | None = None, db: Session = Depends(get_db), current_user: User = Depends(require_permissions("invoice:write"))):
     payment = db.get(InvoicePayment, payment_id)
     if not payment:
         raise HTTPException(status_code=404, detail="Payment not found")
@@ -1113,7 +1116,7 @@ def verify_invoice_payment(payment_id: int, payload: dict | None = None, db: Ses
 
 
 @router.post("/api/invoices/{invoice_id}/audit")
-def audit_invoice(invoice_id: int, db: Session = Depends(get_db)):
+def audit_invoice(invoice_id: int, db: Session = Depends(get_db), current_user: User = Depends(require_permissions("invoice:write"))):
     if not db.get(Invoice, invoice_id):
         raise HTTPException(status_code=404, detail="Invoice not found")
     try:
@@ -1161,7 +1164,7 @@ def _audit_run_dict(run: InvoiceAuditRun, include_result: bool = True) -> dict[s
 
 
 @router.post("/api/invoice-audits/run")
-def run_invoice_audit(payload: dict, db: Session = Depends(get_db)):
+def run_invoice_audit(payload: dict, db: Session = Depends(get_db), current_user: User = Depends(require_permissions("invoice:write"))):
     try:
         invoice_id = int(payload.get("invoice_id"))
     except (TypeError, ValueError) as exc:
@@ -1322,20 +1325,26 @@ def get_discrepancy(discrepancy_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/api/discrepancies/{discrepancy_id}/review")
-def review_discrepancy(discrepancy_id: int, payload: dict, db: Session = Depends(get_db)):
+def review_discrepancy(
+    discrepancy_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("invoice:review")),
+):
     item = db.get(InvoiceDiscrepancy, discrepancy_id)
     if not item:
         raise HTTPException(status_code=404, detail="Discrepancy not found")
-    reviewer = _optional_text(payload.get("reviewer_name"))
+    # Never trust reviewer identity supplied by the client.
+    reviewer = actor_name(current_user)
     decision = _optional_text(payload.get("decision"))
-    if not reviewer:
-        raise HTTPException(status_code=422, detail="reviewer_name is required")
     allowed = {"confirmed", "dismissed", "resolved", "needs_more_evidence", "accepted_risk"}
     if decision not in allowed:
         raise HTTPException(status_code=422, detail=f"decision must be one of {sorted(allowed)}")
+    reviewer_user_id = current_user.id if db.get(User, getattr(current_user, "id", None)) else None
     action = InvoiceReviewAction(
         discrepancy_id=item.id,
         reviewer_name=reviewer,
+        reviewer_user_id=reviewer_user_id,
         decision=decision,
         comment=_optional_text(payload.get("comment")),
     )

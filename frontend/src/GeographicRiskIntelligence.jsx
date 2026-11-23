@@ -29,6 +29,7 @@ import {
   YAxis
 } from 'recharts';
 import './risk.css';
+import { apiFetch } from './api';
 
 const LOCATION_UNAVAILABLE = 'Location unavailable';
 const RISK_COLORS = {
@@ -122,11 +123,9 @@ const channelSourceLabel = (item) => {
   return 'Unknown source';
 };
 
-async function geoApi(apiBase, path, options = {}) {
-  const response = await fetch(`${apiBase}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-    ...options
-  });
+async function geoApi(_apiBase, path, options = {}) {
+  const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+  const response = await apiFetch(path, { ...options, headers });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const detail = Array.isArray(data.detail) ? data.detail.join(' ') : data.detail;

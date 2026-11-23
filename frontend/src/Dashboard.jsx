@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Area,
   AreaChart,
@@ -13,9 +13,9 @@ import {
   XAxis,
   YAxis
 } from 'recharts';
-import { AlertTriangle, ArrowLeftRight, CircleDollarSign, RefreshCw, ShieldAlert, Wallet } from 'lucide-react';
+import { AlertTriangle, ArrowLeftRight, CircleDollarSign, Loader2, RefreshCw, ShieldAlert, Wallet } from 'lucide-react';
 
-const API = (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
+import { apiFetch } from './api';
 
 const currency = (value) =>
   new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(Number(value) || 0);
@@ -41,43 +41,107 @@ function ChartFrame({ title, subtitle, children }) {
 export default function Dashboard({ onNavigate }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const loadedOnce = useRef(false);
+  const inFlight = useRef(false);
 
+  // Single source of truth for dashboard data: every KPI, chart and the recent
+  // activity table below render from the overview payload stored here.
   const load = useCallback(async () => {
-    setLoading(true);
+    if (inFlight.current) return;
+    inFlight.current = true;
+    const initialLoad = !loadedOnce.current;
+    if (initialLoad) setLoading(true);
+    else setRefreshing(true);
     setError('');
     try {
-      const response = await fetch(`${API}/api/dashboard/overview`);
+      const response = await apiFetch('/api/dashboard/overview', { cache: 'no-store' });
       if (!response.ok) throw new Error(`Dashboard request failed (${response.status})`);
-      setData(await response.json());
+      const payload = await response.json();
+      setData(payload);
+      loadedOnce.current = true;
+      setLastUpdated(new Date());
     } catch (err) {
+      // Keep the last successful payload in state so a failed refresh never
+      // wipes the numbers the user is looking at.
       setError(err.message || 'Could not load dashboard data.');
     } finally {
-      setLoading(false);
+      if (initialLoad) setLoading(false);
+      else setRefreshing(false);
+      inFlight.current = false;
     }
   }, []);
 
   useEffect(() => { load(); }, [load]);
 
-  if (loading) return <div className="panel dash-message">Loading database-backed dashboard…</div>;
-  if (error) return <div className="panel dash-message dash-error">{error}</div>;
-  if (!data) return null;
+  if (loading) return (
+    <div className="panel dash-message">
+      <Loader2 size={18} className="spin" /> Loading database-backed dashboard…
+    </div>
+  );
+  if (!data) return (
+    <div className="panel dash-message dash-error">
+      <p role="alert">{error || 'Could not load dashboard data.'}</p>
+      <button className="secondary-btn" type="button" onClick={load} disabled={loading}>
+        <RefreshCw size={15} /> Retry
+      </button>
+    </div>
+  );
 
   const metrics = data.metrics || {};
   const charts = data.charts || {};
   const recent = data.recent_activity || [];
+
+  // The overview API already contains the complete severity distribution.
+  // Derive the card detail from it instead of showing only high/critical.
+  const severityCounts = Object.fromEntries(
+    (charts.risk_distribution || []).map((item) => [item.severity, Number(item.count) || 0])
+  );
+  const severityDetail = ['critical', 'high', 'medium', 'low']
+    .map((severity) => `${number(severityCounts[severity] || 0)} ${severity}`)
+    .join(' · ');
+
+  // reconciliation_match_rate is already a percentage (0.48 means 0.48%),
+  // not a 0-1 fraction. Render it with the correct unit.
+  const matchRate = metrics.reconciliation_match_rate;
+  const matchRateLabel = matchRate == null ? 'n/a' : `${Number(matchRate).toFixed(2)}%`;
+
   const cards = [
     { label: 'Transactions', value: number(metrics.total_transactions), detail: 'All stored imports', icon: Wallet },
     { label: 'Total spending', value: currency(metrics.total_spending), detail: 'Debit-like records', icon: CircleDollarSign },
     { label: 'Net cash flow', value: currency(metrics.net_cash_flow), detail: 'Received less spending', icon: ArrowLeftRight },
-    { label: 'Risk alerts', value: number(metrics.total_risk_alerts), detail: `${number(metrics.high_risk_alerts)} high · ${number(metrics.critical_alerts)} critical`, icon: ShieldAlert },
+    { label: 'Risk alerts', value: number(metrics.total_risk_alerts), detail: severityDetail, icon: ShieldAlert },
   ];
 
   return (
     <div className="dash-workspace">
       <div className="dash-toolbar">
-        <span className="dash-source-note">All figures are computed from persisted SQLite records.</span>
-        <button className="secondary-btn" type="button" onClick={load}><RefreshCw size={15} />Reload</button>
+        <div className="dash-toolbar-note">
+          <span className="dash-source-note">All figures are computed from persisted SQLite records.</span>
+          {error ? (
+            <span className="dash-refresh-status dash-error" role="alert">
+              Refresh failed: {error}. Showing the last successful values.
+            </span>
+          ) : (
+            lastUpdated && (
+              <span className="dash-refresh-status" role="status">
+                Updated {lastUpdated.toLocaleTimeString()}
+              </span>
+            )
+          )}
+        </div>
+        <button
+          className="secondary-btn"
+          type="button"
+          onClick={load}
+          disabled={refreshing || loading}
+          aria-busy={refreshing}
+        >
+          {refreshing ? <Loader2 size={15} className="spin" /> : <RefreshCw size={15} />}
+          {refreshing ? 'Refreshing…' : 'Refresh'}
+        </button>
       </div>
 
       <div className="kpi-grid dash-kpis">
@@ -140,7 +204,10 @@ export default function Dashboard({ onNavigate }) {
           </ResponsiveContainer>
         </ChartFrame>
 
-        <ChartFrame title="Reconciliation status" subtitle="Stored match results, including possible matches">
+        <ChartFrame
+          title="Reconciliation status"
+          subtitle={`Stored match results, including possible matches · Match rate ${matchRateLabel}`}
+        >
           <ResponsiveContainer width="100%" height="100%">
             <BarChart data={charts.reconciliation_status || []} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,.16)" />

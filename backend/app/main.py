@@ -1,11 +1,12 @@
 import json
+import math
 import os
 import re
 from datetime import datetime, timezone
 from io import BytesIO, StringIO
 
 import pandas as pd
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import inspect, or_, text
@@ -17,7 +18,19 @@ from .csv_normalizer import COLUMN_ALIASES, normalize_files, safe_filename
 from .database import Base, engine, get_db
 from .llm import explain_finding
 from .migrations import backup_sqlite_database, ensure_database_schema, has_pending_schema_changes
-from .models import AuditRun, Finding, ReconciliationResult, ReconciliationRun, ReconciliationReviewAction, RiskAlert, TransactionRecord, InvestigationRun, InvestigationCase
+from .models import AuditRun, Finding, ReconciliationResult, ReconciliationRun, ReconciliationReviewAction, RiskAlert, TransactionRecord, InvestigationRun, InvestigationCase, User
+from .auth import (
+    ROLE_ADMIN,
+    ROLE_AUDITOR,
+    ROLE_FINANCE_ANALYST,
+    ROLE_REVIEWER,
+    actor_name,
+    enforce_route_permissions,
+    get_current_active_user,
+    require_permissions,
+    require_roles,
+    router as auth_router,
+)
 from .invoice_api import router as invoice_router
 from .investigation_api import (
     InvestigationCreate,
@@ -60,19 +73,34 @@ def _cors_origins() -> list[str]:
     origins = [item.strip() for item in configured.split(",") if item.strip()]
     if origins:
         return origins
+    # Common local Vite dev/preview ports on both loopback hostnames. Keeping
+    # both avoids CORS failures when the browser URL is localhost but the
+    # frontend resolves the API through 127.0.0.1 (or vice versa).
     return [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:5175",
+        "http://127.0.0.1:5175",
         "http://localhost:4173",
         "http://127.0.0.1:4173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
     ]
 
 
 app = FastAPI(title="FinAudit AI", version="1.0.0", description="Local-first financial audit exception analysis with RAG-assisted explanations.")
 app.add_middleware(CORSMiddleware, allow_origins=_cors_origins(), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-app.include_router(invoice_router)
-app.include_router(risk_router)
-app.include_router(investigation_router)
+
+# Public routes live on app; protected API routes require an authenticated user
+# and pass the centralized role/permission policy.
+protected_api = APIRouter(dependencies=[Depends(enforce_route_permissions)])
+
+app.include_router(auth_router)
+app.include_router(invoice_router, dependencies=[Depends(enforce_route_permissions)])
+app.include_router(risk_router, dependencies=[Depends(enforce_route_permissions)])
+app.include_router(investigation_router, dependencies=[Depends(enforce_route_permissions)])
 
 
 @app.get("/")
@@ -100,7 +128,7 @@ def health(db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/system/health")
+@protected_api.get("/api/system/health")
 def system_health(db: Session = Depends(get_db)):
     """Consolidated, secret-free status for the Settings screen.
 
@@ -151,7 +179,7 @@ def system_health(db: Session = Depends(get_db)):
             "database_url_configured": bool(os.getenv("FINAUDIT_DATABASE_URL", "").strip()),
             "cors_origins_configured": configured,
             "ai_provider_configurable": True,
-            "authentication_enabled": False,
+            "authentication_enabled": True,
             "secrets_exposed": False,
         },
         "deterministic_engine": "operational",
@@ -209,8 +237,12 @@ def _is_duplicate_row(row, keys: set[str], provenance: set[tuple[str, int]]) -> 
     return False
 
 
-@app.post("/api/transactions/preview")
-async def preview_transactions(file: UploadFile = File(...), db: Session = Depends(get_db)):
+@protected_api.post("/api/transactions/preview")
+async def preview_transactions(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("data:import")),
+):
     """Validate a CSV and preview normalized rows before importing it."""
     filename = safe_filename(file.filename)
     if not filename.lower().endswith(".csv"):
@@ -254,7 +286,7 @@ async def preview_transactions(file: UploadFile = File(...), db: Session = Depen
     }
 
 
-@app.post("/api/audits")
+@protected_api.post("/api/audits")
 async def create_audit(
     files: list[UploadFile] | None = File(None),
     file: UploadFile | None = File(None),
@@ -263,6 +295,7 @@ async def create_audit(
     # genuinely fresh copy of the same file must be analysed as a new snapshot.
     skip_duplicates: bool = Form(True),
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("audit:run", "data:import")),
 ):
     uploads = []
     if file is not None:
@@ -392,7 +425,7 @@ def finding_dict(f: Finding):
     }
 
 
-@app.get("/api/audits")
+@protected_api.get("/api/audits")
 def list_audits(db: Session = Depends(get_db)):
     runs = db.query(AuditRun).order_by(AuditRun.id.desc()).limit(50).all()
     return [
@@ -410,7 +443,7 @@ def list_audits(db: Session = Depends(get_db)):
     ]
 
 
-@app.get("/api/audits/{audit_id}")
+@protected_api.get("/api/audits/{audit_id}")
 def get_audit(audit_id: int, db: Session = Depends(get_db)):
     run = db.query(AuditRun).filter(AuditRun.id == audit_id).first()
     if not run:
@@ -425,7 +458,7 @@ def get_audit(audit_id: int, db: Session = Depends(get_db)):
     }
 
 
-@app.post("/api/findings/{finding_id}/explain")
+@protected_api.post("/api/findings/{finding_id}/explain")
 async def explain(finding_id: int, db: Session = Depends(get_db)):
     finding = db.query(Finding).filter(Finding.id == finding_id).first()
     if not finding:
@@ -436,8 +469,9 @@ async def explain(finding_id: int, db: Session = Depends(get_db)):
     )
 
 
-@app.get("/api/audits/{audit_id}/export.csv")
-def export_audit(audit_id: int, db: Session = Depends(get_db)):
+@protected_api.get("/api/audits/{audit_id}/export.csv")
+def export_audit(audit_id: int, db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("data:export")),):
     run = db.query(AuditRun).filter(AuditRun.id == audit_id).first()
     if not run:
         raise HTTPException(status_code=404, detail="Audit not found")
@@ -686,6 +720,7 @@ def reconciliation_action_dict(action: ReconciliationReviewAction) -> dict:
         "result_id": action.result_id,
         "action": action.action,
         "actor": action.actor,
+        "actor_user_id": action.actor_user_id,
         "comment": action.comment,
         "previous_status": action.previous_status,
         "new_status": action.new_status,
@@ -742,6 +777,7 @@ def _log_reconciliation_action(
     previous_review_status: str | None = None,
     new_review_status: str | None = None,
     details: dict | None = None,
+    actor_user_id: int | None = None,
 ):
     db.add(
         ReconciliationReviewAction(
@@ -749,6 +785,7 @@ def _log_reconciliation_action(
             result_id=result_id,
             action=action,
             actor=actor,
+            actor_user_id=actor_user_id,
             comment=comment,
             previous_status=previous_status,
             new_status=new_status,
@@ -808,7 +845,7 @@ def _parse_reconciliation_inputs(
     return (bank_upload[0], bank_frame), (ledger_upload[0], ledger_frame), applied_bank_mapping, applied_ledger_mapping
 
 
-@app.post("/api/reconciliations/preview")
+@protected_api.post("/api/reconciliations/preview")
 async def preview_reconciliation(
     bank_file: UploadFile = File(...),
     ledger_file: UploadFile = File(...),
@@ -816,11 +853,12 @@ async def preview_reconciliation(
     amount_tolerance: float = Form(0.005),
     bank_mapping: str | None = Form(None),
     ledger_mapping: str | None = Form(None),
+    current_user: User = Depends(require_permissions("reconciliation:run")),
 ):
     if date_tolerance_days < 0 or date_tolerance_days > 365:
         raise HTTPException(status_code=400, detail="date_tolerance_days must be between 0 and 365.")
-    if amount_tolerance < 0:
-        raise HTTPException(status_code=400, detail="amount_tolerance must be non-negative.")
+    if not math.isfinite(amount_tolerance) or amount_tolerance < 0:
+        raise HTTPException(status_code=400, detail="amount_tolerance must be a finite non-negative number.")
     bank_upload = await _read_upload_csv(bank_file, "Bank statement")
     ledger_upload = await _read_upload_csv(ledger_file, "Accounting ledger")
     bank, ledger, applied_bank_mapping, applied_ledger_mapping = _parse_reconciliation_inputs(bank_upload, ledger_upload, bank_mapping, ledger_mapping)
@@ -845,7 +883,7 @@ async def preview_reconciliation(
     }
 
 
-@app.post("/api/reconciliations")
+@protected_api.post("/api/reconciliations")
 async def create_reconciliation(
     bank_file: UploadFile = File(...),
     ledger_file: UploadFile = File(...),
@@ -854,11 +892,12 @@ async def create_reconciliation(
     bank_mapping: str | None = Form(None),
     ledger_mapping: str | None = Form(None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("reconciliation:run")),
 ):
     if date_tolerance_days < 0 or date_tolerance_days > 365:
         raise HTTPException(status_code=400, detail="date_tolerance_days must be between 0 and 365.")
-    if amount_tolerance < 0:
-        raise HTTPException(status_code=400, detail="amount_tolerance must be non-negative.")
+    if not math.isfinite(amount_tolerance) or amount_tolerance < 0:
+        raise HTTPException(status_code=400, detail="amount_tolerance must be a finite non-negative number.")
     bank_upload = await _read_upload_csv(bank_file, "Bank statement")
     ledger_upload = await _read_upload_csv(ledger_file, "Accounting ledger")
     bank, ledger, applied_bank_mapping, applied_ledger_mapping = _parse_reconciliation_inputs(bank_upload, ledger_upload, bank_mapping, ledger_mapping)
@@ -924,13 +963,13 @@ async def create_reconciliation(
     return {**reconciliation_run_dict(run, include_results=True), "preview": outcome.preview}
 
 
-@app.get("/api/reconciliations")
+@protected_api.get("/api/reconciliations")
 def list_reconciliations(db: Session = Depends(get_db)):
     runs = db.query(ReconciliationRun).order_by(ReconciliationRun.id.desc()).limit(50).all()
     return [reconciliation_run_dict(run, include_results=False) for run in runs]
 
 
-@app.get("/api/reconciliations/{reconciliation_id}")
+@protected_api.get("/api/reconciliations/{reconciliation_id}")
 def get_reconciliation(reconciliation_id: int, db: Session = Depends(get_db)):
     run = db.query(ReconciliationRun).filter(ReconciliationRun.id == reconciliation_id).first()
     if not run:
@@ -938,8 +977,9 @@ def get_reconciliation(reconciliation_id: int, db: Session = Depends(get_db)):
     return reconciliation_run_dict(run, include_results=True, include_actions=True)
 
 
-@app.get("/api/reconciliations/{reconciliation_id}/export.csv")
-def export_reconciliation(reconciliation_id: int, db: Session = Depends(get_db)):
+@protected_api.get("/api/reconciliations/{reconciliation_id}/export.csv")
+def export_reconciliation(reconciliation_id: int, db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("data:export")),):
     run = db.query(ReconciliationRun).filter(ReconciliationRun.id == reconciliation_id).first()
     if not run:
         raise HTTPException(status_code=404, detail="Reconciliation not found")
@@ -953,18 +993,25 @@ def export_reconciliation(reconciliation_id: int, db: Session = Depends(get_db))
     )
 
 
-@app.post("/api/reconciliations/results/{result_id}/review")
-def review_reconciliation_result(result_id: int, payload: dict, db: Session = Depends(get_db)):
+@protected_api.post("/api/reconciliations/results/{result_id}/review")
+def review_reconciliation_result(
+    result_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
     payload = payload or {}
     action = str(payload.get("action") or payload.get("decision") or "").strip().lower()
-    reviewer = str(payload.get("reviewer") or payload.get("reviewed_by") or "").strip()
     comment = payload.get("comment")
     note = payload.get("note") or payload.get("resolution_note")
-    if not reviewer:
-        raise HTTPException(status_code=400, detail="reviewer is required")
+    reviewer = actor_name(current_user)
     allowed = {"confirm", "confirm_match", "reject", "reject_match", "mark_explained", "explained", "reopen", "add_note", "note"}
     if action not in allowed:
         raise HTTPException(status_code=400, detail=f"Unsupported review action: {action}")
+    if action in {"confirm", "confirm_match", "reject", "reject_match"}:
+        # Only authorized reviewers may approve/confirm or reject a match.
+        if current_user.role not in {ROLE_ADMIN, ROLE_REVIEWER}:
+            raise HTTPException(status_code=403, detail="Reviewer role required to confirm or reject reconciliation matches.")
 
     try:
         row = db.query(ReconciliationResult).filter(ReconciliationResult.id == result_id).first()
@@ -1052,7 +1099,8 @@ def review_reconciliation_result(result_id: int, payload: dict, db: Session = De
             new_status=row.status,
             previous_review_status=prev_review,
             new_review_status=row.review_status,
-            details={"result_id": row.id},
+            details={"result_id": row.id, "actor_user_id": current_user.id},
+            actor_user_id=current_user.id,
         )
         db.flush()
         db.refresh(run)
@@ -1069,16 +1117,19 @@ def review_reconciliation_result(result_id: int, payload: dict, db: Session = De
     return {"result": reconciliation_result_dict(row), "run_summary": reconciliation_summary(run)}
 
 
-@app.post("/api/reconciliations/{reconciliation_id}/manual-link")
-def manual_link_reconciliation(reconciliation_id: int, payload: dict, db: Session = Depends(get_db)):
+@protected_api.post("/api/reconciliations/{reconciliation_id}/manual-link")
+def manual_link_reconciliation(
+    reconciliation_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(ROLE_ADMIN, ROLE_REVIEWER)),
+):
     payload = payload or {}
-    reviewer = str(payload.get("reviewer") or "").strip()
+    reviewer = actor_name(current_user)
     bank_result_id = payload.get("bank_result_id")
     ledger_result_id = payload.get("ledger_result_id")
     comment = payload.get("comment")
     note = payload.get("note") or payload.get("resolution_note")
-    if not reviewer:
-        raise HTTPException(status_code=400, detail="reviewer is required")
     if not bank_result_id or not ledger_result_id:
         raise HTTPException(status_code=400, detail="bank_result_id and ledger_result_id are required")
 
@@ -1169,7 +1220,8 @@ def manual_link_reconciliation(reconciliation_id: int, payload: dict, db: Sessio
                 new_status=src.status,
                 previous_review_status=prev_review,
                 new_review_status=src.review_status,
-                details={"linked_result_id": manual.id, "side": side},
+                details={"linked_result_id": manual.id, "side": side, "actor_user_id": current_user.id},
+                actor_user_id=current_user.id,
             )
 
         _log_reconciliation_action(
@@ -1183,7 +1235,8 @@ def manual_link_reconciliation(reconciliation_id: int, payload: dict, db: Sessio
             new_status=manual.status,
             previous_review_status=None,
             new_review_status=manual.review_status,
-            details={"bank_result_id": bank_row.id, "ledger_result_id": ledger_row.id},
+            details={"bank_result_id": bank_row.id, "ledger_result_id": ledger_row.id, "actor_user_id": current_user.id},
+            actor_user_id=current_user.id,
         )
         db.flush()
         db.refresh(run)
@@ -1201,7 +1254,7 @@ def manual_link_reconciliation(reconciliation_id: int, payload: dict, db: Sessio
 
 
 # Analytics endpoints
-@app.get("/api/analytics/monthly/summary")
+@protected_api.get("/api/analytics/monthly/summary")
 def analytics_monthly_summary(year: int, month: int, db: Session = Depends(get_db)):
     try:
         analysis = monthly_analysis(db, year, month)
@@ -1230,7 +1283,7 @@ def analytics_monthly_summary(year: int, month: int, db: Session = Depends(get_d
     }
 
 
-@app.get("/api/analytics/monthly/categories")
+@protected_api.get("/api/analytics/monthly/categories")
 def analytics_monthly_categories(year: int, month: int, db: Session = Depends(get_db)):
     try:
         analysis = monthly_analysis(db, year, month)
@@ -1239,7 +1292,7 @@ def analytics_monthly_categories(year: int, month: int, db: Session = Depends(ge
     return analysis["category_totals"]
 
 
-@app.get("/api/analytics/transactions")
+@protected_api.get("/api/analytics/transactions")
 def analytics_transactions(year: int | None = None, month: int | None = None, category: str | None = None, q: str | None = None, limit: int = 200, db: Session = Depends(get_db)):
     query = db.query(TransactionRecord)
     if year and month:
@@ -1273,7 +1326,7 @@ def analytics_transactions(year: int | None = None, month: int | None = None, ca
     ]
 
 
-@app.get("/api/analytics/monthly/comparison")
+@protected_api.get("/api/analytics/monthly/comparison")
 def analytics_monthly_comparison(year: int, month: int, db: Session = Depends(get_db)):
     try:
         return monthly_comparison(db, year, month)
@@ -1281,8 +1334,9 @@ def analytics_monthly_comparison(year: int, month: int, db: Session = Depends(ge
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/analytics/export.csv")
-def analytics_export_csv(year: int | None = None, month: int | None = None, db: Session = Depends(get_db)):
+@protected_api.get("/api/analytics/export.csv")
+def analytics_export_csv(year: int | None = None, month: int | None = None, db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("data:export")),):
     query = db.query(TransactionRecord)
     if year and month:
         if month < 1 or month > 12:
@@ -1315,8 +1369,12 @@ from .agents.orchestrator import MultiAgentOrchestrator
 _orch = MultiAgentOrchestrator()
 
 
-@app.post("/api/agents/run")
-def run_agents(payload: dict, db: Session = Depends(get_db)):
+@protected_api.post("/api/agents/run")
+def run_agents(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("assistant:use")),
+):
     try:
         if payload.get("task_type") == "invoice_audit":
             from .invoice_api import _invoice_orch
@@ -1327,8 +1385,9 @@ def run_agents(payload: dict, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.get("/api/agents/runs")
-def list_agent_runs(limit: int = 50, db: Session = Depends(get_db)):
+@protected_api.get("/api/agents/runs")
+def list_agent_runs(limit: int = 50, db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("assistant:use")),):
     runs = db.query(InvestigationRun).order_by(InvestigationRun.id.desc()).limit(min(limit, 200)).all()
     return [
         {
@@ -1354,8 +1413,9 @@ def list_agent_runs(limit: int = 50, db: Session = Depends(get_db)):
     ]
 
 
-@app.get("/api/agents/runs/{run_id}")
-def get_agent_run(run_id: int, db: Session = Depends(get_db)):
+@protected_api.get("/api/agents/runs/{run_id}")
+def get_agent_run(run_id: int, db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("assistant:use")),):
     r = db.query(InvestigationRun).filter(InvestigationRun.id == run_id).first()
     if not r:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -1383,13 +1443,17 @@ def get_agent_run(run_id: int, db: Session = Depends(get_db)):
     }
 
 
-@app.post("/api/cases")
-def create_case(payload: InvestigationCreate, db: Session = Depends(get_db)):
+@protected_api.post("/api/cases")
+def create_case(
+    payload: InvestigationCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
     """Legacy alias; full investigation workflow lives under /api/investigations."""
-    return create_investigation(db, payload)
+    return create_investigation(db, payload, current_user=current_user)
 
 
-@app.get("/api/cases")
+@protected_api.get("/api/cases")
 def list_cases(limit: int = 50, db: Session = Depends(get_db)):
     """Legacy alias returning the historical array shape."""
     return list_investigations(db, limit, 0, None)["items"]
@@ -1398,7 +1462,7 @@ def list_cases(limit: int = 50, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # Dashboard (all figures derived from persisted records)
 # ---------------------------------------------------------------------------
-@app.get("/api/dashboard/overview")
+@protected_api.get("/api/dashboard/overview")
 def dashboard_metrics(db: Session = Depends(get_db)):
     return dashboard_overview(db)
 
@@ -1444,7 +1508,7 @@ def _filtered_transaction_query(
     return query
 
 
-@app.get("/api/transactions")
+@protected_api.get("/api/transactions")
 def search_transactions(
     q: str | None = None,
     date_from: str | None = None,
@@ -1497,7 +1561,7 @@ def search_transactions(
     }
 
 
-@app.get("/api/transactions/export.csv")
+@protected_api.get("/api/transactions/export.csv")
 def export_transactions(
     q: str | None = None,
     date_from: str | None = None,
@@ -1508,7 +1572,7 @@ def export_transactions(
     source_file: str | None = None,
     limit: int = 10000,
     db: Session = Depends(get_db),
-):
+    current_user: User = Depends(require_permissions("data:export")),):
     query = _filtered_transaction_query(
         db,
         q=q,
@@ -1567,7 +1631,7 @@ def export_transactions(
     )
 
 
-@app.get("/api/transactions/{transaction_ref}")
+@protected_api.get("/api/transactions/{transaction_ref}")
 def transaction_detail(transaction_ref: str, db: Session = Depends(get_db)):
     filters = [
         TransactionRecord.transaction_id == transaction_ref,
@@ -1640,8 +1704,11 @@ def transaction_detail(transaction_ref: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # RAG document ingestion and introspection
 # ---------------------------------------------------------------------------
-@app.post("/api/documents/ingest")
-async def ingest_documents(files: list[UploadFile] = File(...)):
+@protected_api.post("/api/documents/ingest")
+async def ingest_documents(
+    files: list[UploadFile] = File(...),
+    current_user: User = Depends(require_permissions("documents:write")),
+):
     if not files:
         raise HTTPException(status_code=400, detail="Upload at least one document.")
     if len(files) > 20:
@@ -1663,12 +1730,15 @@ async def ingest_documents(files: list[UploadFile] = File(...)):
     return {"results": results, "stats": rag.store_stats()}
 
 
-@app.post("/api/documents/sync-transactions")
-def sync_transactions_to_rag(db: Session = Depends(get_db)):
+@protected_api.post("/api/documents/sync-transactions")
+def sync_transactions_to_rag(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("documents:write")),
+):
     return rag.ingest_transactions(db)
 
 
-@app.get("/api/documents")
+@protected_api.get("/api/documents")
 def list_documents(limit: int = 50):
     stats = rag.store_stats()
     return {
@@ -1678,7 +1748,7 @@ def list_documents(limit: int = 50):
     }
 
 
-@app.get("/api/documents/status")
+@protected_api.get("/api/documents/status")
 def document_index_status():
     stats = rag.store_stats()
     chunks = int(stats.get("chunks") or 0)
@@ -1694,7 +1764,7 @@ def document_index_status():
     }
 
 
-@app.get("/api/documents/{doc_id}/status")
+@protected_api.get("/api/documents/{doc_id}/status")
 def document_status(doc_id: str):
     item = rag.document_status(doc_id)
     if not item:
@@ -1702,19 +1772,24 @@ def document_status(doc_id: str):
     return item
 
 
-@app.delete("/api/documents/{doc_id}")
-def delete_document(doc_id: str):
+@protected_api.delete("/api/documents/{doc_id}")
+def delete_document(
+    doc_id: str,
+    current_user: User = Depends(require_permissions("documents:write")),
+):
     if not rag.delete_document(doc_id):
         raise HTTPException(status_code=404, detail="Document not found")
     return {"deleted": doc_id, "stats": rag.store_stats()}
 
 
-@app.post("/api/documents/reindex")
-def reindex_documents():
+@protected_api.post("/api/documents/reindex")
+def reindex_documents(
+    current_user: User = Depends(require_permissions("documents:write")),
+):
     return {"reindexed": True, "stats": rag.reindex()}
 
 
-@app.post("/api/documents/retrieval-test")
+@protected_api.post("/api/documents/retrieval-test")
 def retrieval_test(payload: dict):
     query = str((payload or {}).get("query") or "").strip()
     if not query:
@@ -1734,7 +1809,7 @@ def retrieval_test(payload: dict):
 # ---------------------------------------------------------------------------
 # AI Assistant (selective LangGraph workflow + grounded Ollama answer)
 # ---------------------------------------------------------------------------
-@app.get("/api/assistant/suggestions")
+@protected_api.get("/api/assistant/suggestions")
 def assistant_suggestions():
     return {
         "questions": [
@@ -1749,7 +1824,7 @@ def assistant_suggestions():
     }
 
 
-@app.get("/api/assistant/config")
+@protected_api.get("/api/assistant/config")
 def assistant_config():
     return {
         "backend": "ollama",
@@ -1760,7 +1835,7 @@ def assistant_config():
     }
 
 
-@app.post("/api/assistant/query")
+@protected_api.post("/api/assistant/query")
 def assistant_query(payload: dict, db: Session = Depends(get_db)):
     question = str((payload or {}).get("question") or "").strip()
     if not question:
@@ -1836,8 +1911,13 @@ def assistant_query(payload: dict, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # Human confirmation/review of reconciliation matches and exceptions
 # ---------------------------------------------------------------------------
-@app.post("/api/reconciliations/results/{result_id}/confirm")
-def confirm_reconciliation_result(result_id: int, payload: dict, db: Session = Depends(get_db)):
+@protected_api.post("/api/reconciliations/results/{result_id}/confirm")
+def confirm_reconciliation_result(
+    result_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(ROLE_ADMIN, ROLE_REVIEWER)),
+):
     payload = dict(payload or {})
     decision = str(payload.get("decision") or payload.get("action") or "").strip().lower()
     if decision == "confirmed":
@@ -1846,7 +1926,7 @@ def confirm_reconciliation_result(result_id: int, payload: dict, db: Session = D
         payload["action"] = "reject_match"
     elif not payload.get("action"):
         raise HTTPException(status_code=400, detail="decision must be 'confirmed' or 'rejected'")
-    response = review_reconciliation_result(result_id, payload, db)
+    response = review_reconciliation_result(result_id, payload, db, current_user=current_user)
     result = response.get("result", {})
     # backward-compatible flat shape for existing clients/tests
     result.update({
@@ -1896,8 +1976,9 @@ def _investigation_explanation(run: InvestigationRun) -> dict:
     }
 
 
-@app.get("/api/reports/summary")
-def report_summary(db: Session = Depends(get_db)):
+@protected_api.get("/api/reports/summary")
+def report_summary(db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("reports:read")),):
     overview = dashboard_overview(db)
     latest_recon = db.query(ReconciliationRun).order_by(ReconciliationRun.id.desc()).first()
     alerts = db.query(RiskAlert).order_by(RiskAlert.risk_score.desc()).limit(20).all()
@@ -1950,8 +2031,9 @@ def report_summary(db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/reports/full.csv")
-def report_full_csv(db: Session = Depends(get_db)):
+@protected_api.get("/api/reports/full.csv")
+def report_full_csv(db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("reports:read", "data:export")),):
     output = StringIO()
     rows = []
     for item in db.query(TransactionRecord).limit(10000).all():
@@ -2032,8 +2114,9 @@ def report_full_csv(db: Session = Depends(get_db)):
                              headers={"Content-Disposition": "attachment; filename=finaudit_full_report.csv"})
 
 
-@app.get("/api/reports/full.pdf")
-def report_full_pdf(db: Session = Depends(get_db)):
+@protected_api.get("/api/reports/full.pdf")
+def report_full_pdf(db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("reports:read", "data:export")),):
     overview = dashboard_overview(db)
     lines = ["FINANCIAL INTELLIGENCE REPORT", "Automated indicators for human review - not proof of fraud", ""]
     lines.append(f"Generated at (UTC): {datetime.now(timezone.utc).isoformat()}")
@@ -2083,3 +2166,5 @@ def report_full_pdf(db: Session = Depends(get_db)):
     return StreamingResponse(iter([build_text_pdf("FinAudit AI - Financial Intelligence Report", lines)]),
                              media_type="application/pdf",
                              headers={"Content-Disposition": "attachment; filename=finaudit_full_report.pdf"})
+
+app.include_router(protected_api)

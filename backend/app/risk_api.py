@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from .auth import actor_name, get_current_active_user, require_permissions
 from .database import get_db
 from .geo_analytics import (
     geography_cities,
@@ -24,7 +25,7 @@ from .geo_analytics import (
 )
 from .geocoding import geocoding_status
 from .llm import explain_finding
-from .models import RiskAlert, RiskAlertEvent, RiskAnalysisRun
+from .models import RiskAlert, RiskAlertEvent, RiskAnalysisRun, User
 from .risk_engine import (
     CANONICAL_CHANNELS,
     CATEGORY_LABELS,
@@ -260,7 +261,12 @@ def get_risk_alert(alert_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/api/risk/alerts/{alert_id}/review")
-def review_risk_alert(alert_id: str, payload: dict, db: Session = Depends(get_db)):
+def review_risk_alert(
+    alert_id: str,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("risk:review")),
+):
     alert = _alert_or_404(db, alert_id)
     action = str(payload.get("action") or "comment").strip().lower()
     if action not in {"assign", "resolve", "reopen", "investigate", "comment", "status"}:
@@ -268,9 +274,8 @@ def review_risk_alert(alert_id: str, payload: dict, db: Session = Depends(get_db
             status_code=422,
             detail="action must be assign, resolve, reopen, investigate, comment or status",
         )
-    actor = str(payload.get("reviewer_name") or payload.get("actor") or "").strip()
-    if not actor:
-        raise HTTPException(status_code=422, detail="reviewer_name is required")
+    # Never trust reviewer identity supplied by the client.
+    actor = actor_name(current_user)
 
     requested_status = payload.get("review_status") or payload.get("status")
     if requested_status is None:
@@ -311,6 +316,7 @@ def review_risk_alert(alert_id: str, payload: dict, db: Session = Depends(get_db
         alert_id=alert.id,
         action=action,
         actor=actor,
+        actor_user_id=current_user.id,
         comment=alert.reviewer_comments if comment is not None else None,
         previous_status=previous_status,
         new_status=requested_status,
@@ -322,7 +328,11 @@ def review_risk_alert(alert_id: str, payload: dict, db: Session = Depends(get_db
 
 
 @router.post("/api/risk/analyze")
-def analyze_risk(payload: dict | None = None, db: Session = Depends(get_db)):
+def analyze_risk(
+    payload: dict | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("risk:analyze")),
+):
     payload = payload or {}
     overrides = payload.get("thresholds")
     if not isinstance(overrides, dict):
@@ -344,7 +354,7 @@ def analyze_risk(payload: dict | None = None, db: Session = Depends(get_db)):
         result = run_analysis(
             db,
             thresholds=thresholds,
-            triggered_by=str(payload.get("triggered_by") or "manual"),
+            triggered_by=actor_name(current_user),
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

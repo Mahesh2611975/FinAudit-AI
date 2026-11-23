@@ -10,7 +10,7 @@ import {
   X
 } from 'lucide-react';
 
-const API = (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
+import { apiFetch } from './api';
 
 const money = (value) =>
   new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 2 }).format(Number(value) || 0);
@@ -18,7 +18,7 @@ const money = (value) =>
 const text = (value) => (value === null || value === undefined || value === '' ? '—' : String(value));
 
 async function jsonRequest(path, options = {}) {
-  const response = await fetch(`${API}${path}`, options);
+  const response = await apiFetch(path, options);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const detail = Array.isArray(data.detail) ? data.detail.join(' ') : data.detail;

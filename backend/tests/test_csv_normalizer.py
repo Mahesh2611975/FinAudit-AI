@@ -316,3 +316,30 @@ def test_coordinate_pairs_are_validated_together():
     assert frame.iloc[2]["longitude"] == 20.5
     assert any("Latitude 999" in warning for warning in result.warnings)
     assert any("Incomplete latitude/longitude pair" in warning for warning in result.warnings)
+
+
+def test_iso_timestamp_dates_are_parsed_without_day_month_swap():
+    from app.csv_normalizer import _parse_date
+
+    # Regression: timestamps must not be parsed with dayfirst=True and swapped.
+    assert _parse_date("2025-08-05T00:00:00") == "2025-08-05"
+    assert _parse_date("2025-02-03T00:00:00") == "2025-02-03"
+    assert _parse_date("2025-04-05T00:00:00") == "2025-04-05"
+    assert _parse_date("2025-01-02T00:00:00") == "2025-01-02"
+    assert _parse_date("2025-08-05 00:00:00") == "2025-08-05"
+    assert _parse_date("2025-12-01T10:30:00Z") == "2025-12-01"
+    assert _parse_date("2025-11-12 23:59:59") == "2025-11-12"
+    # Unambiguous day>12 still parses correctly.
+    assert _parse_date("2025-01-13T00:00:00") == "2025-01-13"
+
+
+def test_iso_timestamp_dates_normalize_through_csv_import():
+    rows = pd.DataFrame(
+        [
+            {"date": "2025-08-05T00:00:00", "amount": "10", "vendor": "A"},
+            {"date": "2025-01-02 00:00:00", "amount": "20", "vendor": "B"},
+        ]
+    )
+    result = normalize_files([("timestamps.csv", rows)])
+    assert result.errors == []
+    assert list(result.frame["date"]) == ["2025-08-05", "2025-01-02"]

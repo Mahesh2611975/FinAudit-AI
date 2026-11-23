@@ -27,6 +27,7 @@ import {
   History,
   LayoutDashboard,
   Loader2,
+  LogOut,
   Menu,
   PackageCheck,
   PieChart as PieChartIcon,
@@ -60,15 +61,26 @@ import {
 } from 'recharts';
 import './style.css';
 import './workspace.css';
+import './landing.css';
+import LandingPage from './LandingPage';
 import RiskIntelligence from './RiskIntelligence';
 import GeographicRiskIntelligence from './GeographicRiskIntelligence';
 import Dashboard from './Dashboard';
 import Transactions from './Transactions';
 import Assistant from './Assistant';
-
-const API = (
-  import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
-).trim().replace(/\/+$/, '').replace(/\/api$/, '');
+import {
+  API,
+  LOCAL_DEMO_MODE,
+  apiFetch,
+  apiJson,
+  clearAuth,
+  downloadApi,
+  getAuthToken,
+  getAuthUser,
+  getDemoStatus,
+  requestDemoSession,
+  setAuth
+} from './api';
 
 // Health polling: the lightweight /api/health probe is fast, but a transient
 // failure (cold start, brief network hiccup) must not leave the sidebar stuck
@@ -134,6 +146,7 @@ const SIDEBAR_GROUPS = [
     id: 'administration',
     label: 'Administration',
     items: [
+      { navId: 'admin-users', view: 'admin-users', label: 'User Management', icon: Users },
       { navId: 'settings', view: 'settings', label: 'Settings', icon: Settings }
     ]
   }
@@ -148,10 +161,54 @@ const ALL_NAV_ITEMS = [
   { id: 'analytics' },
   { id: 'monitoring' },
   { id: 'investigations' },
-  { id: 'compliance' }
+  { id: 'compliance' },
+  { id: 'admin-dashboard' },
+  { id: 'lender-dashboard' },
+  { id: 'user-dashboard' }
 ];
 
 const ROUTABLE_VIEW_IDS = new Set(ALL_NAV_ITEMS.map((item) => item.id));
+
+// Backend-verified dashboard targets. The API owns the role-to-dashboard
+// mapping; these values are mirrored only so the SPA can route the response.
+const DASHBOARD_VIEWS = new Set(['admin-dashboard', 'lender-dashboard', 'user-dashboard']);
+const DASHBOARD_REFRESH_VIEWS = new Set([...DASHBOARD_VIEWS, 'overview', 'admin-users']);
+
+const ROLE_DASHBOARDS = {
+  admin: 'admin-dashboard',
+  lender: 'lender-dashboard',
+  user: 'user-dashboard',
+  finance_analyst: 'user-dashboard',
+  auditor: 'user-dashboard',
+  reviewer: 'user-dashboard'
+};
+
+const INVOICE_VIEWS = new Set(INVOICE_NAV_ITEMS.map((item) => item.id));
+
+const USER_VIEWS = new Set([
+  'overview', 'user-dashboard', 'transactions', 'reconciliation',
+  'risk-intelligence', 'geographic-intelligence', 'investigation-cases',
+  'cases', 'assistant', 'agents', 'reports', 'settings',
+  'analytics', 'monitoring', 'investigations', 'compliance', 'vendor-intelligence',
+  ...INVOICE_VIEWS
+]);
+
+// Lenders see only the invoice-evidence workspace. Direct URLs to company-wide
+// pages are redirected client-side; the backend enforces the same boundary.
+const LENDER_VIEWS = new Set(['lender-dashboard', 'settings', ...INVOICE_VIEWS]);
+
+function dashboardViewForUser(user) {
+  if (user?.dashboard && DASHBOARD_VIEWS.has(user.dashboard)) return user.dashboard;
+  return ROLE_DASHBOARDS[String(user?.role || '').toLowerCase()] || 'user-dashboard';
+}
+
+function isViewAllowed(user, viewId) {
+  if (!user) return false;
+  const role = String(user.role || '').toLowerCase();
+  if (role === 'admin') return ROUTABLE_VIEW_IDS.has(viewId);
+  if (role === 'lender') return LENDER_VIEWS.has(viewId);
+  return USER_VIEWS.has(viewId);
+}
 
 const PRIMARY_SIDEBAR_VIEWS = new Set(SIDEBAR_NAV_ITEMS.map((item) => item.view));
 
@@ -177,6 +234,33 @@ const viewFromHash = () => {
   if (!cleaned) return 'overview';
   const resolved = VIEW_ROUTE_ALIASES[cleaned] || cleaned;
   return ROUTABLE_VIEW_IDS.has(resolved) ? resolved : 'overview';
+};
+
+// Public marketing routes live in the same hash space as the protected views.
+// They never grant dashboard access; authentication still owns that boundary.
+const PUBLIC_PAGES = new Set(['landing', 'login', 'register']);
+
+const hashSegment = () => {
+  if (typeof window === 'undefined') return '';
+  return window.location.hash
+    .replace(/^#\/?/, '')
+    .split('?')[0]
+    .split('/')[0]
+    .trim()
+    .toLowerCase();
+};
+
+const authPageFromHash = () => {
+  const segment = hashSegment();
+  return segment === 'login' || segment === 'register' ? segment : null;
+};
+
+const publicPageFromHash = () => authPageFromHash() || 'landing';
+
+const publicHashForPage = (page) => {
+  if (page === 'login') return '#/login';
+  if (page === 'register') return '#/register';
+  return '#/';
 };
 
 
@@ -220,7 +304,7 @@ const fmtMinor = (minor, currency = 'INR') => {
 };
 
 async function invoiceApi(path, options = {}) {
-  const response = await fetch(`${API}${path}`, options);
+  const response = await apiFetch(path, options);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const detail = Array.isArray(data.detail) ? data.detail.join(' ') : data.detail;
@@ -532,7 +616,7 @@ function OverviewPage({ audits, reconciliations, loading, onAuditCreated, onNavi
                     formData.append('files', uploadFile);
                     // Re-uploading the same statement must not create duplicate rows.
                     formData.append('skip_duplicates', 'true');
-                    const response = await fetch(`${API}/api/audits`, {
+                    const response = await apiFetch(`/api/audits`, {
                       method: 'POST',
                       body: formData
                     });
@@ -931,8 +1015,8 @@ function ReconciliationPage({
       setError('Date tolerance must be a non-negative whole number.');
       return false;
     }
-    if (Number(amountTolerance) < 0 || Number.isNaN(Number(amountTolerance))) {
-      setError('Amount tolerance must be a non-negative number.');
+    if (Number(amountTolerance) < 0 || !Number.isFinite(Number(amountTolerance))) {
+      setError('Amount tolerance must be a finite non-negative number.');
       return false;
     }
     return true;
@@ -958,7 +1042,7 @@ function ReconciliationPage({
     setError('');
     setWarnings([]);
     try {
-      const response = await fetch(`${API}/api/reconciliations/preview`, {
+      const response = await apiFetch(`/api/reconciliations/preview`, {
         method: 'POST',
         body: buildFormData(),
       });
@@ -984,7 +1068,7 @@ function ReconciliationPage({
     setWarnings([]);
     setPreview(null);
     try {
-      const response = await fetch(`${API}/api/reconciliations`, {
+      const response = await apiFetch(`/api/reconciliations`, {
         method: 'POST',
         body: buildFormData(),
       });
@@ -1010,7 +1094,7 @@ function ReconciliationPage({
     setHistoryLoadingId(id);
     setError('');
     try {
-      const response = await fetch(`${API}/api/reconciliations/${id}`);
+      const response = await apiFetch(`/api/reconciliations/${id}`);
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || 'Could not load reconciliation run.');
       setReconciliation(data);
@@ -1038,7 +1122,7 @@ function ReconciliationPage({
     setActionLoadingId(resultId || 'manual');
     setError('');
     try {
-      const response = await fetch(`${API}/api/reconciliations/results/${resultId}/review`, {
+      const response = await apiFetch(`/api/reconciliations/results/${resultId}/review`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, reviewer: reviewer.trim(), ...extra }),
@@ -1066,7 +1150,7 @@ function ReconciliationPage({
     setActionLoadingId('manual');
     setError('');
     try {
-      const response = await fetch(`${API}/api/reconciliations/${runId}/manual-link`, {
+      const response = await apiFetch(`/api/reconciliations/${runId}/manual-link`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1116,7 +1200,7 @@ function ReconciliationPage({
     });
   }, [results, filter, search]);
 
-  const exportHref = runId ? `${API}/api/reconciliations/${runId}/export.csv` : null;
+  const exportHref = runId ? `/api/reconciliations/${runId}/export.csv` : null;
 
   const bankLinkCandidates = results.filter((item) => item.bank_source_file && !item.ledger_source_file && !item.is_confirmed_match && !['linked', 'confirmed', 'explained'].includes(item.review_status) && ['bank_only', 'ambiguous', 'amount_mismatch', 'date_mismatch'].includes(item.status));
   const ledgerLinkCandidates = results.filter((item) => item.ledger_source_file && !item.bank_source_file && !item.is_confirmed_match && !['linked', 'confirmed', 'explained'].includes(item.review_status) && ['ledger_only', 'ambiguous', 'amount_mismatch', 'date_mismatch'].includes(item.status));
@@ -1147,7 +1231,7 @@ function ReconciliationPage({
         </div>
         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
           {runId && <button className="secondary-btn" type="button" onClick={refreshCurrentRun}><RefreshCw size={16} /> Refresh run</button>}
-          {exportHref && <a className="secondary-btn" href={exportHref}><Download size={16} /> Export CSV</a>}
+          {exportHref && <button className="secondary-btn" type="button" onClick={() => downloadApi(exportHref, `finaudit_reconciliation_${runId}.csv`)}><Download size={16} /> Export CSV</button>}
         </div>
       </header>
 
@@ -2038,8 +2122,8 @@ function InvoiceAgentCenterPage() {
         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
           <select value={invoiceId} onChange={(e) => setInvoiceId(e.target.value)} style={{ padding: 8, borderRadius: 8, minWidth: 300 }}><option value="">Choose an invoice</option>{invoices.map((invoice) => <option key={invoice.id} value={invoice.id}>{invoice.invoice_number || `Invoice ${invoice.id}`} · {invoice.vendor_name || 'Unresolved'}</option>)}</select>
           <button className="primary-btn" type="button" onClick={runAudit} disabled={busy}>{busy ? <Loader2 size={16} className="spin" /> : <Bot size={16} />} Run workflow</button>
-          {selectedRun?.id && <a className="secondary-btn" href={`${API}/api/invoice-audits/runs/${selectedRun.id}/export.csv`}><Download size={16} /> CSV</a>}
-          {selectedRun?.id && <a className="secondary-btn" href={`${API}/api/invoice-audits/runs/${selectedRun.id}/export.pdf`}><FileText size={16} /> PDF</a>}
+          {selectedRun?.id && <button className="secondary-btn" type="button" onClick={() => downloadApi(`/api/invoice-audits/runs/${selectedRun.id}/export.csv`, `invoice_audit_${selectedRun.id}.csv`)}><Download size={16} /> CSV</button>}
+          {selectedRun?.id && <button className="secondary-btn" type="button" onClick={() => downloadApi(`/api/invoice-audits/runs/${selectedRun.id}/export.pdf`, `invoice_audit_${selectedRun.id}.pdf`)}><FileText size={16} /> PDF</button>}
         </div>
         <InvoiceMessage error={error} message={message} />
       </section>
@@ -2117,7 +2201,538 @@ function InvoiceAnalyticsPage() {
   );
 }
 
+const AUTH_MODES = [
+  { id: 'signin', label: 'Sign in' },
+  { id: 'register', label: 'Create account' }
+];
+
+function passwordIssues(value) {
+  const issues = [];
+  if (value.length < 8) issues.push('8+ characters');
+  if (!/[A-Z]/.test(value)) issues.push('an uppercase letter');
+  if (!/[a-z]/.test(value)) issues.push('a lowercase letter');
+  if (!/\d/.test(value)) issues.push('a digit');
+  if (!/[^A-Za-z0-9]/.test(value)) issues.push('a special character');
+  if (new TextEncoder().encode(value).length > 72) issues.push('at most 72 bytes');
+  return issues;
+}
+
+function AuthPage({ onLogin, initialMode = 'signin', onModeChange, onBackHome }) {
+  const [mode, setMode] = useState(initialMode === 'register' ? 'register' : 'signin');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [email, setEmail] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [accountType, setAccountType] = useState('User');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  useEffect(() => {
+    setMode(initialMode === 'register' ? 'register' : 'signin');
+    setError('');
+    setNotice('');
+  }, [initialMode]);
+
+  const switchMode = (nextMode) => {
+    const resolvedMode = nextMode === 'register' ? 'register' : 'signin';
+    setMode(resolvedMode);
+    if (typeof onModeChange === 'function') onModeChange(resolvedMode);
+    setError('');
+    setNotice('');
+  };
+
+  const submitLogin = async (event) => {
+    event.preventDefault();
+    setError('');
+    setNotice('');
+    if (!username.trim() || !password) {
+      setError('Username and password are required.');
+      return;
+    }
+    setLoading(true);
+    try {
+      const data = await apiJson('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: username.trim(), password })
+      });
+      setAuth(data);
+      onLogin(data.user);
+    } catch (err) {
+      setError(err.message || 'Sign in failed.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const submitRegister = async (event) => {
+    event.preventDefault();
+    setError('');
+    setNotice('');
+    if (!fullName.trim()) {
+      setError('Full name is required.');
+      return;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      setError('Enter a valid email address.');
+      return;
+    }
+    if (!/^[A-Za-z0-9_.-]+$/.test(username.trim())) {
+      setError('Username may contain only letters, numbers, dots, underscores and hyphens.');
+      return;
+    }
+    const issues = passwordIssues(password);
+    if (issues.length) {
+      setError(`Password needs ${issues.join(', ')}.`);
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError('Passwords do not match.');
+      return;
+    }
+    if (!['User', 'Lender'].includes(accountType)) {
+      setError('Choose an account type: User or Lender.');
+      return;
+    }
+    setLoading(true);
+    try {
+      const data = await apiJson('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          full_name: fullName.trim(),
+          email: email.trim(),
+          username: username.trim(),
+          password,
+          confirm_password: confirmPassword,
+          account_type: accountType
+        })
+      });
+      setPassword('');
+      setConfirmPassword('');
+      setNotice(`${data.message} Your username is "${data.user.username}".`);
+      switchMode('signin');
+    } catch (err) {
+      setError(err.message || 'Registration failed.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const isRegister = mode === 'register';
+
+  return (
+    <div className="app-shell theme-dashboard auth-shell">
+      <section className="panel auth-card" aria-label="FinAudit AI account access">
+        {onBackHome && (
+          <button className="auth-back" type="button" onClick={onBackHome}>
+            <ChevronLeft size={15} /> Back to homepage
+          </button>
+        )}
+        <div className="auth-brand">
+          <div className="brand-mark"><ShieldCheck size={26} /></div>
+          <div>
+            <h1>FinAudit AI</h1>
+            <p className="kpi-subtle">Secure access to the financial audit workspace.</p>
+          </div>
+        </div>
+
+        <div className="auth-tabs" role="tablist" aria-label="Authentication mode">
+          {AUTH_MODES.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={mode === tab.id}
+              className={`auth-tab ${mode === tab.id ? 'auth-tab-active' : ''}`}
+              onClick={() => switchMode(tab.id)}
+            >
+              {tab.id === 'signin' ? <ShieldCheck size={15} /> : <Users size={15} />}
+              {tab.label}
+            </button>
+          ))}
+        </div>
+
+        {notice && (
+          <div className="auth-notice" role="status">
+            <CheckCircle2 size={16} />
+            <span>{notice}</span>
+          </div>
+        )}
+        {error && <div className="error-box" role="alert">{error}</div>}
+
+        {isRegister ? (
+          <form className="auth-form" onSubmit={submitRegister} noValidate>
+            <label className="auth-field">
+              <span>Full name</span>
+              <input
+                value={fullName}
+                onChange={(e) => setFullName(e.target.value)}
+                autoComplete="name"
+                placeholder="Jane Doe"
+                maxLength={255}
+                autoFocus
+              />
+            </label>
+            <label className="auth-field">
+              <span>Email</span>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                autoComplete="email"
+                placeholder="jane.doe@example.com"
+                maxLength={255}
+              />
+            </label>
+            <label className="auth-field">
+              <span>Username</span>
+              <input
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                autoComplete="username"
+                placeholder="jane.doe"
+                maxLength={150}
+              />
+            </label>
+            <label className="auth-field">
+              <span>Account type</span>
+              <select
+                value={accountType}
+                onChange={(e) => setAccountType(e.target.value)}
+                aria-label="Account type"
+              >
+                <option value="User">User</option>
+                <option value="Lender">Lender</option>
+              </select>
+            </label>
+            <label className="auth-field">
+              <span>Password</span>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete="new-password"
+                maxLength={128}
+              />
+            </label>
+            <label className="auth-field">
+              <span>Confirm password</span>
+              <input
+                type="password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                autoComplete="new-password"
+                maxLength={128}
+              />
+            </label>
+            <p className="auth-hint">Use 8+ characters with uppercase, lowercase, a digit and a special character.</p>
+            <button className="primary-btn auth-submit" type="submit" disabled={loading}>
+              {loading ? <><RefreshCw size={16} className="spin" /> Creating account...</> : 'Create account'}
+            </button>
+          </form>
+        ) : (
+          <form className="auth-form" onSubmit={submitLogin} noValidate>
+            <label className="auth-field">
+              <span>Username</span>
+              <input
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                autoComplete="username"
+                placeholder="Your username"
+                autoFocus
+              />
+            </label>
+            <label className="auth-field">
+              <span>Password</span>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete="current-password"
+              />
+            </label>
+            <button className="primary-btn auth-submit" type="submit" disabled={loading}>
+              {loading ? <><RefreshCw size={16} className="spin" /> Signing in...</> : 'Sign in'}
+            </button>
+          </form>
+        )}
+
+        <div className="auth-footer">
+          <p className="kpi-subtle">
+            {isRegister
+              ? 'New accounts start pending approval. An administrator approves the selected User or Lender account before you can sign in.'
+              : 'Need an account? Create one and an administrator will approve it before you can sign in.'}
+          </p>
+          <p className="auth-api">API endpoint: {API}</p>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+const ADMIN_ROLE_OPTIONS = ['user', 'lender', 'auditor', 'finance_analyst', 'reviewer', 'admin'];
+const APPROVAL_ROLE_OPTIONS = ['user', 'lender', 'auditor', 'finance_analyst', 'reviewer'];
+
+function AdminUsersPage({ compact = false }) {
+  const [users, setUsers] = useState([]);
+  const [roleDrafts, setRoleDrafts] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState(null);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  const load = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const data = await apiJson('/api/auth/users');
+      const list = Array.isArray(data) ? data : [];
+      setUsers(list);
+      setRoleDrafts(Object.fromEntries(list.map((user) => [user.id, user.role])));
+    } catch (err) {
+      setError(err.message || 'Unable to load users.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const runAction = async (user, path, body, message, method = 'POST') => {
+    setBusyId(user.id);
+    setError('');
+    setNotice('');
+    try {
+      await apiJson(path, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      setNotice(`${message} (${user.username})`);
+      await load();
+    } catch (err) {
+      setError(err.message || 'Action failed.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const pendingCount = users.filter((user) => user.approval_status === 'pending_approval').length;
+
+  return (
+    <section className="panel admin-users-panel">
+      {!compact && (
+        <div className="section-header">
+          <div>
+            <h2>Accounts</h2>
+            <p>Approve registrations and manage roles. Admin provisioning from this table is an explicit action.</p>
+          </div>
+          <span className="status-pill">{pendingCount} pending</span>
+        </div>
+      )}
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {notice && <div className="auth-notice" role="status"><CheckCircle2 size={16} /><span>{notice}</span></div>}
+      {loading ? (
+        <div className="empty-state"><RefreshCw size={18} className="spin" /> Loading accounts…</div>
+      ) : (
+        <div className="data-table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>User</th><th>Account type</th><th>Status</th><th>Dashboard</th><th>Role</th><th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {users.map((user) => {
+                const draft = roleDrafts[user.id] || user.role;
+                const pending = user.approval_status === 'pending_approval';
+                return (
+                  <tr key={user.id}>
+                    <td className="table-primary">
+                      <strong>{user.full_name || user.username}</strong>
+                      <small>{user.username} · {user.email || 'no email'}</small>
+                    </td>
+                    <td>{user.role === 'lender' ? 'Lender' : user.role === 'user' ? 'User' : 'Legacy'}</td>
+                    <td><span className={`approval-badge approval-${user.approval_status}`}>{user.approval_status.replaceAll('_', ' ')}</span></td>
+                    <td>{user.dashboard || '—'}</td>
+                    <td>
+                      <select
+                        className="role-select"
+                        value={draft}
+                        onChange={(event) => setRoleDrafts((current) => ({ ...current, [user.id]: event.target.value }))}
+                        aria-label={`Role for ${user.username}`}
+                      >
+                        {ADMIN_ROLE_OPTIONS.map((role) => <option key={role} value={role}>{role}</option>)}
+                      </select>
+                    </td>
+                    <td>
+                      <div className="role-actions">
+                        {pending && (
+                          <>
+                            <button
+                              className="primary-btn compact-btn"
+                              type="button"
+                              disabled={busyId === user.id || !APPROVAL_ROLE_OPTIONS.includes(draft)}
+                              onClick={() => runAction(user, `/api/auth/users/${user.id}/approval`, { approved: true, role: draft }, 'Approved')}
+                            >
+                              Approve
+                            </button>
+                            <button
+                              className="secondary-btn compact-btn"
+                              type="button"
+                              disabled={busyId === user.id}
+                              onClick={() => runAction(user, `/api/auth/users/${user.id}/approval`, { approved: false }, 'Rejected')}
+                            >
+                              Reject
+                            </button>
+                          </>
+                        )}
+                        <button
+                          className="secondary-btn compact-btn"
+                          type="button"
+                          disabled={busyId === user.id || draft === user.role}
+                          onClick={() => runAction(user, `/api/auth/users/${user.id}`, { role: draft }, 'Role updated', 'PATCH')}
+                        >
+                          Save role
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function AdminDashboardPage({ onNavigate }) {
+  const [counts, setCounts] = useState({ total: 0, pending: 0 });
+
+  useEffect(() => {
+    let cancelled = false;
+    apiJson('/api/auth/users')
+      .then((users) => {
+        if (cancelled || !Array.isArray(users)) return;
+        setCounts({
+          total: users.length,
+          pending: users.filter((user) => user.approval_status === 'pending_approval').length
+        });
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  return (
+    <div className="role-dashboard">
+      <div className="role-kpi-grid">
+        <div className="panel role-kpi"><span>Accounts</span><strong>{counts.total}</strong><small>Provisioned and pending</small></div>
+        <div className="panel role-kpi"><span>Pending approval</span><strong>{counts.pending}</strong><small>Require administrator review</small></div>
+        <div className="panel role-kpi"><span>Approval control</span><strong>Admin only</strong><small>Roles verified on the backend</small></div>
+      </div>
+      <div className="role-shortcuts">
+        <button className="secondary-btn" type="button" onClick={() => onNavigate('admin-users', { navId: 'admin-users' })}>Open User Management</button>
+        <button className="secondary-btn" type="button" onClick={() => onNavigate('settings', { navId: 'settings' })}>System Settings</button>
+        <button className="secondary-btn" type="button" onClick={() => onNavigate('reports', { navId: 'reports-exports' })}>Reports & Exports</button>
+      </div>
+      <AdminUsersPage compact />
+    </div>
+  );
+}
+
+function LenderDashboardPage({ onNavigate }) {
+  const [loading, setLoading] = useState(true);
+  const [invoices, setInvoices] = useState([]);
+  const [monthly, setMonthly] = useState(null);
+  const [error, setError] = useState('');
+  const now = new Date();
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      setLoading(true);
+      setError('');
+      try {
+        const [invoiceData, monthlyData] = await Promise.all([
+          apiJson('/api/invoices?limit=5'),
+          apiJson(`/api/invoice-analytics/monthly?year=${now.getFullYear()}&month=${now.getMonth() + 1}`)
+        ]);
+        if (cancelled) return;
+        setInvoices(Array.isArray(invoiceData) ? invoiceData : invoiceData?.items || []);
+        setMonthly(monthlyData);
+      } catch (err) {
+        if (!cancelled) setError(err.message || 'Unable to load lender evidence.');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    load();
+    return () => { cancelled = true; };
+  }, []);
+
+  const amount = (minor) => {
+    if (minor === null || minor === undefined) return '—';
+    const currency = monthly?.currency && monthly.currency !== 'MIXED' ? monthly.currency : '';
+    return `${currency} ${(Number(minor) / 100).toLocaleString(undefined, { minimumFractionDigits: 2 })}`.trim();
+  };
+
+  return (
+    <div className="role-dashboard">
+      <div className="role-kpi-grid">
+        <div className="panel role-kpi"><span>Invoices this month</span><strong>{monthly?.invoice_count ?? '—'}</strong><small>{monthly?.month || 'Current month'}</small></div>
+        <div className="panel role-kpi"><span>Total invoiced</span><strong>{amount(monthly?.total_invoiced_minor)}</strong><small>Your account only</small></div>
+        <div className="panel role-kpi"><span>Outstanding</span><strong>{amount(monthly?.outstanding_minor)}</strong><small>{monthly?.open_discrepancy_count ?? 0} open discrepancies</small></div>
+      </div>
+      <div className="role-shortcuts">
+        <button className="secondary-btn" type="button" onClick={() => onNavigate('invoice-management')}>Upload / view invoices</button>
+        <button className="secondary-btn" type="button" onClick={() => onNavigate('invoice-matching')}>Invoice matching</button>
+        <button className="secondary-btn" type="button" onClick={() => onNavigate('invoice-discrepancies')}>Discrepancies</button>
+        <button className="secondary-btn" type="button" onClick={() => onNavigate('invoice-analytics')}>Analytics</button>
+      </div>
+      <section className="panel role-recent">
+        <div className="section-header"><div><h2>Recent invoice evidence</h2><p>Scoped to your account</p></div></div>
+        {error && <div className="error-box" role="alert">{error}</div>}
+        {loading ? (
+          <div className="empty-state"><RefreshCw size={18} className="spin" /> Loading invoices…</div>
+        ) : invoices.length ? (
+          <div className="data-table-wrap">
+            <table className="data-table">
+              <thead><tr><th>Invoice</th><th>Vendor</th><th>Date</th><th>Status</th><th>Total</th></tr></thead>
+              <tbody>
+                {invoices.map((invoice) => (
+                  <tr key={invoice.id}>
+                    <td className="table-primary">{invoice.invoice_number || invoice.id}</td>
+                    <td>{invoice.vendor?.vendor_name || invoice.vendor_name || '—'}</td>
+                    <td>{invoice.invoice_date || '—'}</td>
+                    <td>{invoice.status || '—'}</td>
+                    <td>{amount(invoice.total_minor)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <InvoiceEmpty icon={Receipt} title="No invoices yet" detail="Upload invoice evidence to begin." />
+        )}
+      </section>
+    </div>
+  );
+}
+
 function App() {
+  const [currentUser, setCurrentUser] = useState(() => getAuthUser());
+  // A visitor with no token can render the public page immediately; a stored
+  // token still waits for backend verification before any dashboard is shown.
+  const [authReady, setAuthReady] = useState(() => !getAuthToken());
+  const [publicPage, setPublicPage] = useState(() => publicPageFromHash());
+  const [demoMode, setDemoMode] = useState(LOCAL_DEMO_MODE);
+  const [demoLoading, setDemoLoading] = useState(false);
+  const [demoError, setDemoError] = useState('');
   const initialView = viewFromHash();
   const initialNav = SIDEBAR_NAV_ITEMS.find((item) => item.view === initialView)?.navId || (initialView === 'overview' ? 'dashboard' : 'dashboard');
   const [activeView, setActiveViewState] = useState(initialView);
@@ -2138,7 +2753,116 @@ function App() {
     detail: 'Contacting API…'
   });
 
+  const syncHashForPublicPage = (page, replace = false) => {
+    if (typeof window === 'undefined' || !PUBLIC_PAGES.has(page)) return;
+    const nextHash = publicHashForPage(page);
+    if (window.location.hash === nextHash) return;
+    if (replace) {
+      window.history.replaceState(null, '', nextHash);
+    } else {
+      window.history.pushState(null, '', nextHash);
+    }
+  };
 
+  const navigatePublicPage = (page, options = {}) => {
+    if (!PUBLIC_PAGES.has(page)) return;
+    const { syncHash = true, replaceHash = false } = options;
+    setPublicPage(page);
+    if (syncHash) syncHashForPublicPage(page, replaceHash);
+  };
+
+  useEffect(() => {
+    if (!LOCAL_DEMO_MODE) return undefined;
+    let cancelled = false;
+    getDemoStatus()
+      .then((status) => {
+        if (cancelled) return;
+        if (status?.enabled) return;
+        // The frontend opt-in is only a navigation hint. The backend is the
+        // authority; if it did not enable local demo, restore normal auth.
+        setDemoMode(false);
+        const stored = getAuthUser();
+        if (stored?.is_demo) {
+          clearAuth();
+          setCurrentUser(null);
+          navigatePublicPage('landing', { replaceHash: true });
+          setAuthReady(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setDemoMode(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    const onExpired = () => {
+      setCurrentUser(null);
+      setAuthReady(true);
+      navigatePublicPage('landing', { replaceHash: true });
+    };
+    window.addEventListener('finaudit:auth-expired', onExpired);
+    return () => window.removeEventListener('finaudit:auth-expired', onExpired);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const validate = async () => {
+      const token = getAuthToken();
+      if (!token) {
+        if (!cancelled) {
+          setCurrentUser(null);
+          const requested = demoMode ? 'landing' : publicPageFromHash();
+          setPublicPage(requested);
+          if (requested === 'landing') syncHashForPublicPage('landing', true);
+          setAuthReady(true);
+        }
+        return;
+      }
+      try {
+        const response = await apiFetch('/api/auth/me');
+        if (!response.ok) throw new Error('Session invalid');
+        const user = await response.json();
+        if (!cancelled) {
+          setCurrentUser(user);
+          // Keep a valid deep link, otherwise land on the backend-assigned
+          // dashboard. The API response is authoritative for the role.
+          const requested = authPageFromHash() ? null : viewFromHash();
+          setActiveView(
+            requested && isViewAllowed(user, requested) ? requested : dashboardViewForUser(user),
+            { replaceHash: true }
+          );
+          setAuthReady(true);
+        }
+      } catch {
+        clearAuth();
+        if (!cancelled) {
+          setCurrentUser(null);
+          navigatePublicPage('landing', { replaceHash: true });
+          setAuthReady(true);
+        }
+      }
+    };
+    validate();
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleLogout = async () => {
+    // Demo sessions are in-memory and must not create revocation/user rows.
+    if (!currentUser?.is_demo) {
+      try {
+        await apiFetch('/api/auth/logout', { method: 'POST' });
+      } catch {
+        // Ignore network/logout errors; clear local session regardless.
+      }
+    }
+    clearAuth();
+    setCurrentUser(null);
+    navigatePublicPage('landing', { replaceHash: true });
+    setAudits([]);
+    setReconciliations([]);
+    setReconciliation(null);
+  };
 
   const syncHashForView = (viewId, replace = false) => {
     if (typeof window === 'undefined') return;
@@ -2161,13 +2885,45 @@ function App() {
   };
 
   useEffect(() => {
-    // Ensure URL reflects the active route on first load and supports refresh/direct links.
-    syncHashForView(activeView, true);
+    // Ensure the URL reflects the active surface on first load: public routes
+    // for visitors, protected dashboard routes for verified sessions.
+    if (currentUser) {
+      syncHashForView(activeView, true);
+    } else {
+      syncHashForPublicPage(demoMode ? 'landing' : publicPage, true);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [currentUser, demoMode]);
 
   useEffect(() => {
     const syncFromUrl = () => {
+      const authPage = authPageFromHash();
+      if (demoMode && authPage) {
+        // Sign-in/sign-up hashes are not part of local demo navigation.
+        setPublicPage('landing');
+        if (currentUser) {
+          setActiveView(dashboardViewForUser(currentUser), { replaceHash: true });
+        } else {
+          syncHashForPublicPage('landing', true);
+        }
+        setMobileMenuOpen(false);
+        return;
+      }
+      if (authPage) {
+        setPublicPage(authPage);
+        if (currentUser) setActiveView(dashboardViewForUser(currentUser), { replaceHash: true });
+        setMobileMenuOpen(false);
+        return;
+      }
+
+      setPublicPage('landing');
+      if (!currentUser) {
+        // A dashboard deep link belongs to a verified session only.
+        syncHashForPublicPage('landing', true);
+        setMobileMenuOpen(false);
+        return;
+      }
+
       const nextView = viewFromHash();
       const nextNav = SIDEBAR_NAV_ITEMS.find((item) => item.view === nextView)?.navId || (nextView === 'overview' ? 'dashboard' : activeNavId);
       setActiveViewState(nextView);
@@ -2182,7 +2938,7 @@ function App() {
       window.removeEventListener('hashchange', syncFromUrl);
       window.removeEventListener('popstate', syncFromUrl);
     };
-  }, [activeNavId]);
+  }, [activeNavId, currentUser, demoMode]);
 
   const themeClass = activeView === 'reconciliation' ? 'theme-reconciliation' : 'theme-dashboard';
 
@@ -2190,8 +2946,8 @@ function App() {
     setLoadingOverview(true);
     try {
       const [auditRes, reconRes] = await Promise.all([
-        fetch(`${API}/api/audits`),
-        fetch(`${API}/api/reconciliations`)
+        apiFetch('/api/audits'),
+        apiFetch('/api/reconciliations')
       ]);
       if (auditRes.ok) {
         const data = await auditRes.json();
@@ -2209,8 +2965,8 @@ function App() {
   };
 
   useEffect(() => {
-    loadOverview();
-  }, []);
+    if (currentUser) loadOverview();
+  }, [currentUser]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2225,7 +2981,7 @@ function App() {
         detail: 'Unable to reach API'
       };
       try {
-        const response = await fetch(`${API}/api/health`, {
+        const response = await apiFetch(`/api/health`, {
           signal: controller.signal,
           cache: 'no-store'
         });
@@ -2284,6 +3040,14 @@ function App() {
   }, [activeView]);
 
   useEffect(() => {
+    // Client-side guard mirrors backend permissions. Direct hash links to a
+    // role-restricted page are sent back to that role's dashboard.
+    if (currentUser && !isViewAllowed(currentUser, activeView)) {
+      setActiveView(dashboardViewForUser(currentUser), { replaceHash: true });
+    }
+  }, [currentUser, activeView]);
+
+  useEffect(() => {
     const handler = (event) => {
       if (typeof event.detail !== 'string') return;
       const target = event.detail;
@@ -2315,6 +3079,10 @@ function App() {
 
   const pageTitle = {
     overview: { eyebrow: 'Dashboard', title: 'Financial Intelligence Dashboard', description: 'Database-backed KPIs, five charts and recent evidence from actual records.' },
+    'user-dashboard': { eyebrow: 'User Dashboard', title: 'Financial Intelligence Dashboard', description: 'Your workspace for transactions, reconciliation, risk and evidence.' },
+    'lender-dashboard': { eyebrow: 'Lender Dashboard', title: 'Lender Evidence Workspace', description: 'Invoice and payment evidence for your account only.' },
+    'admin-dashboard': { eyebrow: 'Admin Dashboard', title: 'Administration Overview', description: 'User approvals, role management and system access.' },
+    'admin-users': { eyebrow: 'Administration', title: 'User Management', description: 'Review pending accounts, approve registrations and manage roles.' },
     transactions: { eyebrow: 'Transactions', title: 'Transaction Management', description: 'Import, validate, search and inspect transactions with full source provenance.' },
     assistant: { eyebrow: 'AI Assistant', title: 'AI Investigation Assistant', description: 'Selective multi-agent investigation with SQL evidence, RAG citations and human review.' },
     analytics: { eyebrow: 'Analytics', title: 'Financial Analytics', description: 'Monthly spending, categories, trends and transaction details from actual data.' },
@@ -2344,6 +3112,82 @@ function App() {
   };
 
   const compactSidebar = sidebarCollapsed && !mobileMenuOpen;
+  const visibleSidebarGroups = SIDEBAR_GROUPS.map((group) => ({
+    ...group,
+    items: group.items.filter((item) => isViewAllowed(currentUser, item.view))
+  })).filter((group) => group.items.length > 0);
+
+  const handleLoginSuccess = (user) => {
+    setCurrentUser(user);
+    setPublicPage('landing');
+    // The login response carries the backend-assigned dashboard; the API is
+    // authoritative for role, approval and permission decisions.
+    setActiveView(dashboardViewForUser(user), { replaceHash: true });
+    setAuthReady(true);
+  };
+
+  const handleOpenDashboard = async () => {
+    if (!demoMode) {
+      navigatePublicPage('login');
+      return;
+    }
+    setDemoLoading(true);
+    setDemoError('');
+    try {
+      // No fabricated client token: the backend mints a signed, short-lived
+      // demo session that passes the same auth/RBAC gates as a login token.
+      const data = await requestDemoSession();
+      setAuth(data);
+      handleLoginSuccess(data.user);
+    } catch (err) {
+      const message = err?.message || 'Could not start local demo mode.';
+      if (/disabled/i.test(message)) {
+        // A frontend flag without backend opt-in must fall back to normal auth.
+        setDemoMode(false);
+        navigatePublicPage('login');
+      } else {
+        setDemoError(message);
+      }
+    } finally {
+      setDemoLoading(false);
+    }
+  };
+
+  if (!authReady) {
+    return (
+      <div className="app-shell theme-dashboard" style={{ minHeight: '100vh', display: 'grid', placeItems: 'center' }}>
+        <div className="panel" style={{ padding: 24, display: 'flex', alignItems: 'center', gap: 10 }}>
+          <RefreshCw size={18} className="spin" />
+          <span>Checking session…</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    if (!demoMode && (publicPage === 'login' || publicPage === 'register')) {
+      return (
+        <AuthPage
+          initialMode={publicPage}
+          onModeChange={(mode) => navigatePublicPage(mode)}
+          onBackHome={() => navigatePublicPage('landing')}
+          onLogin={handleLoginSuccess}
+        />
+      );
+    }
+
+    return (
+      <LandingPage
+        currentUser={currentUser}
+        demoMode={demoMode}
+        demoLoading={demoLoading}
+        demoError={demoError}
+        onOpenDashboard={handleOpenDashboard}
+        onSignIn={() => navigatePublicPage('login')}
+        onRegister={() => navigatePublicPage('register')}
+      />
+    );
+  }
 
   return (
     <div className={`app-shell ${themeClass}`}>
@@ -2360,7 +3204,7 @@ function App() {
                 <b>
                   FinAudit<span> AI</span>
                 </b>
-                <small>Enterprise Risk Platform</small>
+                <small>{currentUser?.is_demo ? 'LOCAL DEMO MODE' : 'Enterprise Risk Platform'}</small>
               </div>
             )}
           </div>
@@ -2376,7 +3220,7 @@ function App() {
         </div>
 
         <nav className="sidebar-groups" aria-label="Primary navigation">
-          {SIDEBAR_GROUPS.map((group) => {
+          {visibleSidebarGroups.map((group) => {
             const hasItems = group.items.length > 0;
             const expanded = expandedGroups[group.id] ?? true;
             return (
@@ -2463,14 +3307,22 @@ function App() {
           </div>
           {activeView !== 'geographic-intelligence' && (
             <div className="topbar-actions">
-              <button className="secondary-btn" type="button" onClick={loadOverview} disabled={loadingOverview}>
-                <RefreshCw size={16} className={loadingOverview ? 'spin' : ''} />
-                Refresh
-              </button>
-              <div className="status-pill">
+              {currentUser?.is_demo && <span className="demo-mode-badge">DEMO MODE</span>}
+              {/* Dashboard pages own their own refresh controls. */}
+              {!DASHBOARD_REFRESH_VIEWS.has(activeView) && (
+                <button className="secondary-btn" type="button" onClick={loadOverview} disabled={loadingOverview}>
+                  <RefreshCw size={16} className={loadingOverview ? 'spin' : ''} />
+                  Refresh
+                </button>
+              )}
+              <div className="status-pill" title={currentUser?.role || ''}>
                 <span />
-                {API.replace('http://', '').replace('https://', '')}
+                {currentUser?.username || 'User'}{currentUser?.role ? ` (${currentUser.role})` : ''}
               </div>
+              <button className="secondary-btn" type="button" onClick={handleLogout} title="Sign out">
+                <LogOut size={16} />
+                Logout
+              </button>
             </div>
           )}
         </header>
@@ -2484,6 +3336,18 @@ function App() {
 
         {activeView === 'overview' && (
           <Dashboard onNavigate={(view) => setActiveView(view)} />
+        )}
+        {activeView === 'user-dashboard' && (
+          <Dashboard onNavigate={(view) => setActiveView(view)} />
+        )}
+        {activeView === 'admin-dashboard' && (
+          <AdminDashboardPage onNavigate={setActiveView} />
+        )}
+        {activeView === 'admin-users' && (
+          <AdminUsersPage />
+        )}
+        {activeView === 'lender-dashboard' && (
+          <LenderDashboardPage onNavigate={setActiveView} />
         )}
         {activeView === 'transactions' && (
           <Transactions focusRef={transactionFocus} />
@@ -2561,10 +3425,10 @@ function AnalyticsPage() {
     setError('');
     try {
       const [sRes, cRes, compRes, tRes] = await Promise.all([
-        fetch(`${API}/api/analytics/monthly/summary?year=${year}&month=${month}`),
-        fetch(`${API}/api/analytics/monthly/categories?year=${year}&month=${month}`),
-        fetch(`${API}/api/analytics/monthly/comparison?year=${year}&month=${month}`),
-        fetch(`${API}/api/analytics/transactions?year=${year}&month=${month}&limit=100`)
+        apiFetch(`/api/analytics/monthly/summary?year=${year}&month=${month}`),
+        apiFetch(`/api/analytics/monthly/categories?year=${year}&month=${month}`),
+        apiFetch(`/api/analytics/monthly/comparison?year=${year}&month=${month}`),
+        apiFetch(`/api/analytics/transactions?year=${year}&month=${month}&limit=100`)
       ]);
       if (sRes.ok) setSummary(await sRes.json());
       if (cRes.ok) setCategories(await cRes.json());
@@ -2595,7 +3459,7 @@ function AnalyticsPage() {
           <select value={month} onChange={(e) => setMonth(Number(e.target.value))} style={{ padding: '8px 10px', borderRadius: 8 }}>
             {Array.from({length:12}, (_,i)=>i+1).map(m => <option key={m} value={m}>{m}</option>)}
           </select>
-          <a className="secondary-btn" href={`${API}/api/analytics/export.csv?year=${year}&month=${month}`}><Download size={16}/>Export CSV</a>
+          <button className="secondary-btn" type="button" onClick={() => downloadApi(`/api/analytics/export.csv?year=${year}&month=${month}`, `analytics_${year}_${month}.csv`)}><Download size={16}/>Export CSV</button>
         </div>
       </header>
       {error && <div className="error-box">{error}</div>}
@@ -2672,7 +3536,7 @@ function AgentsPage() {
 
   const loadRuns = async () => {
     try {
-      const res = await fetch(`${API}/api/agents/runs`);
+      const res = await apiFetch(`/api/agents/runs`);
       if (res.ok) setRuns(await res.json());
     } catch {}
   };
@@ -2681,7 +3545,7 @@ function AgentsPage() {
   const loadRun = async (id) => {
     setError('');
     try {
-      const res = await fetch(`${API}/api/agents/runs/${id}`);
+      const res = await apiFetch(`/api/agents/runs/${id}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Could not load run');
       const stored = data.output_state || {};
@@ -2708,7 +3572,7 @@ function AgentsPage() {
       const payload = { task_type: taskType, year, month };
       if (auditRunId) payload.audit_run_id = Number(auditRunId);
       if (reconciliationId) payload.reconciliation_id = Number(reconciliationId);
-      const res = await fetch(`${API}/api/agents/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      const res = await apiFetch(`/api/agents/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Agent run failed');
       setResult(data);
@@ -2897,7 +3761,7 @@ function ReportsPage({ audits = [], reconciliations = [], onNavigate }) {
 
   useEffect(() => {
     let active = true;
-    fetch(`${API}/api/reports/summary`)
+    apiFetch(`/api/reports/summary`)
       .then(async (response) => {
         if (!response.ok) throw new Error(`Report summary failed (${response.status})`);
         return response.json();
@@ -2915,12 +3779,12 @@ function ReportsPage({ audits = [], reconciliations = [], onNavigate }) {
   return (
     <div className="reports-workspace">
       <div className="report-toolbar">
-        <a className="primary-btn" href={`${API}/api/reports/full.pdf`}><Download size={16} />Full report (PDF)</a>
-        <a className="secondary-btn" href={`${API}/api/reports/full.csv`}><Download size={16} />Full report (CSV)</a>
-        <a className="secondary-btn" href={`${API}/api/transactions/export.csv`}><Download size={16} />Transactions (filtered CSV)</a>
-        <a className="secondary-btn" href={`${API}/api/risk/alerts/export.csv?severity=high,critical`}><Download size={16} />Risk alerts (CSV)</a>
-        {latestAuditId && <a className="secondary-btn" href={`${API}/api/audits/${latestAuditId}/export.csv`}><Download size={16} />Audit #{latestAuditId}</a>}
-        {latestReconId && <a className="secondary-btn" href={`${API}/api/reconciliations/${latestReconId}/export.csv`}><Download size={16} />Reconciliation #{latestReconId}</a>}
+        <button className="primary-btn" type="button" onClick={() => downloadApi('/api/reports/full.pdf', 'finaudit_full_report.pdf')}><Download size={16} />Full report (PDF)</button>
+        <button className="secondary-btn" type="button" onClick={() => downloadApi('/api/reports/full.csv', 'finaudit_full_report.csv')}><Download size={16} />Full report (CSV)</button>
+        <button className="secondary-btn" type="button" onClick={() => downloadApi('/api/transactions/export.csv', 'transactions.csv')}><Download size={16} />Transactions (filtered CSV)</button>
+        <button className="secondary-btn" type="button" onClick={() => downloadApi('/api/risk/alerts/export.csv?severity=high,critical', 'risk_alerts.csv')}><Download size={16} />Risk alerts (CSV)</button>
+        {latestAuditId && <button className="secondary-btn" type="button" onClick={() => downloadApi(`/api/audits/${latestAuditId}/export.csv`, `audit_${latestAuditId}.csv`)}><Download size={16} />Audit #{latestAuditId}</button>}
+        {latestReconId && <button className="secondary-btn" type="button" onClick={() => downloadApi(`/api/reconciliations/${latestReconId}/export.csv`, `reconciliation_${latestReconId}.csv`)}><Download size={16} />Reconciliation #{latestReconId}</button>}
       </div>
       {error && <div className="ai-alert ai-alert-error"><AlertTriangle size={15} />{error}</div>}
       {summary?.generated_at && (
@@ -3035,7 +3899,7 @@ function InvestigationsPage({ audits = [], onNavigate }) {
       setLoading(true);
       setErr('');
       try {
-        const res = await fetch(`${API}/api/investigations?limit=50`);
+        const res = await apiFetch(`/api/investigations?limit=50`);
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || 'Failed to load investigations');
         if (mounted) {
@@ -3107,7 +3971,7 @@ function CasesPage({ audits = [] }) {
     setLoading(true);
     setErr('');
     try {
-      const res = await fetch(`${API}/api/investigations?limit=200`);
+      const res = await apiFetch(`/api/investigations?limit=200`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Failed to load investigations');
       setCases(data.items || []);
@@ -3125,7 +3989,7 @@ function CasesPage({ audits = [] }) {
     setDetail(null);
     setErr('');
     try {
-      const res = await fetch(`${API}/api/investigations/${encodeURIComponent(caseRef)}`);
+      const res = await apiFetch(`/api/investigations/${encodeURIComponent(caseRef)}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Failed to load case');
       setDetail(data);
@@ -3141,7 +4005,7 @@ function CasesPage({ audits = [] }) {
     try {
       const payload = { ...form, audit_run_id: audits[0]?.id, created_by: 'reviewer' };
       Object.keys(payload).forEach(k => { if (payload[k] === '') delete payload[k]; });
-      const res = await fetch(`${API}/api/investigations`, {
+      const res = await apiFetch(`/api/investigations`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
       });
       const data = await res.json();
@@ -3159,7 +4023,7 @@ function CasesPage({ audits = [] }) {
     if (!selected) return;
     setErr('');
     try {
-      const res = await fetch(`${API}/api/investigations/${encodeURIComponent(selected)}`, {
+      const res = await apiFetch(`/api/investigations/${encodeURIComponent(selected)}`, {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(statusForm),
       });
       const data = await res.json();
@@ -3176,7 +4040,7 @@ function CasesPage({ audits = [] }) {
     if (!selected || !note.note.trim()) return;
     setErr('');
     try {
-      const res = await fetch(`${API}/api/investigations/${encodeURIComponent(selected)}/notes`, {
+      const res = await apiFetch(`/api/investigations/${encodeURIComponent(selected)}/notes`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(note),
       });
       const data = await res.json();
@@ -3193,7 +4057,7 @@ function CasesPage({ audits = [] }) {
     if (!selected || !evidenceForm.source_reference.trim()) return;
     setErr('');
     try {
-      const res = await fetch(`${API}/api/investigations/${encodeURIComponent(selected)}/evidence`, {
+      const res = await apiFetch(`/api/investigations/${encodeURIComponent(selected)}/evidence`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...evidenceForm, added_by: 'reviewer', metadata: { added_from: 'investigation workspace' } }),
       });
@@ -3212,7 +4076,7 @@ function CasesPage({ audits = [] }) {
     setErr('');
     setMsg('Generating grounded explanation…');
     try {
-      const res = await fetch(`${API}/api/investigations/${encodeURIComponent(selected)}/explain`, { method: 'POST' });
+      const res = await apiFetch(`/api/investigations/${encodeURIComponent(selected)}/explain`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Failed');
       setDetail((prev) => ({ ...prev, ai_explanation: data.explanation }));
@@ -3258,7 +4122,7 @@ function CasesPage({ audits = [] }) {
             <div className="empty-state"><div className="empty-icon"><FileSearch size={24}/></div><strong>Select a case</strong><span>Choose a case to review evidence, notes and history.</span></div>
           ) : (
             <>
-              <div className="section-header"><div><h2>{detail.case_number} · {detail.title}</h2><p>Severity {detail.severity} · Assigned to {detail.assigned_to || 'unassigned'}</p></div><a className="secondary-btn" href={`${API}/api/investigations/${encodeURIComponent(detail.case_number)}/export.csv`}><Download size={16}/>Export</a></div>
+              <div className="section-header"><div><h2>{detail.case_number} · {detail.title}</h2><p>Severity {detail.severity} · Assigned to {detail.assigned_to || 'unassigned'}</p></div><button className="secondary-btn" type="button" onClick={() => downloadApi(`/api/investigations/${encodeURIComponent(detail.case_number)}/export.csv`, `investigation_${detail.case_number}.csv`)}><Download size={16}/>Export</button></div>
               <div style={{ display: 'grid', gap: 14, marginTop: 12 }}>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: 8 }}>
                   <select value={statusForm.status} onChange={e=>setStatusForm({...statusForm,status:e.target.value})} style={{ padding: 8, borderRadius: 8 }}><option>open</option><option>under_review</option><option>resolved</option><option>dismissed</option></select>
@@ -3325,7 +4189,7 @@ function SettingsPage() {
     setLoading(true);
     setError('');
     try {
-      const res = await fetch(`${API}/api/system/health`);
+      const res = await apiFetch(`/api/system/health`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Failed to load system health');
       setHealth(data);

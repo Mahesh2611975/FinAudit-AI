@@ -20,16 +20,16 @@ CATEGORIES = [
 
 
 KEYWORDS = {
-    "Groceries": ["grocery", "supermarket", "bigbasket", "blinkit", "dmart", "walmart", "grocer"],
-    "Food and dining": ["restaurant", "cafe", "swiggy", "zomato", "uber eats", "food", "pizza", "coffee"],
-    "Shopping": ["amazon", "flipkart", "myntra", "shopping", "store", "mall"],
-    "Transport and travel": ["uber", "ola", "taxi", "metro", "rail", "air", "fuel", "petrol", "gas station"],
-    "Rent and housing": ["rent", "lease", "mortgage", "hoa"],
-    "Utilities and bills": ["electric", "water", "internet", "wifi", "bill", "mobile", "recharge"],
-    "Healthcare": ["pharmacy", "hospital", "clinic", "medical", "doctor"],
-    "Education": ["school", "college", "university", "course", "tuition"],
-    "Subscriptions": ["netflix", "spotify", "subscription", "prime"],
-    "Transfers": ["transfer", "neft", "imps", "rtgs", "upi transfer"],
+    "Groceries": ["grocery", "supermarket", "bigbasket", "blinkit", "dmart", "walmart", "grocer", "kirana"],
+    "Food and dining": ["restaurant", "cafe", "swiggy", "zomato", "uber eats", "food", "pizza", "coffee", "bakery", "hotel"],
+    "Shopping": ["amazon", "flipkart", "myntra", "shopping", "store", "mall", "mart"],
+    "Transport and travel": ["uber", "ola", "taxi", "metro", "rail", "air", "fuel", "petrol", "gas station", "bus", "travel"],
+    "Rent and housing": ["rent", "lease", "mortgage", "hoa", "maintenance"],
+    "Utilities and bills": ["electric", "water", "internet", "wifi", "bill", "mobile", "recharge", "broadband", "gas bill"],
+    "Healthcare": ["pharmacy", "hospital", "clinic", "medical", "doctor", "medic", "diagnostic"],
+    "Education": ["school", "college", "university", "course", "tuition", "exam", "coaching"],
+    "Subscriptions": ["netflix", "spotify", "subscription", "prime", "youtube premium"],
+    "Transfers": ["transfer", "neft", "imps", "rtgs", "upi transfer", "self transfer"],
 }
 
 

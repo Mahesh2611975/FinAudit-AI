@@ -37,7 +37,7 @@ All amounts, scores, matches and counts are calculated by deterministic Python c
 
 ## Requirements
 
-- Python 3.11 or 3.12 recommended
+- Python 3.11, 3.12 or 3.13 (3.13 supported; see `backend/requirements.txt`)
 - Node.js 20+ recommended
 - Git
 - Optional: [Ollama](https://ollama.com/) with `llama3.2:1b` for AI explanations. No API key or paid account is required.
@@ -70,9 +70,71 @@ npm install
 npm run dev
 ```
 
-Open <http://localhost:5173>. Set `VITE_API_URL` in `frontend/.env` if the API is not at `http://127.0.0.1:8000`.
+Open <http://localhost:5173>. Set `VITE_API_URL` in `frontend/.env` if the API is not at `http://127.0.0.1:8000`. Copy `frontend/.env.example` to `frontend/.env` to get started.
 
-### 3. Enable optional local AI
+### 3. Authentication: first admin, registration and approval
+
+The UI offers **Sign in** and **Create account** tabs. Sign in accepts only username and password; the backend returns the account's real role and dashboard target. Registration accepts full name, email, username, password, confirm password and an **account type** of `User` or `Lender`. The server maps the account type to `ROLE_USER` or `ROLE_LENDER`; a client-supplied `role` (including `admin`) is rejected. New accounts are inactive and pending approval, passwords are bcrypt-hashed, and no token is issued before approval.
+
+Create the **first administrator** explicitly (this never happens automatically and no default credentials exist). This is a one-time bootstrap: once any admin exists, the command refuses to create or modify administrators.
+
+```powershell
+cd backend
+$secret = python -c "import secrets; print(secrets.token_urlsafe(48))"
+Add-Content -Path .env -Value "FINAUDIT_JWT_SECRET=$secret"
+$env:FINAUDIT_ADMIN_PASSWORD = 'ReplaceWithStrongPassword!'
+python -m app.create_admin --username admin --email admin@example.com --full-name "System Administrator"
+Remove-Item Env:\FINAUDIT_ADMIN_PASSWORD
+```
+
+Use a unique strong password and keep `FINAUDIT_JWT_SECRET` in `backend/.env` so tokens survive a backend restart; do **not** commit real secrets or passwords. The CLI no longer accepts reuse after the first admin: use the authenticated admin APIs for all later admin provisioning and role changes.
+
+After sign-in, the backend-verified role routes to:
+
+- `admin` → Admin dashboard (user management, approvals, roles, system pages)
+- `lender` → Lender dashboard (invoice evidence scoped to that account)
+- `user` → User dashboard (existing financial audit workspace)
+
+For an existing installation, sign in as an admin and use:
+
+- `GET /api/auth/users` — list accounts and `approval_status` (`pending_approval`, `approved`, `disabled`).
+- `POST /api/auth/users/{id}/approval` with `{"approved": true, "role": "user|lender|auditor|finance_analyst|reviewer"}` — approve or reject a registration. Admin role cannot be granted here.
+- `PATCH /api/auth/users/{id}` with `{"is_active": false}` or `{"role": "admin"}` — explicit disable/re-enable or role change.
+- `POST /api/auth/users` — explicitly provision an account with a chosen role.
+
+All of these actions are recorded in the backend log with the acting admin's username. Existing JWT signature/expiry/revocation checks, bcrypt hashes, centralized route permissions, row-level ownership filtering and audit identity checks remain enforced.
+
+### 4. Local demonstration mode (optional)
+
+Local demo mode lets a machine open the public landing page and enter the existing dashboard directly, with no sign-in or registration screens. It is **disabled by default** and is refused whenever `FINAUDIT_ENV` is `production`, `prod` or `staging`.
+
+Enable it only on a local machine:
+
+```powershell
+# backend/.env
+FINAUDIT_ENV=local
+FINAUDIT_LOCAL_DEMO_MODE=true
+```
+
+```powershell
+# frontend/.env
+VITE_LOCAL_DEMO_MODE=true
+```
+
+Restart both servers. The landing page stays first, but **Open Dashboard** acquires a short-lived, signed demo session from `POST /api/auth/demo/session` and opens the backend-assigned admin dashboard. The workspace is labelled **DEMO MODE**. No user, password hash or financial record is created; the demo principal is in memory and the existing SQLite database is read as-is.
+
+To restore normal authentication, set both flags back to `false` (or delete them), restart both servers, and remove any stored session:
+
+```powershell
+# browser console on the frontend origin
+localStorage.removeItem('finaudit.auth.token')
+localStorage.removeItem('finaudit.auth.user')
+localStorage.removeItem('finaudit.auth.expiresAt')
+```
+
+The sign-in screen then returns. All protected API endpoints continue to require a valid token; local demo mode only changes navigation and issues a gated token through the backend. It never makes a protected route public.
+
+### 5. Enable optional local AI
 
 Install and start Ollama, then pull a small model suitable for an 8 GB RAM laptop:
 
@@ -92,7 +154,7 @@ OLLAMA_PROBE_TIMEOUT=1.5
 
 No key is needed. If Ollama is unavailable, core audits, reconciliation, risk analysis, RAG retrieval and reports still work; AI answers become evidence-only responses that say the model is unavailable.
 
-### 4. Try sample data
+### 6. Try sample data
 
 Choose `sample_data/transactions.csv` in the Transactions or Dashboard workspace. It intentionally includes a duplicate pair, a high-value payment and a negative amount.
 

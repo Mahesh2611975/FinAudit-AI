@@ -144,7 +144,8 @@ def test_review_workflow_persists_event_and_status(risk_client):
         f"/api/risk/alerts/{alert['id']}/review",
         json={"action": "comment", "comment": "No actor"},
     )
-    assert missing_actor.status_code == 422
+    # Actor identity is derived from the authenticated user; client-supplied actor is not required.
+    assert missing_actor.status_code == 200
 
 
 def test_investigate_uses_deterministic_context_and_ai(monkeypatch, risk_client):

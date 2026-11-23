@@ -20,6 +20,17 @@
   font-size: 12px;
 }
 
+.dash-toolbar-note {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dash-refresh-status {
+  color: var(--dash-text-secondary);
+  font-size: 12px;
+}
+
 .dash-message {
   padding: 32px;
   color: var(--dash-text-secondary);

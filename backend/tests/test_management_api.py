@@ -70,7 +70,7 @@ def test_system_health_reports_real_status_without_secrets(tmp_path):
         assert data["llm"]["provider"] == "ollama"
         assert isinstance(data["llm"]["model"], str)
         assert data["rag"]["backend"] == "local-tfidf-sqlite"
-        assert data["configuration"]["authentication_enabled"] is False
+        assert data["configuration"]["authentication_enabled"] is True
         assert data["configuration"]["secrets_exposed"] is False
         body = response.text.lower()
         assert "groq_api_key" not in body

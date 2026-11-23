@@ -318,7 +318,8 @@ def test_review_action_persists_human_decision():
     assert response.status_code == 200, response.text
     updated = response.json()
     assert updated["status"] == "confirmed"
-    assert updated["review_actions"][0]["reviewer_name"] == "Reviewer One"
+    # Reviewer identity comes from authenticated user, not client payload.
+    assert updated["review_actions"][0]["reviewer_name"] == "test-admin"
     assert updated["review_actions"][0]["comment"] == "Checked source documents."
 
 

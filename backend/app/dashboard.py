@@ -108,13 +108,15 @@ def dashboard_overview(db: Session, *, activity_months: int = 6, recent_limit: i
     recon_counts: dict[str, int] = {}
     latest_recon_run_id = None
     latest_recon_run = None
-    latest_recon = (
-        db.query(ReconciliationResult.run_id)
-        .order_by(ReconciliationResult.run_id.desc())
-        .first()
-    )
-    if latest_recon and latest_recon[0] is not None:
-        latest_recon_run_id = int(latest_recon[0])
+    try:
+        from .models import ReconciliationRun
+
+        latest_recon_run = db.query(ReconciliationRun).order_by(ReconciliationRun.id.desc()).first()
+    except Exception:
+        latest_recon_run = None
+
+    if latest_recon_run is not None:
+        latest_recon_run_id = int(latest_recon_run.id)
         recon_rows = (
             db.query(ReconciliationResult.status, func.count(ReconciliationResult.id))
             .filter(ReconciliationResult.run_id == latest_recon_run_id)
@@ -122,11 +124,6 @@ def dashboard_overview(db: Session, *, activity_months: int = 6, recent_limit: i
             .all()
         )
         recon_counts = {str(status or "unknown"): int(count) for status, count in recon_rows}
-        try:
-            from .models import ReconciliationRun
-            latest_recon_run = db.query(ReconciliationRun).filter(ReconciliationRun.id == latest_recon_run_id).first()
-        except Exception:
-            latest_recon_run = None
 
     # Confirmed matches only. Possible/suggested matches remain pending review.
     matched_transactions = recon_counts.get("matched", 0) + recon_counts.get("reconciled", 0) + recon_counts.get("exact", 0)
@@ -139,6 +136,11 @@ def dashboard_overview(db: Session, *, activity_months: int = 6, recent_limit: i
     ambiguous_count = recon_counts.get("ambiguous", 0)
     bank_record_count = int(getattr(latest_recon_run, "bank_record_count", 0) or 0) if latest_recon_run else 0
     ledger_record_count = int(getattr(latest_recon_run, "ledger_record_count", 0) or 0) if latest_recon_run else 0
+    # Business definition currently in use (intentionally unchanged):
+    #   match_rate = round(matched_transactions / ((bank_record_count + ledger_record_count) / 2) * 100, 2)
+    # The result is a PERCENTAGE of the average side size of the latest run.
+    # It is not a 0-1 fraction and not matched / total result rows. For run 8
+    # (1 matched, 410 bank, 5 ledger) this yields 0.48, i.e. 0.48%.
     denom = max(1.0, (bank_record_count + ledger_record_count) / 2.0) if (bank_record_count or ledger_record_count) else 0.0
     match_rate = round((matched_transactions / denom) * 100, 2) if denom > 0 else None
     unreconciled_value = getattr(latest_recon_run, "unreconciled_value", None) if latest_recon_run else None
@@ -262,7 +264,7 @@ def dashboard_overview(db: Session, *, activity_months: int = 6, recent_limit: i
             "matched_transactions": "Confirmed matched reconciliation results in the latest run. Possible/suggested matches are not counted as confirmed.",
             "unmatched_transactions": "reconciliation_results rows with status bank_only/ledger_only/unmatched in the latest run.",
             "possible_matches": "reconciliation_results rows with status ambiguous/possible/suggested in the latest run (require human confirmation).",
-            "reconciliation_metrics": "Match rate, counts, unreconciled value and total difference are derived from the latest persisted reconciliation run/results.",
+            "reconciliation_metrics": "Match rate, counts, unreconciled value and total difference are derived from the latest persisted reconciliation run/results. Match rate is a percentage: matched / avg(bank_record_count, ledger_record_count) * 100.",
             "risk_alerts": "All persisted deterministic alerts; severity counted from stored risk_engine output.",
             "activity_charts": f"Grouped by transaction date (YYYY-MM), last {activity_months} populated months.",
             "category_distribution": "Count of persisted transaction rows by stored category, top 10 categories.",

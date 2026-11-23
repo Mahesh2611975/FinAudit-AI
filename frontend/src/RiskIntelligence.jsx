@@ -35,6 +35,7 @@ import {
 } from 'recharts';
 
 import './risk.css';
+import { apiFetch } from './api';
 
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'];
 const SEVERITY_COLORS = {
@@ -68,11 +69,9 @@ const fmtDate = (value) => {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 };
 
-async function riskApi(apiBase, path, options = {}) {
-  const response = await fetch(`${apiBase}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-    ...options
-  });
+async function riskApi(_apiBase, path, options = {}) {
+  const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+  const response = await apiFetch(path, { ...options, headers });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const detail = Array.isArray(data.detail) ? data.detail.join(' ') : data.detail;

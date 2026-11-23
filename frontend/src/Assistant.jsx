@@ -14,10 +14,10 @@ import {
   Upload
 } from 'lucide-react';
 
-const API = (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
+import { apiFetch } from './api';
 
 async function assistantRequest(path, options = {}) {
-  const response = await fetch(`${API}${path}`, options);
+  const response = await apiFetch(path, options);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const detail = Array.isArray(data.detail) ? data.detail.join(' ') : data.detail;

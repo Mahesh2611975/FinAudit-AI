@@ -15,3 +15,9 @@ psycopg2-binary>=2.9,<3.0
 # Optional: enables higher-fidelity PDF text extraction during RAG ingestion.
 # Without it, FinAudit uses a built-in lightweight PDF text extractor.
 pypdf>=5.0,<7.0
+# Authentication / RBAC. PyJWT provides the `import jwt` module; the unrelated
+# package named "jwt" must NOT be installed (it has a different API).
+PyJWT>=2.8,<3.0
+# bcrypt provides the password hashing backend used by app/auth.py.
+# 4.x has Python 3.13 wheels and keeps the gensalt/checkpw API used here.
+bcrypt>=4.1,<5.0
