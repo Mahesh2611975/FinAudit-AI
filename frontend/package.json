@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "verify:navigation": "node scripts/verify-navigation.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",

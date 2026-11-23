@@ -2092,7 +2092,7 @@
   }
 }
 
-.geo-risk-distribution-grid {
+.risk-distribution-grid {
   grid-template-columns: minmax(0, 1fr);
 }
 

@@ -81,8 +81,23 @@ def root():
 
 
 @app.get("/api/health")
-def health():
-    return {"status": "healthy"}
+def health(db: Session = Depends(get_db)):
+    """Fast readiness probe used by the UI status indicator.
+
+    Unlike ``/api/system/health`` this endpoint does not probe the LLM or RAG
+    stores, so a slow local model cannot make a perfectly healthy API look
+    offline. Database connectivity is still checked for real.
+    """
+    database_status = "unavailable"
+    try:
+        db.execute(text("SELECT 1")).scalar()
+        database_status = "connected"
+    except Exception:  # noqa: BLE001 - health must report, not raise
+        pass
+    return {
+        "status": "healthy" if database_status == "connected" else "degraded",
+        "database": {"status": database_status},
+    }
 
 
 @app.get("/api/system/health")

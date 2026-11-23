@@ -274,6 +274,36 @@ def test_geo_filters_apply_to_map_and_statistics(geo_client):
     }
 
 
+def test_city_filter_updates_markers_and_channel_analytics(geo_client):
+    """City filtering must constrain both the map markers and the analytics."""
+    client, session_factory = geo_client
+    seed_geo(session_factory)
+    analyze(client)
+
+    response = client.get("/api/risk/geography/summary?city=Mumbai")
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload["summary"]["total_transactions_matched"] == 2
+    assert {item["transaction_id"] for item in payload["markers"]} == {
+        "GEO-MUM-1",
+        "GEO-MUM-2",
+    }
+    # Records without coordinates never become markers even when named.
+    assert "GEO-PUNE-1" not in {item["transaction_id"] for item in payload["markers"]}
+
+    analytics = payload["channel_analytics"]
+    active_channels = {
+        item["channel"]: item
+        for item in analytics["channels"]
+        if item["transaction_count"] > 0
+    }
+    # Legacy explicitly stored labels are preserved for old records.
+    assert set(active_channels) == {"NEFT"}
+    assert active_channels["NEFT"]["transaction_count"] == 2
+    assert sum(item["transaction_count"] for item in analytics["channels"]) == 2
+
+
 def test_geo_empty_state_and_geocode_cache(geo_client):
     client, session_factory = geo_client
     seed_geo(session_factory)

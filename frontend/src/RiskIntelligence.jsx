@@ -712,7 +712,7 @@ export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000' }) 
         )}
       </section>
 
-      <div className="risk-grid-2 geo-risk-distribution-grid">
+      <div className="risk-grid-2 risk-distribution-grid">
         <section className="risk-card">
           <div className="risk-card-header">
             <div>

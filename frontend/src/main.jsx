@@ -68,7 +68,14 @@ import Assistant from './Assistant';
 
 const API = (
   import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
-).replace(/\/$/, '');
+).trim().replace(/\/+$/, '').replace(/\/api$/, '');
+
+// Health polling: the lightweight /api/health probe is fast, but a transient
+// failure (cold start, brief network hiccup) must not leave the sidebar stuck
+// on "Backend offline" for a full polling interval while data loads normally.
+const HEALTH_TIMEOUT_MS = 8000;
+const HEALTH_POLL_MS = 30000;
+const HEALTH_RETRY_MS = 5000;
 
 const INVOICE_NAV_ITEMS = [
   { id: 'invoice-management', label: 'Invoice Management', icon: Receipt },
@@ -2160,15 +2167,21 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const onHashChange = () => {
+    const syncFromUrl = () => {
       const nextView = viewFromHash();
       const nextNav = SIDEBAR_NAV_ITEMS.find((item) => item.view === nextView)?.navId || (nextView === 'overview' ? 'dashboard' : activeNavId);
       setActiveViewState(nextView);
       if (nextNav) setActiveNavId(nextNav);
       setMobileMenuOpen(false);
     };
-    window.addEventListener('hashchange', onHashChange);
-    return () => window.removeEventListener('hashchange', onHashChange);
+    // pushState/replaceState do not emit hashchange. Listen to both so browser
+    // back/forward also restores the correct independent page.
+    window.addEventListener('hashchange', syncFromUrl);
+    window.addEventListener('popstate', syncFromUrl);
+    return () => {
+      window.removeEventListener('hashchange', syncFromUrl);
+      window.removeEventListener('popstate', syncFromUrl);
+    };
   }, [activeNavId]);
 
   const themeClass = activeView === 'reconciliation' ? 'theme-reconciliation' : 'theme-dashboard';
@@ -2201,50 +2214,67 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
+    let retryTimer = null;
+
     const loadHealth = async () => {
       const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), 10000);
+      const timeout = window.setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
+      let next = {
+        state: 'offline',
+        label: 'Backend offline',
+        detail: 'Unable to reach API'
+      };
       try {
-        const response = await fetch(`${API}/api/system/health`, { signal: controller.signal });
+        const response = await fetch(`${API}/api/health`, {
+          signal: controller.signal,
+          cache: 'no-store'
+        });
         const data = await response.json().catch(() => ({}));
         if (cancelled) return;
         if (!response.ok) {
-          setBackendHealth({
+          next = {
             state: 'degraded',
             label: 'Backend degraded',
             detail: `Health check returned HTTP ${response.status}`
-          });
-          return;
+          };
+        } else {
+          const status = String(data.status || '').toLowerCase();
+          const dbStatus = String(data.database?.status || '').toLowerCase();
+          const dbConnected = dbStatus === 'connected';
+          const healthy = dbConnected && ['healthy', 'operational'].includes(status);
+          next = {
+            state: healthy ? 'healthy' : dbConnected ? 'degraded' : 'offline',
+            label: healthy ? 'Backend healthy' : dbConnected ? 'Backend degraded' : 'Database unreachable',
+            detail: dbConnected
+              ? 'API and database reachable'
+              : `Database ${data.database?.status || 'unavailable'}`
+          };
         }
-        const systemStatus = String(data.status || '').toLowerCase();
-        const dbStatus = String(data.database?.status || '').toLowerCase();
-        const dbConnected = dbStatus === 'connected';
-        const healthy = dbConnected && systemStatus === 'operational';
-        setBackendHealth({
-          state: healthy ? 'healthy' : dbConnected ? 'degraded' : 'offline',
-          label: healthy ? 'Backend healthy' : dbConnected ? 'Backend degraded' : 'Backend unreachable',
-          detail: dbConnected
-            ? `Database connected · LLM ${data.llm?.available ? 'available' : 'unavailable'}`
-            : `Database ${data.database?.status || 'unavailable'}`
-        });
       } catch (err) {
-        if (!cancelled) {
-          const timedOut = err?.name === 'AbortError';
-          setBackendHealth({
-            state: 'offline',
-            label: timedOut ? 'Backend slow/unreachable' : 'Backend offline',
-            detail: timedOut ? 'Health check timed out' : 'Unable to reach API'
-          });
-        }
+        if (cancelled) return;
+        const timedOut = err?.name === 'AbortError';
+        next = {
+          state: 'offline',
+          label: timedOut ? 'Backend slow/unreachable' : 'Backend offline',
+          detail: timedOut ? 'Health check timed out' : 'Unable to reach API'
+        };
       } finally {
         window.clearTimeout(timeout);
       }
+      if (cancelled) return;
+      setBackendHealth(next);
+      // Retry quickly after a failure so a transient miss cannot leave a stale
+      // offline label while the rest of the dashboard is clearly working.
+      retryTimer = window.setTimeout(
+        loadHealth,
+        next.state === 'healthy' ? HEALTH_POLL_MS : HEALTH_RETRY_MS
+      );
     };
+
     loadHealth();
-    const interval = window.setInterval(loadHealth, 30000);
     return () => {
       cancelled = true;
-      window.clearInterval(interval);
+      if (retryTimer) window.clearTimeout(retryTimer);
     };
   }, []);
 

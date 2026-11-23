@@ -43,6 +43,21 @@ def teardown(engine):
     engine.dispose()
 
 
+def test_health_is_a_fast_database_backed_readiness_probe(tmp_path):
+    client, _, engine = build_client(tmp_path)
+    try:
+        response = client.get("/api/health")
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["status"] == "healthy"
+        assert data["database"]["status"] == "connected"
+        # Deliberately lightweight: no LLM/RAG probes that can stall the UI.
+        assert "llm" not in data
+        assert "rag" not in data
+    finally:
+        teardown(engine)
+
+
 def test_system_health_reports_real_status_without_secrets(tmp_path):
     client, _, engine = build_client(tmp_path)
     try:
