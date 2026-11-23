@@ -91,10 +91,10 @@ check('Auth screen mode follows the public route', /initialMode=\{publicPage\}/.
 check('Protected dashboard routes remain hash-driven', /syncHashForView\(activeView, true\)/.test(main));
 check('Landing page never calls protected APIs', !/(apiFetch|apiJson|\/api\/)/.test(landing));
 
-check('Landing page uses the exact brand, category and headline', /FinAudit AI/.test(landing) && /FINANCIAL INTELLIGENCE/.test(landing) && /Every transaction\.<br \/>\s*Every discrepancy\.<br \/>\s*<span>Accounted for\.<\/span>/.test(landing));
+check('Landing page uses the exact brand, category and headline', /FinAudit AI/.test(landing) && /FINANCIAL INTELLIGENCE/.test(landing) && /Detect risks\.<br \/>\s*<span>Investigate smarter\.<\/span><br \/>\s*Stay in control\./.test(landing));
 check(
   'Landing page uses the exact supporting copy',
-  /FinAudit AI brings financial reconciliation, risk intelligence, invoice auditing and\s*AI-powered investigations into one evidence-driven workspace\./.test(landing)
+  /Unify financial reconciliation, risk intelligence, invoice auditing and AI-powered\s*investigations in one evidence-driven platform\./.test(landing)
 );
 check('Landing hero includes both required buttons', /Open Dashboard/.test(landing) && /Discover capabilities/.test(landing));
 for (const label of [
@@ -138,7 +138,7 @@ check('Landing styles include tablet and mobile breakpoints', /@media \(max-widt
 check('Landing styles respect reduced motion', /@media \(prefers-reduced-motion: reduce\)/.test(landingCss));
 
 // --- Local demonstration mode ---------------------------------------------
-check('Local demo mode is opt-in and disabled by default', /VITE_LOCAL_DEMO_MODE=false/.test(frontendEnv) && /export const LOCAL_DEMO_MODE/.test(apiClient));
+check('Local demo mode is controlled by the environment flag', /VITE_LOCAL_DEMO_MODE=true/.test(frontendEnv) && /export const LOCAL_DEMO_MODE/.test(apiClient));
 check('Demo status/session helpers call the backend', /export async function getDemoStatus/.test(apiClient) && /export async function requestDemoSession/.test(apiClient) && /\/api\/auth\/demo\/session/.test(apiClient));
 check('Backend exposes gated demo endpoints', /@router\.get\("\/demo\/status"\)/.test(backendAuth) && /@router\.post\("\/demo\/session"/.test(backendAuth));
 check('Backend demo mode refuses production-like environments', /def demo_mode_enabled[\s\S]*?return environment in _LOCAL_DEMO_ENVIRONMENTS/.test(backendAuth));

@@ -318,13 +318,13 @@ export default function LandingPage({
           <div className="lp-hero-copy">
             <p className="lp-eyebrow"><span className="lp-eyebrow-dot" /> FINANCIAL INTELLIGENCE</p>
             <h1 id="lp-hero-title">
-              Every transaction.<br />
-              Every discrepancy.<br />
-              <span>Accounted for.</span>
+              Detect risks.<br />
+              <span>Investigate smarter.</span><br />
+              Stay in control.
             </h1>
             <p className="lp-hero-text">
-              FinAudit AI brings financial reconciliation, risk intelligence, invoice auditing and
-              AI-powered investigations into one evidence-driven workspace.
+              Unify financial reconciliation, risk intelligence, invoice auditing and AI-powered
+              investigations in one evidence-driven platform.
             </p>
             <div className="lp-hero-actions">
               <button
