@@ -11,6 +11,8 @@ os.environ.setdefault("FINAUDIT_DATABASE_URL", f"sqlite:///{os.path.join(TEST_DB
 from app import auth as auth_module  # noqa: E402
 from app.main import app  # noqa: E402
 from app.ownership import reset_data_scope, set_data_scope  # noqa: E402
+from app.rag_migrations import migrate_rag_ownership  # noqa: E402
+from app.vector_store import VectorStore  # noqa: E402
 
 
 DEFAULT_ADMIN = SimpleNamespace(
@@ -21,6 +23,18 @@ DEFAULT_ADMIN = SimpleNamespace(
     role="admin",
     is_active=True,
 )
+
+
+@pytest.fixture
+def scoped_vector_store(tmp_path):
+    """A temporary RAG store with the additive ownership schema applied.
+
+    This is test-only setup; the real RAG database and its backup are never
+    migrated by the test suite.
+    """
+    store = VectorStore(tmp_path / "rag")
+    migrate_rag_ownership(store.db_path)
+    return store
 
 
 @pytest.fixture(autouse=True)

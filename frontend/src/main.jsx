@@ -131,11 +131,6 @@ const SIDEBAR_GROUPS = [
     ]
   },
   {
-    id: 'evidence-documents',
-    label: 'Evidence & Documents',
-    items: []
-  },
-  {
     id: 'governance',
     label: 'Governance',
     items: [
@@ -363,22 +358,6 @@ function StatusBadge({ status }) {
     return <span className="badge badge-low">{label}</span>;
   }
   return <span className="badge badge-neutral">{label}</span>;
-}
-
-function PlaceholderPage({ title, description, icon: Icon }) {
-  return (
-    <section className="panel placeholder-panel">
-      <div className="empty-icon">
-        <Icon size={28} />
-      </div>
-      <h2>{title}</h2>
-      <p>{description}</p>
-      <span className="kpi-subtle">
-        This section is not implemented in the current codebase. UI structure is
-        in place for future expansion.
-      </span>
-    </section>
-  );
 }
 
 function OverviewPage({ audits, reconciliations, loading, onAuditCreated, onNavigateInvestigations }) {
@@ -2028,12 +2007,22 @@ function InvoiceDiscrepancyPage() {
 function VendorIntelligencePage() {
   const [analytics, setAnalytics] = useState([]);
   const [form, setForm] = useState({ vendor_name: '', vendor_code: '', currency: 'INR', tax_registration_number: '' });
+  const [selectedId, setSelectedId] = useState('');
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [investigating, setInvestigating] = useState(false);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
 
   const load = async () => {
-    try { setAnalytics(await invoiceApi('/api/vendors/analytics')); } catch (err) { setError(err.message); }
+    setLoading(true);
+    try {
+      const data = await invoiceApi('/api/vendors/analytics');
+      setAnalytics(data);
+      setSelectedId((current) => current || String(data?.[0]?.vendor_id || ''));
+    } catch (err) { setError(err.message); }
+    finally { setLoading(false); }
   };
   useEffect(() => { load(); }, []);
 
@@ -2047,6 +2036,30 @@ function VendorIntelligencePage() {
     } catch (err) { setError(err.message); }
     finally { setBusy(false); }
   };
+
+  const investigate = async () => {
+    if (!selectedId) { setError('Select a vendor first.'); return; }
+    setInvestigating(true); setError(''); setMessage(''); setResult(null);
+    try {
+      const data = await invoiceApi(`/api/vendors/${selectedId}/investigate`, { method: 'POST' });
+      setResult(data);
+      setMessage(`Investigation ${data.status || 'completed'}. ${data.duration_ms || 0} ms.`);
+    } catch (err) { setError(err.message); }
+    finally { setInvestigating(false); }
+  };
+
+  const summaryRow = analytics.find((item) => String(item.vendor_id) === String(selectedId)) || {};
+  const profile = result?.vendor_profile || summaryRow;
+  const exposure = result?.financial_exposure || {};
+  const indicators = result?.risk_indicators || [];
+  const discrepancies = result?.invoice_discrepancies || [];
+  const timeline = result?.timeline || [];
+  const evidence = result?.evidence_references || result?.retrieved_evidence || [];
+  const facts = result?.verified_database_facts || [];
+  const interpretations = result?.ai_interpretations || [];
+  const missing = result?.missing_evidence || [];
+  const recommendations = result?.recommended_review_actions || [];
+  const currency = exposure.currency || profile.currency || 'INR';
 
   return (
     <>
@@ -2062,10 +2075,74 @@ function VendorIntelligencePage() {
         <InvoiceMessage error={error} message={message} />
       </section>
 
-      <section className="table-card">
-        <div className="section-header"><div><h2>Vendor intelligence</h2><p>Invoice volume, payment position and exception counts</p></div></div>
-        {analytics.length === 0 ? <InvoiceEmpty icon={Store} title="No vendor history" detail="Add a vendor and upload invoices." /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>Vendor</th><th>Code</th><th>Invoices</th><th>Total invoiced</th><th>Paid</th><th>Outstanding</th><th>Average invoice</th><th>Open exceptions</th><th>Duplicates</th></tr></thead><tbody>{analytics.map((vendor) => <tr key={vendor.vendor_id}><td className="table-primary">{vendor.vendor_name}</td><td>{vendor.vendor_code || '—'}</td><td>{vendor.invoice_count}</td><td>{fmtMinor(vendor.total_invoiced_minor, vendor.currency)}</td><td>{fmtMinor(vendor.paid_minor, vendor.currency)}</td><td>{fmtMinor(vendor.outstanding_minor, vendor.currency)}</td><td>{fmtMinor(vendor.average_invoice_minor, vendor.currency)}</td><td>{vendor.open_discrepancy_count}</td><td>{vendor.duplicate_count}</td></tr>)}</tbody></table></div>}
+      <section className="panel" style={{ padding: 18, marginBottom: 18, display: 'grid', gap: 10 }}>
+        <div className="section-header"><div><h2>Vendor intelligence</h2><p>Run a deterministic, owner-scoped investigation from persisted records and cited evidence.</p></div></div>
+        {loading ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, opacity: .8 }}><Loader2 size={16} className="spin" /> Loading vendor history…</div>
+        ) : analytics.length === 0 ? (
+          <InvoiceEmpty icon={Store} title="No vendor history" detail="Add a vendor and upload invoices." />
+        ) : (
+          <>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+              <select value={selectedId} onChange={(e) => { setSelectedId(e.target.value); setResult(null); }} style={{ padding: 8, borderRadius: 8, minWidth: 300 }}>
+                {analytics.map((vendor) => <option key={vendor.vendor_id} value={vendor.vendor_id}>{vendor.vendor_name || `Vendor ${vendor.vendor_id}`}{vendor.vendor_code ? ` · ${vendor.vendor_code}` : ''}</option>)}
+              </select>
+              <button className="primary-btn" type="button" onClick={investigate} disabled={investigating || !selectedId}>
+                {investigating ? <Loader2 size={16} className="spin" /> : <Bot size={16} />} Investigate Vendor
+              </button>
+              <span style={{ fontSize: 11, opacity: .75 }}>No overall risk score is assigned. Every indicator requires human review.</span>
+            </div>
+            <div className="data-table-wrap"><table className="data-table"><thead><tr><th>Vendor</th><th>Code</th><th>Invoices</th><th>Total invoiced</th><th>Paid</th><th>Outstanding</th><th>Average invoice</th><th>Open exceptions</th><th>Duplicates</th></tr></thead><tbody>{analytics.map((vendor) => <tr key={vendor.vendor_id} className={String(vendor.vendor_id) === String(selectedId) ? 'selected-row' : ''}><td className="table-primary">{vendor.vendor_name}</td><td>{vendor.vendor_code || '—'}</td><td>{vendor.invoice_count}</td><td>{fmtMinor(vendor.total_invoiced_minor, vendor.currency)}</td><td>{fmtMinor(vendor.paid_minor, vendor.currency)}</td><td>{fmtMinor(vendor.outstanding_minor, vendor.currency)}</td><td>{fmtMinor(vendor.average_invoice_minor, vendor.currency)}</td><td>{vendor.open_discrepancy_count}</td><td>{vendor.duplicate_count}</td></tr>)}</tbody></table></div>
+          </>
+        )}
       </section>
+
+      {investigating && (
+        <section className="panel" style={{ padding: 18, marginBottom: 18, fontSize: 12, opacity: .85 }}><Loader2 size={16} className="spin" /> Running scoped vendor analysis…</section>
+      )}
+
+      {result && (
+        <>
+          <div className="kpi-grid" style={{ marginBottom: 18 }}>
+            <article className="kpi-card"><div className="kpi-label"><span>Workflow status</span><strong><StatusBadge status={result.status} /></strong></div><span className="kpi-subtle">Run {result.run_id || 'not persisted'}</span></article>
+            <article className="kpi-card"><div className="kpi-label"><span>Total invoiced</span><strong>{fmtMinor(exposure.total_invoiced_minor, currency)}</strong></div><span className="kpi-subtle">{exposure.invoice_count || 0} invoice(s)</span></article>
+            <article className="kpi-card"><div className="kpi-label"><span>Outstanding</span><strong>{fmtMinor(exposure.outstanding_minor, currency)}</strong></div><span className="kpi-subtle">Paid {fmtMinor(exposure.verified_paid_minor, currency)}</span></article>
+            <article className="kpi-card"><div className="kpi-label"><span>Exception exposure</span><strong>{fmtMinor(exposure.open_discrepancy_exposure_minor, currency)}</strong></div><span className="kpi-subtle">{exposure.open_discrepancy_count || 0} open · {exposure.high_severity_exposure_minor || 0} minor high severity</span></article>
+          </div>
+
+          <section className="panel" style={{ padding: 18, marginBottom: 18, display: 'grid', gap: 10 }}>
+            <div className="section-header"><div><h2>Investigation result</h2><p>{result.summary || 'Vendor intelligence result'}</p></div><StatusBadge status={result.conclusion_status} /></div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(260px,1fr))', gap: 14 }}>
+              <div><strong style={{ fontSize: 12 }}>Vendor profile</strong><div style={{ fontSize: 12, marginTop: 6 }}>{profile.vendor_name || '—'} · {profile.vendor_code || 'no code'}</div><div style={{ fontSize: 11, opacity: .8, marginTop: 4 }}>{profile.email || 'No email'} · {profile.payment_terms || 'No terms'}</div></div>
+              <div><strong style={{ fontSize: 12 }}>Verified database facts</strong>{facts.length ? facts.map((fact, index) => <div key={index} style={{ fontSize: 12, marginTop: 6 }}>• {fact}</div>) : <div style={{ fontSize: 12, marginTop: 6 }}>No facts recorded.</div>}</div>
+              <div><strong style={{ fontSize: 12 }}>AI interpretations</strong>{interpretations.length ? interpretations.map((item, index) => <div key={index} style={{ fontSize: 12, marginTop: 6 }}>• {item}</div>) : <div style={{ fontSize: 12, marginTop: 6 }}>No interpretation added.</div>}</div>
+              <div><strong style={{ fontSize: 12 }}>Missing evidence</strong>{missing.length ? missing.map((item, index) => <div key={index} style={{ fontSize: 12, marginTop: 6 }}>• {item}</div>) : <div style={{ fontSize: 12, marginTop: 6 }}>None recorded.</div>}</div>
+              <div><strong style={{ fontSize: 12 }}>Recommended review actions</strong>{recommendations.map((item, index) => <div key={index} style={{ fontSize: 12, marginTop: 6 }}>• {item}</div>)}</div>
+            </div>
+            <p style={{ fontSize: 11, opacity: .75 }}>{result.disclaimer}</p>
+          </section>
+
+          <section className="table-card" style={{ marginBottom: 18 }}>
+            <div className="section-header"><div><h2>Risk indicators</h2><p>Deterministic rule leads; severity and score come from the existing risk engine.</p></div></div>
+            {indicators.length ? <div className="data-table-wrap"><table className="data-table"><thead><tr><th>Rule</th><th>Source</th><th>Severity</th><th>Rule score</th><th>Explanation</th></tr></thead><tbody>{indicators.map((item, index) => <tr key={`${item.source_id || index}`}><td className="table-primary">{item.rule || '—'}</td><td>{item.source_name || item.source_type || '—'}</td><td><StatusBadge status={item.severity} /></td><td>{item.rule_score ?? '—'}</td><td>{item.explanation || '—'}</td></tr>)}</tbody></table></div> : <InvoiceEmpty icon={ShieldCheck} title="No rule indicators" detail="No deterministic rule was triggered for this vendor." />}
+          </section>
+
+          <section className="table-card" style={{ marginBottom: 18 }}>
+            <div className="section-header"><div><h2>Invoice discrepancies</h2><p>Persisted open exceptions linked to this vendor.</p></div></div>
+            {discrepancies.length ? <div className="data-table-wrap"><table className="data-table"><thead><tr><th>Invoice</th><th>Type</th><th>Severity</th><th>Expected</th><th>Actual</th><th>Difference</th><th>Explanation</th></tr></thead><tbody>{discrepancies.map((item) => <tr key={item.id}><td className="table-primary">{item.invoice_number || item.invoice_id}</td><td>{String(item.discrepancy_type || '').replaceAll('_', ' ')}</td><td><StatusBadge status={item.severity} /></td><td>{item.expected_value || '—'}</td><td>{item.actual_value || '—'}</td><td>{fmtMinor(item.difference_minor, item.currency || currency)}</td><td>{item.explanation || '—'}</td></tr>)}</tbody></table></div> : <InvoiceEmpty icon={FileText} title="No open discrepancies" detail="No persisted open exception was found for this vendor." />}
+          </section>
+
+          <section className="table-card" style={{ marginBottom: 18 }}>
+            <div className="section-header"><div><h2>Agent timeline</h2><p>Measured execution per workflow node</p></div></div>
+            {timeline.length ? <div className="data-table-wrap"><table className="data-table"><thead><tr><th>Agent</th><th>Status</th><th>Duration</th><th>Summary</th></tr></thead><tbody>{timeline.map((item, index) => <tr key={`${item.agent_name}-${index}`}><td className="table-primary">{item.agent_name}</td><td><StatusBadge status={item.status} /></td><td>{item.duration_ms} ms</td><td>{item.summary || item.error || '—'}</td></tr>)}</tbody></table></div> : <InvoiceEmpty icon={Bot} title="No timeline" detail="Run an investigation to populate it." />}
+          </section>
+
+          <section className="table-card" style={{ marginBottom: 18 }}>
+            <div className="section-header"><div><h2>Evidence references</h2><p>Database rows and scoped document chunks with preserved citation metadata.</p></div></div>
+            {evidence.length ? <div className="data-table-wrap"><table className="data-table"><thead><tr><th>Source</th><th>Record</th><th>File</th><th>Page</th><th>Transaction</th><th>Score</th></tr></thead><tbody>{evidence.map((item, index) => <tr key={`${item.source_id || item.source_filename}-${index}`}><td className="table-primary">{item.source_id || '—'}</td><td>{item.doc_id || item.record_id || item.chunk_id || '—'}</td><td>{item.source_file || item.source_filename || '—'}</td><td>{item.page_number ?? '—'}</td><td>{item.transaction_id || '—'}</td><td>{item.score ?? '—'}</td></tr>)}</tbody></table></div> : <InvoiceEmpty icon={FileSearch} title="No evidence references" detail="No database record or indexed document matched this vendor." />}
+          </section>
+        </>
+      )}
     </>
   );
 }
@@ -2747,6 +2824,7 @@ function App() {
   const [reconciliation, setReconciliation] = useState(null);
   const [loadingOverview, setLoadingOverview] = useState(false);
   const [transactionFocus, setTransactionFocus] = useState('');
+  const [casesRefreshSignal, setCasesRefreshSignal] = useState(0);
   const [backendHealth, setBackendHealth] = useState({
     state: 'checking',
     label: 'Checking backend',
@@ -3359,7 +3437,7 @@ function App() {
           <InvestigationsPage audits={audits} onNavigate={(view) => setActiveView(view)} />
         )}
         {activeView === 'cases' && (
-          <CasesPage audits={audits} />
+          <CasesPage audits={audits} currentUser={currentUser} refreshSignal={casesRefreshSignal} />
         )}
         {activeView === 'reconciliation' && (
           <ReconciliationPage
@@ -3373,7 +3451,11 @@ function App() {
           <AnalyticsPage />
         )}
         {activeView === 'risk-intelligence' && (
-          <RiskIntelligence apiBase={API} />
+          <RiskIntelligence
+            apiBase={API}
+            currentUser={currentUser}
+            onCasesCreated={() => setCasesRefreshSignal((value) => value + 1)}
+          />
         )}
         {activeView === 'geographic-intelligence' && (
           <GeographicRiskIntelligence apiBase={API} backendHealth={backendHealth} />
@@ -3529,6 +3611,8 @@ function AgentsPage() {
   const [month, setMonth] = useState(new Date().getMonth()+1);
   const [auditRunId, setAuditRunId] = useState('');
   const [reconciliationId, setReconciliationId] = useState('');
+  const [caseId, setCaseId] = useState('');
+  const [focusTransactionId, setFocusTransactionId] = useState('');
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
@@ -3572,6 +3656,8 @@ function AgentsPage() {
       const payload = { task_type: taskType, year, month };
       if (auditRunId) payload.audit_run_id = Number(auditRunId);
       if (reconciliationId) payload.reconciliation_id = Number(reconciliationId);
+      if (caseId) payload.case_id = Number(caseId);
+      if (focusTransactionId.trim()) payload.focus_transaction_id = focusTransactionId.trim();
       const res = await apiFetch(`/api/agents/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Agent run failed');
@@ -3618,7 +3704,11 @@ function AgentsPage() {
           <select value={year} onChange={(e)=>setYear(Number(e.target.value))} style={{ padding: '8px 10px', borderRadius: 8 }}>{[2025,2026,2027].map(y=><option key={y} value={y}>{y}</option>)}</select>
           <select value={month} onChange={(e)=>setMonth(Number(e.target.value))} style={{ padding: '8px 10px', borderRadius: 8 }}>{Array.from({length:12},(_,i)=>i+1).map(m=><option key={m} value={m}>{m}</option>)}</select>
           {taskType === 'investigation' && (
-            <input value={auditRunId} onChange={(e)=>setAuditRunId(e.target.value)} placeholder="Audit run ID (optional)" type="number" style={{ padding: '8px 10px', borderRadius: 8, width: 180 }} />
+            <>
+              <input value={auditRunId} onChange={(e)=>setAuditRunId(e.target.value)} placeholder="Audit run ID (optional)" type="number" style={{ padding: '8px 10px', borderRadius: 8, width: 180 }} />
+              <input value={caseId} onChange={(e)=>setCaseId(e.target.value)} placeholder="Investigation case ID" type="number" min="1" style={{ padding: '8px 10px', borderRadius: 8, width: 180 }} />
+              <input value={focusTransactionId} onChange={(e)=>setFocusTransactionId(e.target.value)} placeholder="Focus transaction ID" style={{ padding: '8px 10px', borderRadius: 8, width: 200 }} />
+            </>
           )}
           {taskType === 'reconciliation_review' && (
             <input value={reconciliationId} onChange={(e)=>setReconciliationId(e.target.value)} placeholder="Reconciliation ID" type="number" style={{ padding: '8px 10px', borderRadius: 8, width: 180 }} />
@@ -3781,7 +3871,7 @@ function ReportsPage({ audits = [], reconciliations = [], onNavigate }) {
       <div className="report-toolbar">
         <button className="primary-btn" type="button" onClick={() => downloadApi('/api/reports/full.pdf', 'finaudit_full_report.pdf')}><Download size={16} />Full report (PDF)</button>
         <button className="secondary-btn" type="button" onClick={() => downloadApi('/api/reports/full.csv', 'finaudit_full_report.csv')}><Download size={16} />Full report (CSV)</button>
-        <button className="secondary-btn" type="button" onClick={() => downloadApi('/api/transactions/export.csv', 'transactions.csv')}><Download size={16} />Transactions (filtered CSV)</button>
+        <button className="secondary-btn" type="button" onClick={() => downloadApi('/api/transactions/export.csv', 'transactions.csv')}><Download size={16} />Transactions CSV</button>
         <button className="secondary-btn" type="button" onClick={() => downloadApi('/api/risk/alerts/export.csv?severity=high,critical', 'risk_alerts.csv')}><Download size={16} />Risk alerts (CSV)</button>
         {latestAuditId && <button className="secondary-btn" type="button" onClick={() => downloadApi(`/api/audits/${latestAuditId}/export.csv`, `audit_${latestAuditId}.csv`)}><Download size={16} />Audit #{latestAuditId}</button>}
         {latestReconId && <button className="secondary-btn" type="button" onClick={() => downloadApi(`/api/reconciliations/${latestReconId}/export.csv`, `reconciliation_${latestReconId}.csv`)}><Download size={16} />Reconciliation #{latestReconId}</button>}
@@ -3954,7 +4044,8 @@ function InvestigationsPage({ audits = [], onNavigate }) {
 }
 
 
-function CasesPage({ audits = [] }) {
+function CasesPage({ audits = [], currentUser = null, refreshSignal = 0 }) {
+  const authenticatedActor = currentUser?.full_name || currentUser?.username || 'Authenticated user';
   const [cases, setCases] = useState([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -3963,8 +4054,8 @@ function CasesPage({ audits = [] }) {
   const [msg, setMsg] = useState('');
   const [err, setErr] = useState('');
   const [form, setForm] = useState({ title: '', description: '', severity: 'medium', transaction_id: '', vendor_name: '', assigned_to: '' });
-  const [statusForm, setStatusForm] = useState({ status: 'open', resolution: '', reviewer_notes: '', actor: 'reviewer' });
-  const [note, setNote] = useState({ author: 'reviewer', note: '' });
+  const [statusForm, setStatusForm] = useState({ status: 'open', resolution: '', reviewer_notes: '' });
+  const [note, setNote] = useState({ note: '' });
   const [evidenceForm, setEvidenceForm] = useState({ source_type: 'document', source_reference: '', excerpt: '' });
 
   const load = async () => {
@@ -3982,7 +4073,7 @@ function CasesPage({ audits = [] }) {
       setLoading(false);
     }
   };
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, [refreshSignal]);
 
   const openCase = async (caseRef) => {
     setSelected(caseRef);
@@ -3993,7 +4084,7 @@ function CasesPage({ audits = [] }) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Failed to load case');
       setDetail(data);
-      setStatusForm({ status: data.status || 'open', resolution: data.resolution || '', reviewer_notes: '', actor: 'reviewer' });
+      setStatusForm({ status: data.status || 'open', resolution: data.resolution || '', reviewer_notes: '' });
     } catch (e) {
       setErr(e.message);
     }
@@ -4003,7 +4094,7 @@ function CasesPage({ audits = [] }) {
     setMsg('');
     setErr('');
     try {
-      const payload = { ...form, audit_run_id: audits[0]?.id, created_by: 'reviewer' };
+      const payload = { ...form, audit_run_id: audits[0]?.id };
       Object.keys(payload).forEach(k => { if (payload[k] === '') delete payload[k]; });
       const res = await apiFetch(`/api/investigations`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
@@ -4041,11 +4132,11 @@ function CasesPage({ audits = [] }) {
     setErr('');
     try {
       const res = await apiFetch(`/api/investigations/${encodeURIComponent(selected)}/notes`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(note),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: note.note }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Failed');
-      setNote({ ...note, note: '' });
+      setNote({ note: '' });
       await openCase(selected);
       setMsg('Note added');
     } catch (e) {
@@ -4059,7 +4150,7 @@ function CasesPage({ audits = [] }) {
     try {
       const res = await apiFetch(`/api/investigations/${encodeURIComponent(selected)}/evidence`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...evidenceForm, added_by: 'reviewer', metadata: { added_from: 'investigation workspace' } }),
+        body: JSON.stringify({ ...evidenceForm, metadata: { added_from: 'investigation workspace' } }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Failed');
@@ -4088,7 +4179,7 @@ function CasesPage({ audits = [] }) {
 
   return (
     <>
-      <header className="page-header"><div><h1>Investigation Cases</h1><p>Alerts to cases with status, reviewer, evidence, notes and history</p></div></header>
+      <header className="page-header"><div><h1>Investigation Cases</h1><p>Alerts to cases with status, reviewer, evidence, notes and history</p><small>Audit events are recorded as {authenticatedActor} (signed-in user).</small></div></header>
       {err && <div className="warning-box" style={{ marginBottom: 12 }}>{err}</div>}
       {msg && <div className="success-box" style={{ marginBottom: 12 }}>{msg}</div>}
       <section className="panel" style={{ padding: 18, marginBottom: 18, display: 'grid', gap: 10 }}>
@@ -4126,12 +4217,12 @@ function CasesPage({ audits = [] }) {
               <div style={{ display: 'grid', gap: 14, marginTop: 12 }}>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: 8 }}>
                   <select value={statusForm.status} onChange={e=>setStatusForm({...statusForm,status:e.target.value})} style={{ padding: 8, borderRadius: 8 }}><option>open</option><option>under_review</option><option>resolved</option><option>dismissed</option></select>
-                  <input placeholder="Actor" value={statusForm.actor} onChange={e=>setStatusForm({...statusForm,actor:e.target.value})} style={{ padding: 8, borderRadius: 8 }}/>
+                  <span style={{ fontSize: 12, color: 'var(--dash-text-secondary)' }}>Actor: {authenticatedActor}</span>
                   <button className="primary-btn" onClick={updateStatus}>Update status</button>
                 </div>
                 <input placeholder="Resolution (optional)" value={statusForm.resolution} onChange={e=>setStatusForm({...statusForm,resolution:e.target.value})} style={{ padding: 8, borderRadius: 8 }}/>
                 <textarea placeholder="Reviewer note (also logged on update)" value={statusForm.reviewer_notes} onChange={e=>setStatusForm({...statusForm,reviewer_notes:e.target.value})} style={{ padding: 8, borderRadius: 8, minHeight: 48 }}/>
-                <div style={{ display: 'flex', gap: 8 }}><input placeholder="Note author" value={note.author} onChange={e=>setNote({...note,author:e.target.value})} style={{ padding: 8, borderRadius: 8, width: 140 }}/><input placeholder="Add a note" value={note.note} onChange={e=>setNote({...note,note:e.target.value})} style={{ padding: 8, borderRadius: 8, flex: 1 }}/><button className="secondary-btn" onClick={addNote}>Add note</button></div>
+                <div style={{ display: 'flex', gap: 8 }}><span style={{ fontSize: 12, color: 'var(--dash-text-secondary)', minWidth: 140 }}>Author: {authenticatedActor}</span><input placeholder="Add a note" value={note.note} onChange={e=>setNote({ note: e.target.value })} style={{ padding: 8, borderRadius: 8, flex: 1 }}/><button className="secondary-btn" onClick={addNote}>Add note</button></div>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: 8 }}>
                   <select value={evidenceForm.source_type} onChange={e=>setEvidenceForm({...evidenceForm,source_type:e.target.value})} style={{ padding: 8, borderRadius: 8 }}><option>document</option><option>transaction_record</option><option>rag_chunk</option><option>invoice</option></select>
                   <input placeholder="Source reference" value={evidenceForm.source_reference} onChange={e=>setEvidenceForm({...evidenceForm,source_reference:e.target.value})} style={{ padding: 8, borderRadius: 8 }}/>

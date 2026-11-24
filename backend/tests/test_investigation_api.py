@@ -1,6 +1,8 @@
 """Deterministic tests for the investigation case workflow."""
+from contextlib import contextmanager
 import os
 import tempfile
+from types import SimpleNamespace
 
 TEST_DB_DIR = tempfile.mkdtemp(prefix="finaudit-investigation-tests-")
 os.environ.setdefault("FINAUDIT_DATABASE_URL", f"sqlite:///{os.path.join(TEST_DB_DIR, 'investigations.db')}")
@@ -9,10 +11,12 @@ from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import create_engine  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
+from app import auth as auth_module  # noqa: E402
 from app import investigation_api  # noqa: E402
 from app.database import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import RiskAlert, TransactionRecord  # noqa: E402
+from app.ownership import reset_data_scope, set_data_scope  # noqa: E402
 
 
 def build_client(tmp_path):
@@ -37,6 +41,29 @@ def build_client(tmp_path):
 def teardown(engine):
     app.dependency_overrides.pop(get_db, None)
     engine.dispose()
+
+
+@contextmanager
+def acting_as(user):
+    """Temporarily authenticate endpoint calls as ``user``."""
+    dependency = auth_module.get_current_active_user
+    previous = app.dependency_overrides.get(dependency)
+
+    async def _current_user():
+        token = set_data_scope(user)
+        try:
+            yield user
+        finally:
+            reset_data_scope(token)
+
+    app.dependency_overrides[dependency] = _current_user
+    try:
+        yield
+    finally:
+        if previous is None:
+            app.dependency_overrides.pop(dependency, None)
+        else:
+            app.dependency_overrides[dependency] = previous
 
 
 def seed_alert_and_transaction(factory):
@@ -76,7 +103,7 @@ def seed_alert_and_transaction(factory):
         db.commit()
 
 
-async def fake_explain(question, evidence=""):
+async def fake_explain(question, evidence="", *, scope):
     return {
         "answer": "Grounded explanation for human review.",
         "model": "test-model",
@@ -100,9 +127,18 @@ def test_create_from_alert_notes_status_and_export(tmp_path, monkeypatch):
         assert case["case_number"].startswith("INV-")
         assert case["status"] == "open"
         assert case["risk_alert_id"] is not None
+        assert case["created_by"] == "test-admin"
         assert len(case["evidence"]) >= 2
-        assert any(item["source_type"] == "risk_alert" for item in case["evidence"])
+        assert any(
+            item["source_type"] == "risk_alert" and item["source_id"] == "RA-TEST-0001"
+            for item in case["evidence"]
+        )
         assert any(item["source_type"] == "transaction_record" for item in case["evidence"])
+        assert all(item["added_by"] == "test-admin" for item in case["evidence"])
+        assert any(
+            item["action"] == "created_from_alert" and item["actor"] == "test-admin"
+            for item in case["history"]
+        )
 
         alert = client.get("/api/risk/alerts/RA-TEST-0001").json()
         assert alert["review_status"] == "investigating"
@@ -151,6 +187,42 @@ def test_create_from_alert_notes_status_and_export(tmp_path, monkeypatch):
         assert resolved.json()["resolved_at"] is not None
     finally:
         teardown(engine)
+
+
+def test_explanation_scope_follows_authenticated_user(tmp_path, monkeypatch):
+    client, factory, engine = build_client(tmp_path)
+    seed_alert_and_transaction(factory)
+    created = client.post(
+        "/api/investigations/from-alert/RA-TEST-0001",
+        json={"created_by": "setup"},
+    )
+    assert created.status_code == 201, created.text
+    case_ref = created.json()["case_number"]
+    owners = []
+
+    async def scoped_explain(question, evidence="", *, scope):
+        owners.append((scope.owner_user_id, scope.global_access))
+        return {
+            "answer": "Grounded explanation for human review.",
+            "model": "test-model",
+            "retrieved_sources": [],
+            "fallback": False,
+        }
+
+    monkeypatch.setattr(investigation_api, "explain_finding", scoped_explain)
+    for user_id in (301, 302):
+        user = SimpleNamespace(
+            id=user_id,
+            username=f"investigation-user-{user_id}",
+            role="user",
+            is_active=True,
+        )
+        with acting_as(user):
+            response = client.post(f"/api/investigations/{case_ref}/explain")
+        assert response.status_code == 200, response.text
+
+    assert owners == [(301, False), (302, False)]
+    teardown(engine)
 
 
 def test_case_validation_and_listing(tmp_path):

@@ -16,7 +16,6 @@ from app import llm, rag  # noqa: E402
 from app.agents import assistant_graph as graph_module  # noqa: E402
 from app.database import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.vector_store import VectorStore  # noqa: E402
 
 
 def build_client(tmp_path):
@@ -80,10 +79,10 @@ def test_system_health_reports_real_status_without_secrets(tmp_path):
 
 
 def test_rag_management_ingest_status_retrieval_delete_and_reindex(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, scoped_vector_store
 ):
     client, _, engine = build_client(tmp_path)
-    monkeypatch.setattr(rag, "_store", VectorStore(tmp_path / "rag"))
+    monkeypatch.setattr(rag, "_store", scoped_vector_store)
     try:
         ingested = client.post(
             "/api/documents/ingest",
@@ -105,7 +104,7 @@ def test_rag_management_ingest_status_retrieval_delete_and_reindex(
 
         retrieved = client.post(
             "/api/documents/retrieval-test",
-            json={"query": "INV-7788 duplicate payment", "top_k": 5},
+            json={"query": "INV-7788 paid twice", "top_k": 5},
         )
         assert retrieved.status_code == 200, retrieved.text
         data = retrieved.json()
@@ -135,9 +134,9 @@ REQUIRED = {
 }
 
 
-def test_assistant_exposes_five_roles_and_persists_history(tmp_path, monkeypatch):
+def test_assistant_exposes_five_roles_and_persists_history(tmp_path, monkeypatch, scoped_vector_store):
     client, factory, engine = build_client(tmp_path)
-    monkeypatch.setattr(rag, "_store", VectorStore(tmp_path / "rag"))
+    monkeypatch.setattr(rag, "_store", scoped_vector_store)
     monkeypatch.setattr(graph_module, "SessionLocal", lambda: factory())
     monkeypatch.setattr(llm, "is_available", lambda: False)
     try:
@@ -162,9 +161,9 @@ def test_assistant_exposes_five_roles_and_persists_history(tmp_path, monkeypatch
         teardown(engine)
 
 
-def test_assistant_records_individual_agent_failure(tmp_path, monkeypatch):
+def test_assistant_records_individual_agent_failure(tmp_path, monkeypatch, scoped_vector_store):
     client, factory, engine = build_client(tmp_path)
-    monkeypatch.setattr(rag, "_store", VectorStore(tmp_path / "rag"))
+    monkeypatch.setattr(rag, "_store", scoped_vector_store)
     monkeypatch.setattr(graph_module, "SessionLocal", lambda: factory())
     monkeypatch.setattr(llm, "is_available", lambda: False)
 

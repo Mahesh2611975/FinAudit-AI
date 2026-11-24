@@ -1,12 +1,17 @@
+from contextlib import contextmanager
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app import auth as auth_module
 from app import risk_api
 from app.database import Base, get_db
 from app.main import app
 from app.models import TransactionRecord
+from app.ownership import reset_data_scope, set_data_scope
 
 
 @pytest.fixture
@@ -32,6 +37,29 @@ def risk_client(tmp_path):
     finally:
         app.dependency_overrides.pop(get_db, None)
         engine.dispose()
+
+
+@contextmanager
+def acting_as(user):
+    """Temporarily authenticate endpoint calls as ``user``."""
+    dependency = auth_module.get_current_active_user
+    previous = app.dependency_overrides.get(dependency)
+
+    async def _current_user():
+        token = set_data_scope(user)
+        try:
+            yield user
+        finally:
+            reset_data_scope(token)
+
+    app.dependency_overrides[dependency] = _current_user
+    try:
+        yield
+    finally:
+        if previous is None:
+            app.dependency_overrides.pop(dependency, None)
+        else:
+            app.dependency_overrides[dependency] = previous
 
 
 def seed_duplicate(session_factory):
@@ -148,6 +176,36 @@ def test_review_workflow_persists_event_and_status(risk_client):
     assert missing_actor.status_code == 200
 
 
+def test_review_event_uses_authenticated_user_not_client_supplied_identity(risk_client):
+    client, session_factory = risk_client
+    seed_duplicate(session_factory)
+    analyze(client)
+    alert = first_alert(client)
+    reviewer = SimpleNamespace(
+        id=777,
+        username="signed.in.reviewer",
+        full_name="Signed In Reviewer",
+        role="reviewer",
+        is_active=True,
+    )
+
+    with acting_as(reviewer):
+        response = client.post(
+            f"/api/risk/alerts/{alert['id']}/review",
+            json={
+                "action": "investigate",
+                "reviewer_name": "spoofed.reviewer",
+                "actor": "spoofed.reviewer",
+                "comment": "Reviewed by the signed-in account.",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    events = response.json()["events"]
+    assert events[0]["actor"] == "signed.in.reviewer"
+    assert all(event["actor"] != "spoofed.reviewer" for event in events)
+
+
 def test_investigate_uses_deterministic_context_and_ai(monkeypatch, risk_client):
     client, session_factory = risk_client
     seed_duplicate(session_factory)
@@ -155,9 +213,10 @@ def test_investigate_uses_deterministic_context_and_ai(monkeypatch, risk_client)
     alert = first_alert(client)
     captured = {}
 
-    async def fake_explain(question, evidence):
+    async def fake_explain(question, evidence, *, scope):
         captured["question"] = question
         captured["evidence"] = evidence
+        captured["scope"] = scope
         return {
             "answer": "Human review is required.",
             "model": "mock",
@@ -174,6 +233,47 @@ def test_investigate_uses_deterministic_context_and_ai(monkeypatch, risk_client)
     assert payload["ai"]["answer"] == "Human review is required."
     assert "not proof of fraud" in captured["question"]
     assert "Duplicate Vendor" in captured["evidence"]
+    assert captured["scope"].owner_user_id == 1
+    assert captured["scope"].global_access is False
+
+
+def test_risk_explanation_scope_follows_authenticated_user(monkeypatch, risk_client):
+    client, session_factory = risk_client
+    seed_duplicate(session_factory)
+    analyze(client)
+    alert = first_alert(client)
+    owners = []
+
+    async def fake_explain(question, evidence, *, scope):
+        owners.append((scope.owner_user_id, scope.global_access))
+        return {
+            "answer": "Human review is required.",
+            "model": "mock",
+            "retrieved_sources": [],
+            "fallback": False,
+        }
+
+    monkeypatch.setattr(risk_api, "explain_finding", fake_explain)
+    with acting_as(SimpleNamespace(id=201, username="risk-user-201", role="user", is_active=True)):
+        rejected = client.post(
+            "/api/risk/investigate",
+            json={"alert_id": alert["id"], "global_access": True},
+        )
+    assert rejected.status_code == 400
+    assert owners == []
+
+    for user_id in (201, 202):
+        user = SimpleNamespace(
+            id=user_id,
+            username=f"risk-user-{user_id}",
+            role="user",
+            is_active=True,
+        )
+        with acting_as(user):
+            response = client.post("/api/risk/investigate", json={"alert_id": alert["id"]})
+        assert response.status_code == 200, response.text
+
+    assert owners == [(201, False), (202, False)]
 
 
 def test_config_channels_trends_and_geography_endpoints(risk_client):

@@ -40,7 +40,19 @@ from .models import (
     RevokedToken,
     User,
 )
-from .ownership import reset_data_scope, set_data_scope
+from .ownership import (
+    RAG_DEBUG_PERMISSION,
+    RAG_GLOBAL_READ_PERMISSION,
+    RAG_GLOBAL_WRITE_PERMISSION,
+    RAG_READ,
+    RAG_SCOPE_SOURCE_REQUEST,
+    RAG_WRITE,
+    RagAccessDenied,
+    RagScope,
+    reset_data_scope,
+    set_data_scope,
+    validate_rag_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +226,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "investigation:read", "investigation:write",
         "invoice:read", "invoice:write", "invoice:review",
         "reports:read", "assistant:use", "documents:write", "documents:read",
+        RAG_DEBUG_PERMISSION, RAG_GLOBAL_READ_PERMISSION, RAG_GLOBAL_WRITE_PERMISSION,
         "settings:read", "settings:write",
     },
     # New self-service account type: internal company user. Deliberately has no
@@ -226,6 +239,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "investigation:read", "investigation:write",
         "invoice:read", "invoice:write",
         "reports:read", "assistant:use", "documents:write", "documents:read",
+        RAG_DEBUG_PERMISSION,
         "settings:read",
     },
     # Lenders only work with invoice evidence for their own account. They do not
@@ -243,6 +257,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "investigation:read", "investigation:write",
         "invoice:read", "invoice:write",
         "reports:read", "assistant:use", "documents:write", "documents:read",
+        RAG_DEBUG_PERMISSION,
         "settings:read",
     },
     ROLE_AUDITOR: {
@@ -253,6 +268,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "investigation:read", "investigation:write",
         "invoice:read",
         "reports:read", "assistant:use", "documents:read",
+        RAG_DEBUG_PERMISSION,
         "settings:read",
     },
     ROLE_REVIEWER: {
@@ -263,6 +279,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "investigation:read", "investigation:write",
         "invoice:read", "invoice:review",
         "reports:read", "assistant:use", "documents:read",
+        RAG_DEBUG_PERMISSION,
         "settings:read",
     },
 }
@@ -274,6 +291,48 @@ def role_permissions(role: str) -> set[str]:
 
 def has_permission(user: User, permission: str) -> bool:
     return permission in role_permissions(str(user.role))
+
+
+def rag_scope_for_user(
+    user: User,
+    *,
+    operation: str = RAG_READ,
+    global_access: bool = False,
+    audit_reason: str | None = None,
+) -> RagScope:
+    """Build a trusted RAG scope from an already-authenticated user.
+
+    Call this only with the principal resolved by ``get_current_active_user``
+    (or a permission dependency). The owner id and permissions come from that
+    principal, never from request payload data. Global access additionally
+    requires the explicit RAG global permission for the requested operation.
+    """
+    if operation not in (RAG_READ, RAG_WRITE):
+        raise RagAccessDenied("Unrecognized RAG operation.")
+    if getattr(user, "is_active", True) is False:
+        raise RagAccessDenied("Inactive users cannot establish a RAG scope.")
+
+    permissions = role_permissions(str(user.role))
+    if global_access:
+        required = (
+            RAG_GLOBAL_WRITE_PERMISSION if operation == RAG_WRITE else RAG_GLOBAL_READ_PERMISSION
+        )
+        if required not in permissions:
+            raise RagAccessDenied(f"RAG global access requires {required}.")
+
+    try:
+        owner_user_id = int(user.id)
+    except (TypeError, ValueError) as exc:
+        raise RagAccessDenied("Authenticated user has no valid integer id.") from exc
+
+    scope = RagScope(
+        owner_user_id=owner_user_id,
+        permissions=frozenset(permissions),
+        global_access=global_access,
+        source=RAG_SCOPE_SOURCE_REQUEST,
+        audit_reason=audit_reason,
+    )
+    return validate_rag_scope(scope, operation=operation)
 
 
 def approval_status(user: User) -> str:
@@ -585,11 +644,13 @@ ROUTE_PERMISSIONS: tuple[tuple[str, str, str | None], ...] = (
     ("GET", r"/api/transactions/[^/]+", "data:read"),
     ("POST", r"/api/documents/(ingest|sync-transactions|reindex)", "documents:write"),
     ("DELETE", r"/api/documents/.+", "documents:write"),
+    ("GET", r"/api/documents", "documents:read"),
     ("GET", r"/api/documents/.+", "documents:read"),
-    ("POST", r"/api/documents/retrieval-test", "documents:read"),
+    ("POST", r"/api/documents/retrieval-test", RAG_DEBUG_PERMISSION),
     ("GET", r"/api/assistant/suggestions", "assistant:use"),
     ("GET", r"/api/assistant/config", "settings:read"),
     ("POST", r"/api/assistant/query", "assistant:use"),
+    ("POST", r"/api/vendors/\d+/investigate", "assistant:use"),
     ("GET", r"/api/reports/.+", "data:export"),
     # Invoice / lender-facing evidence surface.
     ("POST", r"/api/(vendors|purchase-orders|goods-receipts)(/import)?", "invoice:write"),

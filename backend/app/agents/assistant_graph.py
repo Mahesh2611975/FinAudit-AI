@@ -31,8 +31,10 @@ from sqlalchemy.orm import Session
 
 from .. import llm, rag
 from ..database import SessionLocal
-from ..models import ReconciliationResult, ReconciliationRun, RiskAlert, TransactionRecord
+from ..models import ReconciliationResult, ReconciliationRun, RiskAlert, TransactionRecord, Vendor
+from ..ownership import RAG_READ, RagScope, validate_rag_scope
 from .schemas import AgentOutput
+from .vendor_intelligence import AGENT_VENDOR, VendorIntelligenceAgent, vendor_data_scope
 
 AGENT_ORCHESTRATOR = "Orchestrator Agent"
 AGENT_FINANCIAL = "Financial Analyst Agent"
@@ -50,12 +52,14 @@ AGENT_NODE = {
     AGENT_RECONCILIATION: "reconciliation",
     AGENT_RISK: "risk",
     AGENT_EVIDENCE: "evidence",
+    AGENT_VENDOR: "vendor",
     AGENT_SUMMARY: "reporting",
 }
 
 # Route keys exposed to clients.  "transaction"/"reporting" are retained so
 # existing integrations keep working while the five required roles are exposed
-# through ``agent_roles`` and the timeline.
+# through ``agent_roles`` and the timeline.  The vendor specialist is optional
+# and deliberately absent from NODE_TO_ROLE so REQUIRED_AGENT_ROLES stays stable.
 NODE_TO_ROLE = {
     "transaction": "Financial Analyst Agent",
     "reconciliation": "Reconciliation Agent",
@@ -64,9 +68,19 @@ NODE_TO_ROLE = {
     "reporting": "Investigation Summary Agent",
 }
 
+OPTIONAL_NODE_TO_ROLE = {"vendor": AGENT_VENDOR}
+
 REQUIRED_AGENT_ROLES = tuple(NODE_TO_ROLE.values())
 
 INTENTS = {
+    "vendor": {
+        "keywords": (
+            "vendor", "supplier", "vendor intelligence", "vendor payment",
+            "vendor pattern", "vendor discrepancy", "vendor risk",
+            "repeated discrepancy", "duplicate invoice", "invoice po",
+        ),
+        "agents": [AGENT_VENDOR],
+    },
     "transaction": {
         "keywords": ("transaction", "payment", "duplicate", "vendor", "spend", "amount", "debit", "credit", "txn"),
         "agents": [AGENT_TRANSACTION],
@@ -98,6 +112,7 @@ _STOP_WORDS = {
 
 class AssistantState(TypedDict, total=False):
     question: str
+    vendor_id: int | None
     intent: str
     route: list[str]
     route_reason: str
@@ -112,6 +127,7 @@ class AssistantState(TypedDict, total=False):
     agent_failures: list[dict[str, Any]]
     agent_roles: list[str]
     llm: dict[str, Any]
+    rag_scope: RagScope
 
 
 def _now_ms() -> int:
@@ -247,11 +263,20 @@ class AssistantGraph:
             scores[intent] = sum(2 if word in {"risk", "alert", "severity", "reconcil", "duplicate", "fraud"} else 1
                                  for word in spec["keywords"] if word in question)
         # Deterministic priority for ambiguous multi-keyword questions.
-        if any(term in question for term in (
+        if state.get("vendor_id") is not None:
+            intent = "vendor"
+        elif any(term in question for term in (
             "evidence supports", "supporting evidence", "document citation",
             "rag document", "which documents", "source documents",
         )):
             intent = "evidence"
+        elif any(term in question for term in (
+            "vendor intelligence", "investigate vendor", "vendor risk",
+            "vendor payment", "vendor pattern", "vendor discrepancy",
+            "vendor discrepancies", "supplier", "repeated discrepancy",
+            "invoice po", "invoice/po",
+        )) or (question.strip().startswith("vendor") and "vendor" in question):
+            intent = "vendor"
         elif any(term in question for term in ("highest-risk", "risk alert", "risk score", "why was", "flagged", "alert")):
             intent = "risk"
         elif any(term in question for term in ("reconcil", "unmatched", "bank", "ledger", "possible match")):
@@ -564,7 +589,8 @@ class AssistantGraph:
         """
         started = _now_ms()
         question = state.get("question") or ""
-        chunks = rag.search(question, top_k=6)
+        scope = validate_rag_scope(state.get("rag_scope"), operation=RAG_READ)
+        chunks = rag.search(question, scope=scope, top_k=6)
         state["doc_evidence"] = list(chunks)
         facts = [
             f"[{item.get('source')}] {item.get('source_filename') or 'unknown file'} "
@@ -604,6 +630,134 @@ class AssistantGraph:
         _record(state, AGENT_EVIDENCE, started, f"Retrieved {len(chunks)} document chunk(s).")
         return state
 
+    @staticmethod
+    def _resolve_vendor_id(question: str, scope: RagScope) -> int | None:
+        """Resolve one vendor deterministically from question tokens, if unique."""
+        ignored = {
+            "vendor", "vendors", "supplier", "investigate", "intelligence",
+            "analysis", "pattern", "patterns", "risk", "discrepancy",
+            "discrepancies", "payment", "payments", "invoice", "invoices",
+            "duplicate", "mismatch", "mismatches", "summary", "explain",
+        }
+        tokens = [
+            token.lower() for token in _question_tokens(question)
+            if token.lower() not in ignored and len(token) > 2
+        ]
+        if not tokens:
+            return None
+        with vendor_data_scope(scope):
+            db: Session = SessionLocal()
+            try:
+                candidate_ids: set[int] = set()
+                for token in tokens:
+                    like = f"%{token}%"
+                    rows = (
+                        db.query(Vendor)
+                        .filter(
+                            or_(
+                                Vendor.vendor_name.ilike(like),
+                                Vendor.vendor_code.ilike(like),
+                            )
+                        )
+                        .limit(10)
+                        .all()
+                    )
+                    candidate_ids.update(row.id for row in rows)
+                return next(iter(candidate_ids)) if len(candidate_ids) == 1 else None
+            finally:
+                db.close()
+
+    @_guarded(AGENT_VENDOR, "vendor")
+    def _vendor(self, state: AssistantState) -> AssistantState:
+        """Execute the real scoped vendor workflow for a vendor-specific question."""
+        started = _now_ms()
+        scope = validate_rag_scope(state.get("rag_scope"), operation=RAG_READ)
+        vendor_id = state.get("vendor_id")
+        if vendor_id is not None:
+            try:
+                vendor_id = int(vendor_id)
+            except (TypeError, ValueError):
+                vendor_id = None
+        if vendor_id is None or vendor_id < 1:
+            vendor_id = self._resolve_vendor_id(state.get("question") or "", scope)
+
+        if vendor_id is None:
+            output = _validate(
+                {
+                    "agent_name": AGENT_VENDOR,
+                    "status": "completed",
+                    "facts": ["No unique vendor could be resolved from the question."],
+                    "hypotheses": [],
+                    "missing_evidence": [
+                        "Provide a vendor_id or name a single existing vendor in the question."
+                    ],
+                    "recommendations": ["Select a vendor before requesting an investigation."],
+                    "evidence": [],
+                    "data": {"resolved": False},
+                }
+            )
+            state.setdefault("agent_outputs", {})[AGENT_VENDOR] = output
+            _record(state, AGENT_VENDOR, started, "No unique vendor was resolved.")
+            return state
+
+        result = VendorIntelligenceAgent().run(vendor_id, scope=scope, persist=False)
+        retrieved = result.get("retrieved_evidence") or []
+        sql_items = []
+        for ref in result.get("evidence_references") or []:
+            sql_items.append(
+                {
+                    "source_id": ref.get("source_id"),
+                    "source_type": ref.get("source_type"),
+                    "record_id": ref.get("record_id"),
+                    "source_file": ref.get("source_file"),
+                    "source_row": ref.get("source_row"),
+                    "transaction_id": ref.get("transaction_id"),
+                    "text": ref.get("excerpt"),
+                }
+            )
+        evidence = [
+            {
+                "source_file": item.get("source_filename"),
+                "source_row": None,
+                "transaction_id": item.get("transaction_id"),
+                "excerpt": item.get("excerpt"),
+                "record_id": item.get("doc_id"),
+            }
+            for item in retrieved
+        ]
+        facts = list(result.get("verified_database_facts") or [])
+        output = _validate(
+            {
+                "agent_name": AGENT_VENDOR,
+                "status": result.get("status") or "completed",
+                "facts": facts or [f"Vendor {vendor_id} analysis completed."],
+                "hypotheses": list(result.get("ai_interpretations") or []),
+                "missing_evidence": list(result.get("missing_evidence") or []),
+                "recommendations": list(result.get("recommended_review_actions") or []),
+                "evidence": evidence,
+                "data": {
+                    "vendor_id": vendor_id,
+                    "financial_exposure": result.get("financial_exposure") or {},
+                    "risk_indicators": result.get("risk_indicators") or [],
+                    "conclusion_status": result.get("conclusion_status"),
+                },
+            }
+        )
+        state.setdefault("sql_evidence", []).extend(sql_items)
+        state["doc_evidence"] = list(retrieved)
+        state.setdefault("agent_outputs", {})[AGENT_VENDOR] = output
+        _record(
+            state,
+            AGENT_VENDOR,
+            started,
+            (
+                f"Analyzed vendor {vendor_id}: "
+                f"{len(facts)} fact(s), {len(sql_items)} reference(s), "
+                f"{len(retrieved)} document chunk(s)."
+            ),
+        )
+        return state
+
     @_guarded(AGENT_SUMMARY, "reporting")
     def _reporting(self, state: AssistantState) -> AssistantState:
         started = _now_ms()
@@ -618,7 +772,8 @@ class AssistantGraph:
         # role still receive grounded document citations.
         doc_evidence = state.get("doc_evidence") or []
         if not doc_evidence:
-            doc_evidence = rag.search(question, top_k=5)
+            scope = validate_rag_scope(state.get("rag_scope"), operation=RAG_READ)
+            doc_evidence = rag.search(question, scope=scope, top_k=5)
         state["doc_evidence"] = doc_evidence
 
         evidence_blob = "\n".join(f"[{item.get('source_id')}] {item.get('text')}" for item in sql_evidence[:15])
@@ -626,7 +781,13 @@ class AssistantGraph:
             {"source": item["source"], "text": item["text"], "score": item.get("score", 0)}
             for item in doc_evidence
         ]
-        prompt, context_text = llm.build_prompt(question, evidence_blob, prompt_contexts)
+        scope = validate_rag_scope(state.get("rag_scope"), operation=RAG_READ)
+        prompt, context_text = llm.build_prompt(
+            question,
+            evidence_blob,
+            prompt_contexts,
+            scope=scope,
+        )
 
         narrative = "Evidence summary (Ollama unavailable): " + (" ".join(facts[:5]) if facts else "No stored evidence found.")
         llm_meta: dict[str, Any] = {"backend": "ollama", "fallback": True, "model": llm.get_model()}
@@ -730,6 +891,7 @@ class AssistantGraph:
         graph.add_node("reconciliation", self._reconciliation)
         graph.add_node("risk", self._risk)
         graph.add_node("evidence", self._evidence)
+        graph.add_node("vendor", self._vendor)
         graph.add_node("reporting", self._reporting)
 
         routes = {
@@ -737,18 +899,28 @@ class AssistantGraph:
             "reconciliation": "reconciliation",
             "risk": "risk",
             "evidence": "evidence",
+            "vendor": "vendor",
             "reporting": "reporting",
         }
         graph.add_edge(START, "orchestrator")
         graph.add_conditional_edges("orchestrator", self._first_agent, routes)
-        for node in ("transaction", "reconciliation", "risk", "evidence"):
+        for node in ("transaction", "reconciliation", "risk", "evidence", "vendor"):
             graph.add_conditional_edges(node, self._next_agent(node), routes)
         graph.add_edge("reporting", END)
         return graph.compile()
 
-    def run(self, question: str) -> dict[str, Any]:
+    def run(
+        self,
+        question: str,
+        *,
+        scope: RagScope | None = None,
+        vendor_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Run one user's assistant workflow; the scope is never stored globally."""
+        validated_scope = validate_rag_scope(scope, operation=RAG_READ)
         initial: AssistantState = {
             "question": question,
+            "vendor_id": vendor_id,
             "route": [],
             "sql_evidence": [],
             "doc_evidence": [],
@@ -758,8 +930,11 @@ class AssistantGraph:
             "timeline": [],
             "agent_failures": [],
             "agent_roles": [],
+            "rag_scope": validated_scope,
         }
         result = dict(self.graph.invoke(initial))
+        # Never expose or persist the trusted scope in API/run payloads.
+        result.pop("rag_scope", None)
         result.setdefault("answer", "")
         result.setdefault("sufficiency", "insufficient")
         result.setdefault("agent_failures", [])

@@ -22,7 +22,6 @@ from app import llm, rag  # noqa: E402
 from app.agents import assistant_graph as graph_module  # noqa: E402
 from app.database import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.vector_store import VectorStore  # noqa: E402
 
 
 TXN_CSV = (
@@ -74,9 +73,9 @@ def teardown(engine):
     engine.dispose()
 
 
-def test_deterministic_end_to_end_workflow(tmp_path, monkeypatch):
+def test_deterministic_end_to_end_workflow(tmp_path, monkeypatch, scoped_vector_store):
     client, factory, engine = build_client(tmp_path)
-    monkeypatch.setattr(rag, "_store", VectorStore(tmp_path / "rag"))
+    monkeypatch.setattr(rag, "_store", scoped_vector_store)
     monkeypatch.setattr(graph_module, "SessionLocal", lambda: factory())
     monkeypatch.setattr(llm, "is_available", lambda: False)
     try:
@@ -160,7 +159,7 @@ def test_deterministic_end_to_end_workflow(tmp_path, monkeypatch):
 
         retrieval = client.post(
             "/api/documents/retrieval-test",
-            json={"query": "INV-9001 duplicate payment refund", "top_k": 5},
+            json={"query": "INV-9001 paid twice refunded", "top_k": 5},
         )
         assert retrieval.status_code == 200, retrieval.text
         retrieved = retrieval.json()

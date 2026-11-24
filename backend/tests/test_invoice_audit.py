@@ -3,6 +3,8 @@ import tempfile
 import uuid
 from datetime import date
 
+import pytest
+
 TEST_DB_DIR = tempfile.mkdtemp(prefix="finaudit-invoice-tests-")
 os.environ["FINAUDIT_DATABASE_URL"] = f"sqlite:///{os.path.join(TEST_DB_DIR, 'test.db')}"
 
@@ -14,6 +16,12 @@ from app.main import app  # noqa: E402
 from app.models import Invoice, InvoiceDiscrepancy, TransactionRecord  # noqa: E402
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _scoped_rag_store(monkeypatch, scoped_vector_store):
+    """Keep invoice workflow tests on a migrated, owner-scoped temporary RAG store."""
+    monkeypatch.setattr("app.rag._store", scoped_vector_store)
 
 
 def uid():

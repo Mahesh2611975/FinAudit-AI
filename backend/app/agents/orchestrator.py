@@ -26,14 +26,22 @@ from ..models import (
     ReconciliationRun,
     TransactionRecord,
 )
+from ..ownership import (
+    RAG_READ,
+    RagScope,
+    reject_client_rag_scope_input,
+    validate_rag_scope,
+)
 from ..rag import retrieve_context
 from .schemas import OrchestratorInput
+from .vendor_intelligence import VendorIntelligenceAgent
 
 AGENT_INTAKE = "Transaction Intake Agent"
 AGENT_RECON = "Reconciliation Agent"
 AGENT_ANOMALY = "Anomaly Investigation Agent"
 AGENT_ANALYSIS = "Financial Analysis Agent"
 AGENT_EVIDENCE = "Evidence Retrieval / RAG Agent"
+AGENT_VENDOR = "Vendor Intelligence Agent"
 AGENT_SYNTHESIS = "Investigation Synthesis Agent"
 AGENT_REPORT = "Reporting Agent"
 
@@ -56,6 +64,7 @@ class WorkflowState(TypedDict, total=False):
     evidence: list[dict[str, Any]]
     missing_evidence: list[str]
     require_human_review: bool
+    rag_scope: RagScope
 
 
 def _now() -> datetime:
@@ -310,6 +319,11 @@ class MultiAgentOrchestrator:
                 if parsed.reconciliation_id is None:
                     # Not fatal: the reconciliation node reports the missing input.
                     pass
+            elif parsed.task_type == "vendor_intelligence":
+                if parsed.vendor_id is None or parsed.vendor_id < 1:
+                    raise ValueError(
+                        "Vendor intelligence requires a positive vendor_id."
+                    )
 
             output = {
                 "validated": True,
@@ -320,6 +334,8 @@ class MultiAgentOrchestrator:
                 "reconciliation_id": parsed.reconciliation_id,
                 "case_id": parsed.case_id,
                 "focus_transaction_id": parsed.focus_transaction_id,
+                "invoice_id": parsed.invoice_id,
+                "vendor_id": parsed.vendor_id,
             }
             return {
                 "key": "intake",
@@ -838,7 +854,8 @@ class MultiAgentOrchestrator:
                         "reconciliation bank ledger unmatched amount mismatch "
                         "human review"
                     )
-                    retrieval = retrieve_context(query)
+                    scope = validate_rag_scope(current.get("rag_scope"), operation=RAG_READ)
+                    retrieval = retrieve_context(query, scope=scope)
                     for policy in retrieval:
                         items.append(
                             {
@@ -940,7 +957,8 @@ class MultiAgentOrchestrator:
                 evidence_text = " ".join(
                     str(finding.get("evidence") or "") for finding in findings[:5]
                 )
-                retrieval = retrieve_context(query, evidence_text)
+                scope = validate_rag_scope(current.get("rag_scope"), operation=RAG_READ)
+                retrieval = retrieve_context(query, evidence_text, scope=scope)
                 for policy in retrieval:
                     items.append(
                         {
@@ -997,9 +1015,84 @@ class MultiAgentOrchestrator:
 
         return self._execute(state, AGENT_EVIDENCE, handler)
 
+    def _vendor(self, state: WorkflowState) -> WorkflowState:
+        """Run the real owner-scoped vendor intelligence workflow."""
+
+        def handler(current: WorkflowState) -> dict[str, Any]:
+            payload = current.get("input") or {}
+            vendor_id = payload.get("vendor_id")
+            if vendor_id is None:
+                raise ValueError("Vendor intelligence requires vendor_id.")
+            try:
+                vendor_id = int(vendor_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("vendor_id must be an integer.") from exc
+            scope = validate_rag_scope(current.get("rag_scope"), operation=RAG_READ)
+            result = VendorIntelligenceAgent().run(
+                vendor_id,
+                scope=scope,
+                persist=False,
+            )
+            if result.get("status") == "failed":
+                raise RuntimeError("; ".join(result.get("errors") or ["Vendor agent failed."]))
+            return {
+                "key": "vendor",
+                "summary": (
+                    f"Vendor {vendor_id}: {result.get('conclusion_status', 'reviewed')} "
+                    f"with {len(result.get('evidence_references') or [])} evidence reference(s)."
+                ),
+                "output": result,
+                "evidence": result.get("evidence_references") or [],
+                "missing_evidence": result.get("missing_evidence") or [],
+                "require_human_review": bool(result.get("require_human_review", True)),
+            }
+
+        return self._execute(state, AGENT_VENDOR, handler)
+
     def _synthesis(self, state: WorkflowState) -> WorkflowState:
         def handler(current: WorkflowState) -> dict[str, Any]:
             outputs = current.get("outputs") or {}
+            task_type = (current.get("input") or {}).get("task_type")
+            if task_type == "vendor_intelligence":
+                vendor = outputs.get("vendor") or {}
+                evidence = current.get("evidence") or []
+                conclusion_status = (
+                    vendor.get("conclusion_status") or "requires_human_review"
+                )
+                return {
+                    "key": "synthesis",
+                    "summary": (
+                        "Separated vendor database facts, calculated metrics, RAG evidence "
+                        f"and review actions; conclusion status: {conclusion_status}."
+                    ),
+                    "output": {
+                        "facts": list(vendor.get("verified_database_facts") or []),
+                        "hypotheses": list(vendor.get("ai_interpretations") or []),
+                        "limitations": list(vendor.get("missing_evidence") or []),
+                        "recommendations": list(
+                            vendor.get("recommended_review_actions") or []
+                        ),
+                        "narrative": None,
+                        "llm": {"used": False, "backend": "deterministic_rules"},
+                        "human_review_required": True,
+                        "conclusion_status": conclusion_status,
+                        "evidence_references": [
+                            {
+                                "source_id": item.get("source_id"),
+                                "source_type": item.get("source_type"),
+                                "source_file": item.get("source_file"),
+                                "source_row": item.get("source_row"),
+                                "transaction_id": item.get("transaction_id"),
+                                "doc_id": item.get("doc_id"),
+                                "chunk_id": item.get("chunk_id"),
+                                "page_number": item.get("page_number"),
+                            }
+                            for item in evidence
+                        ],
+                    },
+                    "require_human_review": True,
+                }
+
             analysis = outputs.get("analysis") or {}
             anomaly = outputs.get("anomaly") or {}
             evidence = current.get("evidence") or []
@@ -1127,8 +1220,9 @@ class MultiAgentOrchestrator:
                 retryable = {"timeout", "network", "rate_limit", "ollama_unavailable"}
                 for attempt in range(1, 3):
                     try:
+                        scope = validate_rag_scope(current.get("rag_scope"), operation=RAG_READ)
                         llm_result = asyncio.run(
-                            llm.explain_finding(question, evidence_text)
+                            llm.explain_finding(question, evidence_text, scope=scope)
                         )
                         llm_meta.update(
                             {
@@ -1220,6 +1314,9 @@ class MultiAgentOrchestrator:
             report = {
                 "task_type": task_type,
                 "period": analysis.get("period"),
+                "vendor_intelligence": (
+                    outputs.get("vendor") if task_type == "vendor_intelligence" else None
+                ),
                 "conclusion_status": synthesis.get("conclusion_status"),
                 "verified_facts": synthesis.get("facts") or [],
                 "hypotheses": synthesis.get("hypotheses") or [],
@@ -1250,7 +1347,11 @@ class MultiAgentOrchestrator:
 
             if current.get("status") != "failed":
                 if (
-                    task_type in {"investigation", "reconciliation_review"}
+                    task_type in {
+                        "investigation",
+                        "reconciliation_review",
+                        "vendor_intelligence",
+                    }
                     and current.get("require_human_review")
                 ):
                     current["status"] = "needs_human_review"
@@ -1270,6 +1371,8 @@ class MultiAgentOrchestrator:
     def _route_after_intake(self, state: WorkflowState):
         if state.get("status") == "failed":
             return END
+        if (state.get("input") or {}).get("task_type") == "vendor_intelligence":
+            return "vendor"
         return "recon"
 
     def _build_graph(self):
@@ -1279,12 +1382,16 @@ class MultiAgentOrchestrator:
         graph.add_node("anomaly", self._anomaly)
         graph.add_node("analysis", self._analysis)
         graph.add_node("evidence", self._evidence)
+        graph.add_node("vendor", self._vendor)
         graph.add_node("synthesis", self._synthesis)
         graph.add_node("report", self._report)
         graph.add_edge(START, "intake")
         graph.add_conditional_edges(
-            "intake", self._route_after_intake, {"recon": "recon", END: END}
+            "intake",
+            self._route_after_intake,
+            {"recon": "recon", "vendor": "vendor", END: END},
         )
+        graph.add_edge("vendor", "synthesis")
         graph.add_edge("recon", "anomaly")
         graph.add_edge("anomaly", "analysis")
         graph.add_edge("analysis", "evidence")
@@ -1296,7 +1403,20 @@ class MultiAgentOrchestrator:
     # ------------------------------------------------------------------
     # Execution / persistence
     # ------------------------------------------------------------------
-    def run(self, input_data: dict[str, Any], persist: bool = True) -> dict[str, Any]:
+    def run(
+        self,
+        input_data: dict[str, Any],
+        *,
+        scope: RagScope | None = None,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        """Run the workflow with an explicit trusted RAG scope.
+
+        Client input is checked for ownership fields; the validated scope is
+        carried in graph state and is never persisted in run output.
+        """
+        reject_client_rag_scope_input(input_data, path="input")
+        validated_scope = validate_rag_scope(scope, operation=RAG_READ)
         started = _now()
         started_perf = time.perf_counter()
         state: WorkflowState = {
@@ -1309,6 +1429,7 @@ class MultiAgentOrchestrator:
             "evidence": [],
             "missing_evidence": [],
             "require_human_review": False,
+            "rag_scope": validated_scope,
         }
         try:
             result = dict(self.graph.invoke(state))
@@ -1317,6 +1438,7 @@ class MultiAgentOrchestrator:
             result["status"] = "failed"
             result["errors"] = list(result.get("errors") or []) + [str(exc)]
 
+        result.pop("rag_scope", None)
         finished = _now()
         result["started_at"] = started.isoformat()
         result["finished_at"] = finished.isoformat()

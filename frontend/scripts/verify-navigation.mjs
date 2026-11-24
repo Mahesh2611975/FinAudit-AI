@@ -138,11 +138,22 @@ check('Landing styles include tablet and mobile breakpoints', /@media \(max-widt
 check('Landing styles respect reduced motion', /@media \(prefers-reduced-motion: reduce\)/.test(landingCss));
 
 // --- Local demonstration mode ---------------------------------------------
-check('Local demo mode is controlled by the environment flag', /VITE_LOCAL_DEMO_MODE=true/.test(frontendEnv) && /export const LOCAL_DEMO_MODE/.test(apiClient));
+check(
+  'Example environment keeps local demo mode opt-in and disabled by default',
+  /^VITE_LOCAL_DEMO_MODE=false$/m.test(frontendEnv) && /export const LOCAL_DEMO_MODE/.test(apiClient)
+);
 check('Demo status/session helpers call the backend', /export async function getDemoStatus/.test(apiClient) && /export async function requestDemoSession/.test(apiClient) && /\/api\/auth\/demo\/session/.test(apiClient));
 check('Backend exposes gated demo endpoints', /@router\.get\("\/demo\/status"\)/.test(backendAuth) && /@router\.post\("\/demo\/session"/.test(backendAuth));
-check('Backend demo mode refuses production-like environments', /def demo_mode_enabled[\s\S]*?return environment in _LOCAL_DEMO_ENVIRONMENTS/.test(backendAuth));
-check('Demo sessions use signed JWTs, not a client-side auth bypass', /create_demo_token\(\)/.test(backendAuth) && /jwt\.encode\(payload, _jwt_secret\(\), algorithm=JWT_ALGORITHM\)/.test(backendAuth));
+check(
+  'Backend demo mode refuses production-like environments',
+  /_LOCAL_ENVIRONMENTS\s*=\s*\{[^}]*"local"[^}]*\}/.test(backendAuth)
+    && /return _environment_name\(\) in _LOCAL_ENVIRONMENTS/.test(backendAuth)
+);
+check(
+  'Demo sessions use signed JWTs, not a client-side auth bypass',
+  /create_demo_token\(\)/.test(backendAuth)
+    && /jwt\.encode\(payload, _jwt_secret(?:_for_crypto)?\(\), algorithm=JWT_ALGORITHM\)/.test(backendAuth)
+);
 check('Protected routes still validate backend sessions', /apiFetch\('\/api\/auth\/me'\)/.test(main) && /enforce_route_permissions/.test(backendAuth));
 check('Demo navigation skips the auth screens', /if \(!demoMode && \(publicPage === 'login' \|\| publicPage === 'register'\)\)/.test(main));
 check('Demo Open Dashboard requests a backend demo session', /const handleOpenDashboard[\s\S]*?requestDemoSession\(\)[\s\S]*?setAuth\(data\)/.test(main));
@@ -233,6 +244,43 @@ check(
 
 // --- Responsive layout ---------------------------------------------------
 check('Two-column map/detail layout is styled', /\.geo-map-detail-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*\d+fr\)\s+minmax\(0,\s*\d+fr\)/s.test(css));
+
+// --- Stage 7 workflow integration contracts -------------------------------
+check(
+  'Alert investigation can create a persisted case from the selected alert',
+  /\/api\/investigations\/from-alert\/\$\{encodeURIComponent\(alertRef\)\}/.test(risk)
+    && /Create Investigation Case/.test(risk)
+    && /createdCase/.test(risk)
+);
+check(
+  'Successful alert-to-case creation refreshes the case list',
+  /onCaseCreated\?\.\(created\)/.test(risk)
+    && /setCasesRefreshSignal/.test(main)
+    && /refreshSignal/.test(main)
+);
+check(
+  'Agent runs accept case and focus transaction inputs from the UI',
+  /caseId/.test(main)
+    && /focusTransactionId/.test(main)
+    && /payload\.case_id/.test(main)
+    && /payload\.focus_transaction_id/.test(main)
+);
+check(
+  'Investigation audit actors come from the authenticated user',
+  /currentUser/.test(main)
+    && !/created_by: 'reviewer'/.test(main)
+    && !/author: 'reviewer'/.test(main)
+    && !/actor: 'reviewer'/.test(main)
+    && !/'Risk Analyst'/.test(risk)
+);
+check(
+  'Transaction CSV label matches the unfiltered export endpoint',
+  !/Transactions \(filtered CSV\)/.test(main) && /Transactions CSV/.test(main)
+);
+check(
+  'Empty evidence navigation group and dead placeholder page are removed',
+  !/label: 'Evidence & Documents'/.test(main) && !/function PlaceholderPage/.test(main)
+);
 
 console.log(`Navigation contract verified: ${checks.length} checks passed.`);
 for (const label of checks) console.log(`  ✓ ${label}`);

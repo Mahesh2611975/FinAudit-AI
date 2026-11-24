@@ -17,9 +17,15 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
+from .ownership import RAG_READ, RagScope, validate_rag_scope
 from .rag import retrieve_context
 
 logger = logging.getLogger(__name__)
+
+
+def _validated_rag_scope(scope: RagScope | None) -> RagScope:
+    """Validate the caller-supplied RAG scope before any retrieval."""
+    return validate_rag_scope(scope, operation=RAG_READ)
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 ENV_PATH = BACKEND_DIR / ".env"
@@ -96,11 +102,17 @@ async def agenerate(prompt: str, **kwargs: Any) -> str | None:
     return await asyncio.to_thread(generate, prompt, **kwargs)
 
 
-def _fallback(answer: str, sources: list[dict], category: str) -> dict:
+def _fallback(
+    answer: str,
+    sources: list[dict],
+    category: str,
+    contexts: list[dict] | None = None,
+) -> dict:
     return {
         "answer": answer,
         "model": get_model(),
         "retrieved_sources": sources,
+        "retrieved_evidence": list(contexts or []),
         "fallback": True,
         "error_category": category,
     }
@@ -119,9 +131,25 @@ Rules you must follow:
 """
 
 
-def build_prompt(question: str, evidence: str = "", contexts: list[dict] | None = None) -> tuple[str, str]:
-    """Build a grounded prompt; returns (prompt, context_text)."""
-    contexts = contexts if contexts is not None else retrieve_context(question, evidence)
+def build_prompt(
+    question: str,
+    evidence: str = "",
+    contexts: list[dict] | None = None,
+    *,
+    scope: RagScope | None = None,
+) -> tuple[str, str]:
+    """Build a grounded prompt; returns (prompt, context_text).
+
+    A trusted scope is always required. When explicit contexts are supplied by a
+    retrieval-capable caller, the scope is still validated so this helper can
+    never become an unscoped retrieval path.
+    """
+    validated_scope = _validated_rag_scope(scope)
+    contexts = (
+        contexts
+        if contexts is not None
+        else retrieve_context(question, evidence, scope=validated_scope)
+    )
     context_text = "\n".join(
         f"[{item.get('source', 'SOURCE')}] {item.get('text', '')}" for item in contexts
     ) or "No supporting evidence was retrieved."
@@ -144,9 +172,15 @@ Return a concise answer with: (1) what is observed, (2) source references,
     return prompt, context_text
 
 
-async def explain_finding(question: str, evidence: str = "") -> dict:
+async def explain_finding(
+    question: str,
+    evidence: str = "",
+    *,
+    scope: RagScope | None = None,
+) -> dict:
     """Grounded explanation used by findings, risk alerts and the assistant."""
-    contexts = retrieve_context(question, evidence)
+    validated_scope = _validated_rag_scope(scope)
+    contexts = retrieve_context(question, evidence, scope=validated_scope)
     sources = [
         {"source": item["source"], "score": round(float(item.get("score", 0)), 3)}
         for item in contexts
@@ -163,7 +197,7 @@ async def explain_finding(question: str, evidence: str = "") -> dict:
 
     if not is_available():
         logger.info("Ollama is not available; returning evidence-only fallback")
-        return _fallback(fallback_answer, sources, "ollama_unavailable")
+        return _fallback(fallback_answer, sources, "ollama_unavailable", contexts)
 
     prompt = f"""Explain this financial audit finding using only the supplied context.
 
@@ -191,10 +225,12 @@ Return: (1) explanation, (2) supporting evidence with source IDs,
             fallback_answer + " The local model returned an empty response.",
             sources,
             "empty_response",
+            contexts,
         )
     return {
         "answer": answer,
         "model": get_model(),
         "retrieved_sources": sources,
+        "retrieved_evidence": contexts,
         "fallback": False,
     }

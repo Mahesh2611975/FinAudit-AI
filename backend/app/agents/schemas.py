@@ -22,7 +22,13 @@ class EvidenceItem(BaseModel):
 
 
 class OrchestratorInput(BaseModel):
-    task_type: Literal["monthly_analysis", "investigation", "reconciliation_review", "invoice_audit"]
+    task_type: Literal[
+        "monthly_analysis",
+        "investigation",
+        "reconciliation_review",
+        "invoice_audit",
+        "vendor_intelligence",
+    ]
     year: int | None = None
     month: int | None = None
     audit_run_id: int | None = None
@@ -30,6 +36,7 @@ class OrchestratorInput(BaseModel):
     case_id: int | None = None
     focus_transaction_id: str | None = None
     invoice_id: int | None = None
+    vendor_id: int | None = None
 
 
 class AgentOutput(BaseModel):

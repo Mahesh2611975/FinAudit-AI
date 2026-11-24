@@ -149,34 +149,35 @@ function channelSourceLabel(channel) {
 function AlertDetail({
   alert,
   apiBase,
+  currentUser,
   onClose,
   onUpdated,
-  onReviewSaved
+  onReviewSaved,
+  onCaseCreated
 }) {
   const [reviewStatus, setReviewStatus] = useState(alert.review_status || 'open');
   const [assignedTo, setAssignedTo] = useState(alert.assigned_to || '');
-  const [reviewerName, setReviewerName] = useState('Risk Analyst');
   const [comment, setComment] = useState(alert.reviewer_comments || '');
   const [saving, setSaving] = useState(false);
   const [investigating, setInvestigating] = useState(false);
   const [investigation, setInvestigation] = useState(null);
+  const [creatingCase, setCreatingCase] = useState(false);
+  const [createdCase, setCreatedCase] = useState(null);
   const [error, setError] = useState('');
   const [showEvidence, setShowEvidence] = useState(false);
+  const reviewerName = currentUser?.full_name || currentUser?.username || 'Authenticated user';
 
   useEffect(() => {
     setReviewStatus(alert.review_status || 'open');
     setAssignedTo(alert.assigned_to || '');
     setComment(alert.reviewer_comments || '');
     setInvestigation(null);
+    setCreatedCase(null);
     setError('');
     setShowEvidence(false);
   }, [alert.id]);
 
   const saveReview = async () => {
-    if (!reviewerName.trim()) {
-      setError('Reviewer name is required.');
-      return;
-    }
     setSaving(true);
     setError('');
     try {
@@ -193,7 +194,6 @@ function AlertDetail({
           action,
           review_status: reviewStatus,
           assigned_to: assignedTo,
-          reviewer_name: reviewerName,
           comment
         })
       });
@@ -218,6 +218,25 @@ function AlertDetail({
       setError(err.message);
     } finally {
       setInvestigating(false);
+    }
+  };
+
+  const createCase = async () => {
+    const alertRef = alert.alert_id || alert.id;
+    setCreatingCase(true);
+    setError('');
+    try {
+      const created = await riskApi(
+        apiBase,
+        `/api/investigations/from-alert/${encodeURIComponent(alertRef)}`,
+        { method: 'POST', body: JSON.stringify({}) }
+      );
+      setCreatedCase(created);
+      onCaseCreated?.(created);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setCreatingCase(false);
     }
   };
 
@@ -307,6 +326,22 @@ function AlertDetail({
           </section>
 
           <section className="risk-drawer-section">
+            <h3><FileSearch size={18} /> Investigation case</h3>
+            <p className="risk-muted">Creates a persisted case from alert {alert.alert_id}. The backend copies the alert reference and supporting evidence into the case.</p>
+            <button type="button" className="secondary-btn risk-inline-btn" onClick={createCase} disabled={creatingCase}>
+              {creatingCase ? <Loader2 size={16} className="spin" /> : <FileSearch size={16} />}
+              {creatingCase ? 'Creating case…' : 'Create Investigation Case'}
+            </button>
+            {createdCase && (
+              <div className="risk-investigation">
+                <div className="risk-ai-answer">
+                  Created {createdCase.case_number} with {createdCase.evidence?.length || 0} copied evidence item(s) from {createdCase.alert?.alert_code || alert.alert_id}.
+                </div>
+              </div>
+            )}
+          </section>
+
+          <section className="risk-drawer-section">
             <h3><UserCheck size={18} /> Human review</h3>
             <div className="risk-form-grid">
               <label>
@@ -318,10 +353,10 @@ function AlertDetail({
                   <option value="dismissed">Dismissed</option>
                 </select>
               </label>
-              <label>
+              <div className="risk-form-wide">
                 <span>Reviewer</span>
-                <input value={reviewerName} onChange={(event) => setReviewerName(event.target.value)} placeholder="Reviewer name" />
-              </label>
+                <div className="risk-muted">{reviewerName} (signed-in user)</div>
+              </div>
               <label className="risk-form-wide">
                 <span>Assign to</span>
                 <input value={assignedTo} onChange={(event) => setAssignedTo(event.target.value)} placeholder="Team or analyst" />
@@ -362,7 +397,7 @@ function AlertDetail({
   );
 }
 
-export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000' }) {
+export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000', currentUser = null, onCasesCreated }) {
   const [overview, setOverview] = useState(null);
   const [alertsData, setAlertsData] = useState({ items: [], total: 0, categories: [] });
   const [channels, setChannels] = useState(null);
@@ -750,9 +785,14 @@ export default function RiskIntelligence({ apiBase = 'http://127.0.0.1:8000' }) 
         <AlertDetail
           alert={selectedAlert}
           apiBase={apiBase}
+          currentUser={currentUser}
           onClose={() => setSelectedAlert(null)}
           onUpdated={(updated) => setSelectedAlert(updated)}
           onReviewSaved={() => Promise.all([loadOverview(), loadAlerts(offset)])}
+          onCaseCreated={(created) => {
+            setSelectedAlert(created.alert ? { ...selectedAlert, review_status: created.alert.review_status } : selectedAlert);
+            onCasesCreated?.(created);
+          }}
         />
       )}
     </section>

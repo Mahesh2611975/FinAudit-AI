@@ -5,11 +5,19 @@ TEST_DB_DIR = tempfile.mkdtemp(prefix="finaudit-agents-tests-")
 os.environ["FINAUDIT_DATABASE_URL"] = f"sqlite:///{os.path.join(TEST_DB_DIR, 'test.db')}"
 
 from app.agents.orchestrator import MultiAgentOrchestrator  # noqa: E402
+from app.ownership import rag_scope_for_background  # noqa: E402
+
+
+SCOPE = rag_scope_for_background(77, audit_reason="orchestrator unit tests")
 
 
 def test_orchestrator_runs_full_workflow():
     orch = MultiAgentOrchestrator()
-    result = orch.run({"task_type": "monthly_analysis", "year": 2026, "month": 1}, persist=False)
+    result = orch.run(
+        {"task_type": "monthly_analysis", "year": 2026, "month": 1},
+        scope=SCOPE,
+        persist=False,
+    )
     assert result["status"] in ("completed", "failed")
     assert isinstance(result.get("timeline"), list)
     assert len(result.get("timeline")) >= 1
@@ -25,6 +33,6 @@ def test_orchestrator_runs_full_workflow():
 
 def test_orchestrator_fails_gracefully_on_empty_input():
     orch = MultiAgentOrchestrator()
-    result = orch.run({}, persist=False)
+    result = orch.run({}, scope=SCOPE, persist=False)
     assert result["status"] == "failed"
     assert result.get("errors")

@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from .auth import actor_name, get_current_active_user, require_permissions
+from .auth import actor_name, get_current_active_user, rag_scope_for_user, require_permissions
 from .database import get_db
 from .geo_analytics import (
     geography_cities,
@@ -26,6 +26,7 @@ from .geo_analytics import (
 from .geocoding import geocoding_status
 from .llm import explain_finding
 from .models import RiskAlert, RiskAlertEvent, RiskAnalysisRun, User
+from .ownership import RagAccessDenied, reject_client_rag_scope_input
 from .risk_engine import (
     CANONICAL_CHANNELS,
     CATEGORY_LABELS,
@@ -43,6 +44,14 @@ from .risk_engine import (
 )
 
 router = APIRouter()
+
+
+def _request_rag_scope(user: User, reason: str):
+    """Build a read-only RAG scope from the authenticated principal."""
+    try:
+        return rag_scope_for_user(user, audit_reason=reason)
+    except RagAccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 def _alert_or_404(db: Session, alert_id: str) -> RiskAlert:
@@ -618,7 +627,16 @@ def risk_geography_trend(
 
 
 @router.post("/api/risk/investigate")
-async def investigate_risk(payload: dict, db: Session = Depends(get_db)):
+async def investigate_risk(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("investigation:write")),
+):
+    try:
+        reject_client_rag_scope_input(payload)
+    except RagAccessDenied as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    scope = _request_rag_scope(current_user, "risk investigation explanation")
     alert_id = payload.get("alert_id") or payload.get("id")
     if alert_id is None:
         raise HTTPException(status_code=422, detail="alert_id is required")
@@ -649,7 +667,7 @@ async def investigate_risk(payload: dict, db: Session = Depends(get_db)):
         default=str,
     )
     try:
-        ai_result = await explain_finding(question, evidence_text)
+        ai_result = await explain_finding(question, evidence_text, scope=scope)
     except Exception as exc:
         ai_result = {
             "answer": "AI investigation assistant is unavailable. Use the deterministic facts and evidence below for manual review.",

@@ -4,6 +4,10 @@ Ingestion supports CSV transaction files, PDF documents, text reports and
 persisted investigation reports.  Text is cleaned, chunked and embedded with a
 local TF-IDF vector store (see :mod:`app.vector_store`) that keeps full source
 metadata for citations.  No paid embedding API or model download is used.
+
+Every public RAG façade operation requires an explicit trusted ``RagScope``.
+There is no ambient or global fallback. Client-provided filters are checked for
+ownership fields and can never widen access beyond the supplied scope.
 """
 from __future__ import annotations
 
@@ -18,6 +22,14 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from .models import InvestigationRun, TransactionRecord
+from .ownership import (
+    RAG_READ,
+    RAG_WRITE,
+    RagAccessDenied,
+    RagScope,
+    reject_client_rag_scope_input,
+    validate_rag_scope,
+)
 from .vector_store import VectorStore, chunk_text, clean_text, text_hash
 
 _store = VectorStore()
@@ -36,8 +48,35 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _doc_id(source_filename: str, file_hash: str) -> str:
-    return f"doc-{text_hash(source_filename + ':' + file_hash)[:20]}"
+def _validated_scope(scope: RagScope | None, operation: str = RAG_READ) -> RagScope:
+    """Validate a trusted scope at the façade boundary before any RAG work."""
+    return validate_rag_scope(scope, operation=operation)
+
+
+def _write_owner(scope: RagScope) -> int:
+    """Resolve the only owner this façade is allowed to stamp on writes.
+
+    Global writers do not identify a document owner.  Permission-backed global
+    writes that need a target owner must use ``VectorStore`` directly with an
+    explicit ``owner_user_id``; the façade never guesses or reuses the admin id.
+    """
+    validated = _validated_scope(scope, RAG_WRITE)
+    if validated.global_access:
+        raise RagAccessDenied(
+            "RAG ingestion requires a non-global owner scope; global writes "
+            "must name an explicit target owner at the storage layer."
+        )
+    return int(validated.owner_user_id)
+
+
+def _doc_id(source_filename: str, file_hash: str, owner_user_id: int) -> str:
+    """Derive an owner-scoped document id.
+
+    Including the owner keeps same-user re-uploads idempotent while preventing
+    two users who upload identical filename/content from colliding on the
+    globally unique ``doc_id`` primary key.
+    """
+    return f"doc-{text_hash(f'{owner_user_id}:{source_filename}:{file_hash}')[:20]}"
 
 
 # ----------------------------------------------------------------------
@@ -46,19 +85,22 @@ def _doc_id(source_filename: str, file_hash: str) -> str:
 def ingest_text(
     text: str,
     *,
+    scope: RagScope,
     source_filename: str,
     document_type: str = "text_report",
     metadata: dict[str, Any] | None = None,
     doc_id: str | None = None,
 ) -> dict[str, Any]:
     """Ingest arbitrary text with metadata; returns a summary."""
+    owner_user_id = _write_owner(scope)
     cleaned = clean_text(text)
     if not cleaned:
         raise ValueError("No readable text was found in the document.")
     file_hash = text_hash(cleaned)
-    identifier = doc_id or _doc_id(source_filename, file_hash)
+    identifier = doc_id or _doc_id(source_filename, file_hash, owner_user_id)
     chunks = chunk_text(cleaned, metadata=metadata)
     count = _store.add_document(
+        scope=scope,
         doc_id=identifier,
         source_filename=source_filename,
         document_type=document_type,
@@ -76,8 +118,9 @@ def ingest_text(
     }
 
 
-def ingest_csv_bytes(raw: bytes, source_filename: str) -> dict[str, Any]:
+def ingest_csv_bytes(raw: bytes, source_filename: str, *, scope: RagScope) -> dict[str, Any]:
     """Ingest a CSV as row-level evidence with provenance metadata."""
+    _write_owner(scope)
     try:
         import pandas as pd
 
@@ -111,14 +154,21 @@ def ingest_csv_bytes(raw: bytes, source_filename: str) -> dict[str, Any]:
     if not chunks:
         raise ValueError("The CSV contained no non-empty rows.")
     file_hash = text_hash(raw)
-    return _finalize_csv(source_filename, file_hash, chunks, len(frame))
+    return _finalize_csv(source_filename, file_hash, chunks, len(frame), scope=scope)
 
 
 def _finalize_csv(
-    source_filename: str, file_hash: str, chunks: list[dict[str, Any]], rows: int
+    source_filename: str,
+    file_hash: str,
+    chunks: list[dict[str, Any]],
+    rows: int,
+    *,
+    scope: RagScope,
 ) -> dict[str, Any]:
-    identifier = _doc_id(source_filename, file_hash)
+    owner_user_id = _write_owner(scope)
+    identifier = _doc_id(source_filename, file_hash, owner_user_id)
     count = _store.add_document(
+        scope=scope,
         doc_id=identifier,
         source_filename=source_filename,
         document_type="transaction_csv",
@@ -171,8 +221,9 @@ def _extract_pdf_fallback(raw: bytes) -> list[str]:
     return pages
 
 
-def ingest_pdf_bytes(raw: bytes, source_filename: str) -> dict[str, Any]:
+def ingest_pdf_bytes(raw: bytes, source_filename: str, *, scope: RagScope) -> dict[str, Any]:
     """Ingest a PDF, preserving page numbers as metadata."""
+    owner_user_id = _write_owner(scope)
     pages = _extract_pdf_with_pypdf(raw) or _extract_pdf_fallback(raw)
     if not any(page.strip() for page in pages):
         raise ValueError(
@@ -188,8 +239,9 @@ def ingest_pdf_bytes(raw: bytes, source_filename: str) -> dict[str, Any]:
             )
         )
     file_hash = text_hash(raw)
-    identifier = _doc_id(source_filename, file_hash)
+    identifier = _doc_id(source_filename, file_hash, owner_user_id)
     count = _store.add_document(
+        scope=scope,
         doc_id=identifier,
         source_filename=source_filename,
         document_type="pdf_document",
@@ -208,22 +260,29 @@ def ingest_pdf_bytes(raw: bytes, source_filename: str) -> dict[str, Any]:
     }
 
 
-def ingest_upload(raw: bytes, source_filename: str) -> dict[str, Any]:
+def ingest_upload(raw: bytes, source_filename: str, *, scope: RagScope) -> dict[str, Any]:
     """Route an uploaded file to the correct ingestion path."""
+    _write_owner(scope)
     filename = Path(source_filename or "upload").name
     suffix = Path(filename).suffix.lower()
     if suffix == ".csv":
-        return ingest_csv_bytes(raw, filename)
+        return ingest_csv_bytes(raw, filename, scope=scope)
     if suffix == ".pdf":
-        return ingest_pdf_bytes(raw, filename)
+        return ingest_pdf_bytes(raw, filename, scope=scope)
     if suffix in {".txt", ".md", ".log", ".json"}:
         text = raw.decode("utf-8", "replace")
-        return ingest_text(text, source_filename=filename, document_type="text_report")
+        return ingest_text(
+            text,
+            scope=scope,
+            source_filename=filename,
+            document_type="text_report",
+        )
     raise ValueError("Supported formats: .csv, .pdf, .txt, .md, .log, .json")
 
 
-def ingest_transactions(db: Session, limit: int = 5000) -> dict[str, Any]:
+def ingest_transactions(db: Session, *, scope: RagScope, limit: int = 5000) -> dict[str, Any]:
     """Index persisted transaction records as searchable evidence."""
+    _write_owner(scope)
     rows = (
         db.query(TransactionRecord)
         .order_by(TransactionRecord.id.desc())
@@ -253,11 +312,14 @@ def ingest_transactions(db: Session, limit: int = 5000) -> dict[str, Any]:
     if not chunks:
         return {"chunks": 0, "status": "empty"}
     file_hash = text_hash("|".join(str(row.id) for row in reversed(rows)))
-    return _finalize_csv("transaction_recordsDB", file_hash, chunks, len(rows))
+    return _finalize_csv("transaction_recordsDB", file_hash, chunks, len(rows), scope=scope)
 
 
-def ingest_investigation_reports(db: Session, limit: int = 100) -> dict[str, Any]:
+def ingest_investigation_reports(
+    db: Session, *, scope: RagScope, limit: int = 100
+) -> dict[str, Any]:
     """Index persisted investigation run reports as evidence."""
+    owner_user_id = _write_owner(scope)
     runs = (
         db.query(InvestigationRun)
         .order_by(InvestigationRun.id.desc())
@@ -274,10 +336,13 @@ def ingest_investigation_reports(db: Session, limit: int = 100) -> dict[str, Any
         ingests.append(
             ingest_text(
                 text,
+                scope=scope,
                 source_filename=f"investigation_run_{run.id}",
                 document_type="investigation_report",
                 metadata={"run_id": run.id, "task_type": run.task_type},
-                doc_id=f"investigation-report-{run.id}",
+                doc_id=_doc_id(
+                    f"investigation_run_{run.id}", text_hash(text), owner_user_id
+                ),
             )
         )
     return {"reports": len(ingests), "status": "ingested"}
@@ -286,18 +351,27 @@ def ingest_investigation_reports(db: Session, limit: int = 100) -> dict[str, Any
 # ----------------------------------------------------------------------
 # Retrieval
 # ----------------------------------------------------------------------
-def search(query: str, top_k: int = 5, **filters: Any) -> list[dict[str, Any]]:
-    return _store.search(query, top_k=top_k, **filters)
+def search(query: str, *, scope: RagScope, top_k: int = 5, **filters: Any) -> list[dict[str, Any]]:
+    validated = _validated_scope(scope, RAG_READ)
+    reject_client_rag_scope_input(filters, path="filters")
+    return _store.search(query, scope=validated, top_k=top_k, **filters)
 
 
-def retrieve_context(question: str, evidence: str = "", top_k: int = 3) -> list[dict[str, Any]]:
+def retrieve_context(
+    question: str,
+    evidence: str = "",
+    *,
+    scope: RagScope,
+    top_k: int = 3,
+) -> list[dict[str, Any]]:
     """Backward-compatible retrieval used by the LLM and legacy agents.
 
     Combines vector-store chunks (when documents exist) with the supplied
     structured evidence and the built-in review policies.  Returns items with
-    ``source``, ``text`` and ``score`` keys.
+    ``source``, ``text`` and ``score`` keys. Every retrieval is scoped.
     """
-    results = search(question, top_k=top_k)
+    validated = _validated_scope(scope, RAG_READ)
+    results = search(question, scope=validated, top_k=top_k)
     if not results:
         corpus = list(POLICIES)
         from sklearn.feature_extraction.text import TfidfVectorizer
@@ -323,47 +397,61 @@ def retrieve_context(question: str, evidence: str = "", top_k: int = 3) -> list[
     return results
 
 
-def store_stats() -> dict[str, Any]:
-    return _store.stats()
+def store_stats(*, scope: RagScope) -> dict[str, Any]:
+    validated = _validated_scope(scope, RAG_READ)
+    return _store.stats(scope=validated)
 
 
-def list_documents(limit: int = 50) -> list[dict[str, Any]]:
-    return _store.list_documents(limit)
+def list_documents(*, scope: RagScope, limit: int = 50) -> list[dict[str, Any]]:
+    validated = _validated_scope(scope, RAG_READ)
+    return _store.list_documents(scope=validated, limit=limit)
 
 
 # ----------------------------------------------------------------------
 # Management: deletion, re-indexing and retrieval debugging
 # ----------------------------------------------------------------------
-def delete_document(doc_id: str) -> bool:
+def delete_document(doc_id: str, *, scope: RagScope) -> bool:
     """Remove a document and all of its chunks, then rebuild the index."""
-    return _store.delete_document(doc_id)
+    validated = _validated_scope(scope, RAG_WRITE)
+    return _store.delete_document(scope=validated, doc_id=doc_id)
 
 
-def reindex() -> dict[str, Any]:
-    """Rebuild the local TF-IDF index from all stored chunks."""
-    return _store.reindex()
+def reindex(*, scope: RagScope) -> dict[str, Any]:
+    """Rebuild the scoped local TF-IDF index from authorized chunks."""
+    validated = _validated_scope(scope, RAG_WRITE)
+    return _store.reindex(scope=validated)
 
 
-def document_status(doc_id: str) -> dict[str, Any] | None:
+def document_status(doc_id: str, *, scope: RagScope) -> dict[str, Any] | None:
     """Return per-document ingestion status, including chunk count."""
-    return _store.get_document(doc_id)
+    validated = _validated_scope(scope, RAG_READ)
+    return _store.get_document(scope=validated, doc_id=doc_id)
 
 
-def retrieval_test(query: str, top_k: int = 5, **filters: Any) -> dict[str, Any]:
+def retrieval_test(
+    query: str,
+    *,
+    scope: RagScope,
+    top_k: int = 5,
+    **filters: Any,
+) -> dict[str, Any]:
     """Return retrieved chunks and citations for debugging RAG quality.
 
     This is a retrieval-only helper. It never invokes the LLM and never
-    fabricates evidence: an empty result is reported explicitly.
+    fabricates evidence: an empty result is reported explicitly. Client filters
+    are validated and cannot override ownership.
     """
+    validated = _validated_scope(scope, RAG_READ)
+    reject_client_rag_scope_input(filters, path="filters")
     query = str(query or "").strip()
     if not query:
         raise ValueError("query is required.")
-    chunks = search(query, top_k=max(1, min(top_k, 20)), **filters)
+    chunks = search(query, scope=validated, top_k=max(1, min(top_k, 20)), **filters)
     return {
         "query": query,
         "has_evidence": bool(chunks),
         "result_count": len(chunks),
         "chunks": chunks,
-        "stats": store_stats(),
+        "stats": store_stats(scope=validated),
         "message": None if chunks else "No indexed chunks matched this query.",
     }

@@ -6,12 +6,26 @@ import httpx
 import pytest
 
 from app import llm
+from app.auth import rag_scope_for_user
+from app.ownership import RagAccessDenied
 from app.rag import POLICIES, retrieve_context
-from app.vector_store import VectorStore
+
+
+SCOPE = rag_scope_for_user(
+    SimpleNamespace(id=101, username="llm-user", role="user", is_active=True),
+    audit_reason="llm tests",
+)
 
 
 def run_explain(question="Possible duplicate payment to Acme", evidence="Vendor=Acme; amount=120.00"):
-    return asyncio.run(llm.explain_finding(question, evidence))
+    return asyncio.run(llm.explain_finding(question, evidence, scope=SCOPE))
+
+
+def test_explanation_and_prompt_require_a_trusted_scope():
+    with pytest.raises(RagAccessDenied):
+        asyncio.run(llm.explain_finding("question", "evidence"))
+    with pytest.raises(RagAccessDenied):
+        llm.build_prompt("question", "evidence", contexts=CONTEXTS)
 
 
 CONTEXTS = [
@@ -115,6 +129,7 @@ def test_unavailable_ollama_returns_evidence_only_fallback(monkeypatch):
         {"source": "POLICY-DUP-01", "score": 0.42},
         {"source": "STRUCTURED-EVIDENCE", "score": 0.999},
     ]
+    assert result["retrieved_evidence"] == CONTEXTS
     assert result["model"] == llm.MODEL
 
 
@@ -136,6 +151,7 @@ def test_successful_ollama_response_is_grounded_in_retrieved_context(monkeypatch
     assert result["answer"] == "The payment [POLICY-DUP-01] needs review."
     assert result["model"] == llm.MODEL
     assert all(set(item) == {"source", "score"} for item in result["retrieved_sources"])
+    assert result["retrieved_evidence"] == CONTEXTS
     assert "POLICY-DUP-01" in captured["prompt"]
     assert "Vendor=Acme" in captured["prompt"]
     assert "Never invent or guess transaction IDs" in captured["prompt"]
@@ -157,11 +173,12 @@ def test_empty_model_response_returns_safe_fallback(monkeypatch):
     assert "empty response" in result["answer"].lower()
 
 
-def test_retrieval_returns_known_source_metadata_with_empty_store(monkeypatch, tmp_path):
-    monkeypatch.setattr("app.rag._store", VectorStore(tmp_path / "rag"))
+def test_retrieval_returns_known_source_metadata_with_empty_store(monkeypatch, scoped_vector_store):
+    monkeypatch.setattr("app.rag._store", scoped_vector_store)
     contexts = retrieve_context(
         "Possible duplicate payment to Acme",
         "Vendor=Acme; amount=120.00",
+        scope=SCOPE,
     )
     source_ids = {item["source"] for item in contexts}
     allowed_ids = {item["source"] for item in POLICIES} | {"STRUCTURED-EVIDENCE"}
@@ -173,9 +190,9 @@ def test_retrieval_returns_known_source_metadata_with_empty_store(monkeypatch, t
     assert all(0 <= item["score"] <= 1 for item in contexts)
 
 
-def test_irrelevant_or_empty_evidence_retrieval_is_safe(monkeypatch, tmp_path):
-    monkeypatch.setattr("app.rag._store", VectorStore(tmp_path / "rag"))
-    assert retrieve_context("zzzxq plugh") == []
+def test_irrelevant_or_empty_evidence_retrieval_is_safe(monkeypatch, scoped_vector_store):
+    monkeypatch.setattr("app.rag._store", scoped_vector_store)
+    assert retrieve_context("zzzxq plugh", scope=SCOPE) == []
 
-    contexts = retrieve_context("duplicate payment", "")
+    contexts = retrieve_context("duplicate payment", "", scope=SCOPE)
     assert all(item["source"] != "STRUCTURED-EVIDENCE" for item in contexts)

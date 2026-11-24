@@ -1,9 +1,11 @@
 import json
+import logging
 import math
 import os
 import re
 from datetime import datetime, timezone
 from io import BytesIO, StringIO
+from typing import Any
 
 import pandas as pd
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, UploadFile
@@ -27,10 +29,21 @@ from .auth import (
     actor_name,
     enforce_route_permissions,
     get_current_active_user,
+    rag_scope_for_user,
     require_permissions,
     require_roles,
+    role_permissions,
     router as auth_router,
     validate_jwt_configuration,
+)
+from .ownership import (
+    RAG_DEBUG_PERMISSION,
+    RAG_GLOBAL_READ_PERMISSION,
+    RAG_READ,
+    RAG_WRITE,
+    RagAccessDenied,
+    RagScope,
+    reject_client_rag_scope_input,
 )
 from .invoice_api import router as invoice_router
 from .investigation_api import (
@@ -46,9 +59,12 @@ from .dashboard import dashboard_overview
 from . import llm, rag
 from .agents.assistant_graph import get_assistant_graph
 from .pdf_utils import build_text_pdf
+from .vector_store import RAGOwnershipSchemaError
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_FILES = 20
+
+logger = logging.getLogger(__name__)
 
 # Fail at startup, before migrations or health checks, when a hosted
 # deployment has no usable JWT signing secret. Token operations also
@@ -96,6 +112,67 @@ def _cors_origins() -> list[str]:
     ]
 
 
+def _rag_scope(
+    user: User,
+    *,
+    operation: str = RAG_READ,
+    audit_reason: str | None = None,
+) -> RagScope:
+    """Build a request scope from the authenticated principal only."""
+    try:
+        return rag_scope_for_user(user, operation=operation, audit_reason=audit_reason)
+    except RagAccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+def _reject_client_rag_scope(payload: Any, *, path: str = "payload") -> None:
+    """Turn client-controlled ownership input into a clear 400 response."""
+    try:
+        reject_client_rag_scope_input(payload, path=path)
+    except RagAccessDenied as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _status_rag_scope(user: User) -> tuple[RagScope, str]:
+    """Select an explicit, authorized visibility level for status endpoints.
+
+    Ordinary accounts see only their own RAG rows. A principal with the explicit
+    global-read permission may report deployment-wide counts; no fake user id is
+    ever used.
+    """
+    global_read = RAG_GLOBAL_READ_PERMISSION in role_permissions(str(user.role))
+    try:
+        scope = rag_scope_for_user(
+            user,
+            global_access=global_read,
+            audit_reason="system status",
+        )
+    except RagAccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return scope, "global" if global_read else "user"
+
+
+def _status_rag_stats(user: User) -> dict:
+    """Return only visibility-appropriate RAG stats, failing safe when absent."""
+    scope, visibility = _status_rag_scope(user)
+    try:
+        stats = dict(rag.store_stats(scope=scope))
+    except (RagAccessDenied, RAGOwnershipSchemaError) as exc:
+        return {
+            "backend": "local-tfidf-sqlite",
+            "documents": 0,
+            "chunks": 0,
+            "index_exists": False,
+            "visibility": visibility,
+            "status": "unavailable",
+            "error": type(exc).__name__,
+        }
+    stats.setdefault("backend", "local-tfidf-sqlite")
+    stats["visibility"] = visibility
+    stats["status"] = "indexed" if int(stats.get("chunks") or 0) > 0 else "empty"
+    return stats
+
+
 app = FastAPI(title="FinAudit AI", version="1.0.0", description="Local-first financial audit exception analysis with RAG-assisted explanations.")
 app.add_middleware(CORSMiddleware, allow_origins=_cors_origins(), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -135,7 +212,10 @@ def health(db: Session = Depends(get_db)):
 
 
 @protected_api.get("/api/system/health")
-def system_health(db: Session = Depends(get_db)):
+def system_health(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
     """Consolidated, secret-free status for the Settings screen.
 
     Every reported value is derived from an actual probe; no credentials,
@@ -157,7 +237,7 @@ def system_health(db: Session = Depends(get_db)):
         database["error"] = f"{type(exc).__name__}: {exc}"
 
     llm_available = llm.is_available()
-    rag_stats = rag.store_stats()
+    rag_stats = _status_rag_stats(current_user)
     rag_chunks = int(rag_stats.get("chunks") or 0)
     configured = bool(os.getenv("FINAUDIT_CORS_ORIGINS", "").strip())
     return {
@@ -179,7 +259,8 @@ def system_health(db: Session = Depends(get_db)):
             "documents": int(rag_stats.get("documents") or 0),
             "chunks": rag_chunks,
             "index_exists": bool(rag_stats.get("index_exists")),
-            "status": "indexed" if rag_chunks > 0 else "empty",
+            "visibility": rag_stats.get("visibility"),
+            "status": rag_stats.get("status", "indexed" if rag_chunks > 0 else "empty"),
         },
         "configuration": {
             "database_url_configured": bool(os.getenv("FINAUDIT_DATABASE_URL", "").strip()),
@@ -465,13 +546,18 @@ def get_audit(audit_id: int, db: Session = Depends(get_db)):
 
 
 @protected_api.post("/api/findings/{finding_id}/explain")
-async def explain(finding_id: int, db: Session = Depends(get_db)):
+async def explain(
+    finding_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("audit:read")),
+):
     finding = db.query(Finding).filter(Finding.id == finding_id).first()
     if not finding:
         raise HTTPException(status_code=404, detail="Finding not found")
     return await explain_finding(
         f"Explain this audit finding: {finding.finding_type}. {finding.summary}",
         finding.evidence,
+        scope=_rag_scope(current_user, audit_reason="finding explanation"),
     )
 
 
@@ -1381,14 +1467,24 @@ def run_agents(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_permissions("assistant:use")),
 ):
+    _reject_client_rag_scope(payload)
+    scope = _rag_scope(current_user, audit_reason="agent workflow")
     try:
         if payload.get("task_type") == "invoice_audit":
             from .invoice_api import _invoice_orch
-            return _invoice_orch.run(payload, persist=True)
-        result = _orch.run(payload, persist=True)
+            return _invoice_orch.run(payload, scope=scope, persist=True)
+        result = _orch.run(payload, scope=scope, persist=True)
         return result
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        logger.exception(
+            "Agent workflow failed for user=%s task_type=%s",
+            current_user.username,
+            payload.get("task_type"),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Agent workflow failed. Check backend logs for details.",
+        )
 
 
 @protected_api.get("/api/agents/runs")
@@ -1719,6 +1815,7 @@ async def ingest_documents(
         raise HTTPException(status_code=400, detail="Upload at least one document.")
     if len(files) > 20:
         raise HTTPException(status_code=400, detail="Upload no more than 20 documents at once.")
+    scope = _rag_scope(current_user, operation=RAG_WRITE, audit_reason="document ingestion")
     results = []
     for upload in files:
         filename = safe_filename(upload.filename)
@@ -1730,10 +1827,10 @@ async def ingest_documents(
             results.append({"filename": filename, "status": "error", "error": "File exceeds 5 MB"})
             continue
         try:
-            results.append(rag.ingest_upload(raw, filename))
+            results.append(rag.ingest_upload(raw, filename, scope=scope))
         except ValueError as exc:
             results.append({"filename": filename, "status": "error", "error": str(exc)})
-    return {"results": results, "stats": rag.store_stats()}
+    return {"results": results, "stats": rag.store_stats(scope=scope)}
 
 
 @protected_api.post("/api/documents/sync-transactions")
@@ -1741,27 +1838,39 @@ def sync_transactions_to_rag(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_permissions("documents:write")),
 ):
-    return rag.ingest_transactions(db)
+    scope = _rag_scope(
+        current_user, operation=RAG_WRITE, audit_reason="transaction document sync"
+    )
+    return rag.ingest_transactions(db, scope=scope)
 
 
 @protected_api.get("/api/documents")
-def list_documents(limit: int = 50):
-    stats = rag.store_stats()
+def list_documents(
+    limit: int = 50,
+    current_user: User = Depends(require_permissions("documents:read")),
+):
+    scope = _rag_scope(current_user, audit_reason="document listing")
+    stats = rag.store_stats(scope=scope)
     return {
         "stats": stats,
-        "documents": rag.list_documents(limit),
+        "documents": rag.list_documents(scope=scope, limit=limit),
         "status": "indexed" if stats.get("chunks", 0) > 0 else "empty",
     }
 
 
 @protected_api.get("/api/documents/status")
-def document_index_status():
-    stats = rag.store_stats()
+def document_index_status(
+    current_user: User = Depends(require_permissions("documents:read")),
+):
+    scope = _rag_scope(current_user, audit_reason="document index status")
+    stats = rag.store_stats(scope=scope)
     chunks = int(stats.get("chunks") or 0)
     return {
         **stats,
         "status": "indexed" if chunks > 0 else "empty",
-        "healthy": chunks > 0 and bool(stats.get("index_exists")),
+        # The scoped TF-IDF index is rebuilt in memory on demand, so a cached
+        # index is not required for a healthy, populated store.
+        "healthy": chunks > 0,
         "message": (
             f"{stats.get('documents', 0)} document(s), {chunks} chunk(s) indexed."
             if chunks
@@ -1771,9 +1880,15 @@ def document_index_status():
 
 
 @protected_api.get("/api/documents/{doc_id}/status")
-def document_status(doc_id: str):
-    item = rag.document_status(doc_id)
+def document_status(
+    doc_id: str,
+    current_user: User = Depends(require_permissions("documents:read")),
+):
+    scope = _rag_scope(current_user, audit_reason="document ownership status")
+    item = rag.document_status(doc_id, scope=scope)
     if not item:
+        # Scoped lookup returns None for missing and other users' documents,
+        # so the response does not leak document existence.
         raise HTTPException(status_code=404, detail="Document not found")
     return item
 
@@ -1783,20 +1898,26 @@ def delete_document(
     doc_id: str,
     current_user: User = Depends(require_permissions("documents:write")),
 ):
-    if not rag.delete_document(doc_id):
+    scope = _rag_scope(current_user, operation=RAG_WRITE, audit_reason="document deletion")
+    if not rag.delete_document(doc_id, scope=scope):
         raise HTTPException(status_code=404, detail="Document not found")
-    return {"deleted": doc_id, "stats": rag.store_stats()}
+    return {"deleted": doc_id, "stats": rag.store_stats(scope=scope)}
 
 
 @protected_api.post("/api/documents/reindex")
 def reindex_documents(
     current_user: User = Depends(require_permissions("documents:write")),
 ):
-    return {"reindexed": True, "stats": rag.reindex()}
+    scope = _rag_scope(current_user, operation=RAG_WRITE, audit_reason="document reindex")
+    return {"reindexed": True, "stats": rag.reindex(scope=scope)}
 
 
 @protected_api.post("/api/documents/retrieval-test")
-def retrieval_test(payload: dict):
+def retrieval_test(
+    payload: dict,
+    current_user: User = Depends(require_permissions(RAG_DEBUG_PERMISSION)),
+):
+    _reject_client_rag_scope(payload)
     query = str((payload or {}).get("query") or "").strip()
     if not query:
         raise HTTPException(status_code=400, detail="query is required.")
@@ -1806,8 +1927,9 @@ def retrieval_test(payload: dict):
         value = (payload or {}).get(key)
         if value:
             filters[key] = value
+    scope = _rag_scope(current_user, audit_reason="retrieval debug")
     try:
-        return rag.retrieval_test(query, top_k=top_k, **filters)
+        return rag.retrieval_test(query, scope=scope, top_k=top_k, **filters)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1831,24 +1953,42 @@ def assistant_suggestions():
 
 
 @protected_api.get("/api/assistant/config")
-def assistant_config():
+def assistant_config(
+    current_user: User = Depends(require_permissions("settings:read")),
+):
     return {
         "backend": "ollama",
         "available": llm.is_available(),
         "model": llm.get_model(),
         "host": llm.get_host(),
-        "rag": rag.store_stats(),
+        "rag": _status_rag_stats(current_user),
     }
 
 
 @protected_api.post("/api/assistant/query")
-def assistant_query(payload: dict, db: Session = Depends(get_db)):
+def assistant_query(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("assistant:use")),
+):
+    _reject_client_rag_scope(payload)
     question = str((payload or {}).get("question") or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="question is required.")
     if len(question) > 1000:
         raise HTTPException(status_code=400, detail="question must be 1000 characters or fewer.")
-    result = get_assistant_graph().run(question)
+    vendor_id = (payload or {}).get("vendor_id")
+    if vendor_id is not None:
+        if isinstance(vendor_id, bool):
+            raise HTTPException(status_code=400, detail="vendor_id must be a positive integer.")
+        try:
+            vendor_id = int(vendor_id)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="vendor_id must be a positive integer.")
+        if vendor_id < 1:
+            raise HTTPException(status_code=400, detail="vendor_id must be a positive integer.")
+    scope = _rag_scope(current_user, audit_reason="assistant query")
+    result = get_assistant_graph().run(question, scope=scope, vendor_id=vendor_id)
     links = []
     for citation in result.get("citations", []):
         if citation.get("type") in {"risk_alert", "transaction_record"} and citation.get("transaction_id"):
@@ -1868,7 +2008,7 @@ def assistant_query(payload: dict, db: Session = Depends(get_db)):
             name=question[:120],
             task_type="assistant_query",
             status="completed" if not result.get("agent_failures") else "partial",
-            input_state={"question": question},
+            input_state={"question": question, "vendor_id": vendor_id},
             output_state={
                 "answer": result.get("answer"),
                 "intent": result.get("intent"),

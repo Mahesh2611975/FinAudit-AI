@@ -15,7 +15,12 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .agents.invoice_workflow import InvoiceAuditOrchestrator
-from .auth import actor_name, get_current_active_user, require_permissions
+from .agents.vendor_intelligence import (
+    VendorIntelligenceAgent,
+    VendorIntelligenceError,
+    VendorNotFoundError,
+)
+from .auth import actor_name, get_current_active_user, rag_scope_for_user, require_permissions
 from .csv_normalizer import safe_filename
 from .database import get_db
 from .invoice_audit import (
@@ -47,12 +52,21 @@ from .models import (
     User,
     Vendor,
 )
+from .ownership import RagAccessDenied, reject_client_rag_scope_input
 from .pdf_utils import build_text_pdf
 
 router = APIRouter()
 _invoice_orch = InvoiceAuditOrchestrator()
 
 MAX_FILES = 20
+
+
+def _request_rag_scope(user: User, reason: str):
+    """Build a read-only RAG scope from the authenticated principal."""
+    try:
+        return rag_scope_for_user(user, audit_reason=reason)
+    except RagAccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 def _text(value: Any) -> str:
@@ -632,6 +646,49 @@ def get_vendor_analytics(db: Session = Depends(get_db)):
     return vendor_analytics(db)
 
 
+@router.post("/api/vendors/{vendor_id}/investigate")
+def investigate_vendor(
+    vendor_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("invoice:read", "assistant:use")),
+):
+    """Run one deterministic, owner-scoped vendor investigation."""
+    if vendor_id < 1:
+        raise HTTPException(status_code=400, detail="vendor_id must be a positive integer.")
+    # The request's data scope is installed by get_current_active_user, so this
+    # lookup also denies vendors that belong to another account.
+    if db.query(Vendor).filter(Vendor.id == vendor_id).first() is None:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+    scope = _request_rag_scope(current_user, "vendor intelligence")
+    try:
+        result = VendorIntelligenceAgent().run(
+            vendor_id,
+            scope=scope,
+            persist=True,
+        )
+    except VendorNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except VendorIntelligenceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RagAccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - never return an invented report
+        raise HTTPException(
+            status_code=502,
+            detail=f"Vendor investigation failed: {type(exc).__name__}: {exc}",
+        ) from exc
+    if result.get("status") == "failed":
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Vendor investigation failed.",
+                "errors": result.get("errors") or [],
+                "run_id": result.get("run_id"),
+            },
+        )
+    return result
+
+
 @router.get("/api/vendors")
 def list_vendors(limit: int = 200, db: Session = Depends(get_db)):
     vendors = db.query(Vendor).order_by(Vendor.vendor_name.asc()).limit(min(limit, 500)).all()
@@ -1119,8 +1176,13 @@ def verify_invoice_payment(payment_id: int, payload: dict | None = None, db: Ses
 def audit_invoice(invoice_id: int, db: Session = Depends(get_db), current_user: User = Depends(require_permissions("invoice:write"))):
     if not db.get(Invoice, invoice_id):
         raise HTTPException(status_code=404, detail="Invoice not found")
+    scope = _request_rag_scope(current_user, "invoice audit")
     try:
-        return _invoice_orch.run({"invoice_id": invoice_id, "task_type": "invoice_audit"}, persist=True)
+        return _invoice_orch.run(
+            {"invoice_id": invoice_id, "task_type": "invoice_audit"},
+            scope=scope,
+            persist=True,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1166,13 +1228,22 @@ def _audit_run_dict(run: InvoiceAuditRun, include_result: bool = True) -> dict[s
 @router.post("/api/invoice-audits/run")
 def run_invoice_audit(payload: dict, db: Session = Depends(get_db), current_user: User = Depends(require_permissions("invoice:write"))):
     try:
+        reject_client_rag_scope_input(payload)
+    except RagAccessDenied as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
         invoice_id = int(payload.get("invoice_id"))
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="invoice_id is required") from exc
     if not db.get(Invoice, invoice_id):
         raise HTTPException(status_code=404, detail="Invoice not found")
+    scope = _request_rag_scope(current_user, "invoice audit")
     try:
-        return _invoice_orch.run({"invoice_id": invoice_id, "task_type": "invoice_audit"}, persist=True)
+        return _invoice_orch.run(
+            {"invoice_id": invoice_id, "task_type": "invoice_audit"},
+            scope=scope,
+            persist=True,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

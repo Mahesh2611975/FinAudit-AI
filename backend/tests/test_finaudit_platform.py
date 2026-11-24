@@ -2,6 +2,7 @@
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 TEST_DB_DIR = tempfile.mkdtemp(prefix="finaudit-platform-tests-")
 os.environ.setdefault("FINAUDIT_DATABASE_URL", f"sqlite:///{os.path.join(TEST_DB_DIR, 'platform.db')}")
@@ -12,10 +13,16 @@ from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from app import llm, rag  # noqa: E402
 from app.agents import assistant_graph as graph_module  # noqa: E402
+from app.auth import rag_scope_for_user  # noqa: E402
 from app.database import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import InvestigationRun, TransactionRecord  # noqa: E402
-from app.vector_store import VectorStore  # noqa: E402
+
+
+SCOPE = rag_scope_for_user(
+    SimpleNamespace(id=1, username="platform-user", role="user", is_active=True),
+    audit_reason="platform tests",
+)
 
 CSV_TEXT = (
     "transaction_id,date,type,vendor,amount,description\n"
@@ -122,14 +129,15 @@ def test_transaction_preview_and_duplicate_import_prevention(tmp_path):
         teardown_client(engine)
 
 
-def test_rag_ingestion_preserves_metadata_and_retrieves_context(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.rag._store", VectorStore(tmp_path / "rag"))
+def test_rag_ingestion_preserves_metadata_and_retrieves_context(monkeypatch, scoped_vector_store):
+    monkeypatch.setattr("app.rag._store", scoped_vector_store)
     text = (
         "Investigation note for TXN-A. The reviewer verified the purchase order and invoice. "
         "The duplicate-looking payment was a legitimate recurring supplier payment."
     )
     ingested = rag.ingest_text(
         text,
+        scope=SCOPE,
         source_filename="review-notes.txt",
         document_type="investigation_report",
         metadata={"transaction_id": "TXN-A", "page_number": 1},
@@ -137,21 +145,21 @@ def test_rag_ingestion_preserves_metadata_and_retrieves_context(tmp_path, monkey
     assert ingested["status"] == "ingested"
     assert ingested["chunks"] == 1
 
-    results = rag.search("TXN-A reviewer verified invoice", top_k=3)
+    results = rag.search("TXN-A reviewer verified invoice", scope=SCOPE, top_k=3)
     assert results
     assert results[0]["source_filename"] == "review-notes.txt"
     assert results[0]["transaction_id"] == "TXN-A"
     assert results[0]["page_number"] == 1
 
-    contexts = rag.retrieve_context("TXN-A", "amount=100.00")
+    contexts = rag.retrieve_context("TXN-A", "amount=100.00", scope=SCOPE)
     assert any(item["source"] == "STRUCTURED-EVIDENCE" for item in contexts)
-    docs = rag.list_documents()
+    docs = rag.list_documents(scope=SCOPE)
     assert docs[0]["document_type"] == "investigation_report"
 
 
-def test_assistant_graph_selects_agents_and_returns_citations(tmp_path, monkeypatch):
+def test_assistant_graph_selects_agents_and_returns_citations(tmp_path, monkeypatch, scoped_vector_store):
     client, session_factory, engine = build_client(tmp_path)
-    monkeypatch.setattr("app.rag._store", VectorStore(tmp_path / "rag"))
+    monkeypatch.setattr("app.rag._store", scoped_vector_store)
     monkeypatch.setattr(graph_module, "SessionLocal", lambda: session_factory())
     monkeypatch.setattr(llm, "is_available", lambda: False)
     try:
@@ -160,11 +168,15 @@ def test_assistant_graph_selects_agents_and_returns_citations(tmp_path, monkeypa
         client.post("/api/risk/analyze", json={})
         rag.ingest_text(
             "TXN-A was reviewed against the original invoice and purchase order.",
+            scope=SCOPE,
             source_filename="txn-a-review.txt",
             metadata={"transaction_id": "TXN-A"},
         )
 
-        response = client.post("/api/assistant/query", json={"question": "Explain transaction TXN-A and its risk evidence."})
+        response = client.post(
+            "/api/assistant/query",
+            json={"question": "TXN-A reviewed original invoice purchase order"},
+        )
         assert response.status_code == 200, response.text
         data = response.json()
         assert data["intent"] == "transaction"

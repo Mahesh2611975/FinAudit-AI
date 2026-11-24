@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from .auth import actor_name, get_current_active_user
+from .auth import actor_name, get_current_active_user, rag_scope_for_user, require_permissions
 from .database import get_db
 from .llm import explain_finding
 from .models import (
@@ -30,8 +30,17 @@ from .models import (
     TransactionRecord,
     User,
 )
+from .ownership import RagAccessDenied
 
 router = APIRouter()
+
+
+def _request_rag_scope(user: User, reason: str):
+    """Build a read-only RAG scope from the authenticated principal."""
+    try:
+        return rag_scope_for_user(user, audit_reason=reason)
+    except RagAccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 CASE_STATUSES = ("open", "under_review", "resolved", "dismissed")
 _STATUS_ALIASES = {
@@ -567,7 +576,12 @@ def add_evidence(
 
 
 @router.post("/api/investigations/{case_ref}/explain")
-async def explain_case(case_ref: str, db: Session = Depends(get_db)):
+async def explain_case(
+    case_ref: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permissions("investigation:write")),
+):
+    scope = _request_rag_scope(current_user, "investigation case explanation")
     case = _case_or_404(db, case_ref)
     detail = _serialize_case(db, case, detailed=True)
     evidence_lines = [
@@ -591,7 +605,7 @@ async def explain_case(case_ref: str, db: Session = Depends(get_db)):
     for item in detail["notes"][-5:]:
         evidence_lines.append(f"Reviewer note by {item['author']}: {item['note']}")
     question = f"Explain the stored evidence for investigation {case.case_number} and state what a reviewer should verify."
-    result = await explain_finding(question, "\n".join(evidence_lines))
+    result = await explain_finding(question, "\n".join(evidence_lines), scope=scope)
     case.ai_explanation = result.get("answer") or "No explanation was generated."
     _event(
         db,

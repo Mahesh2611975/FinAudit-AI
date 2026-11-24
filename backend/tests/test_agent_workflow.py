@@ -1,5 +1,9 @@
+import logging
 import os
 import tempfile
+from types import SimpleNamespace
+
+import pytest
 
 TEST_DB_DIR = tempfile.mkdtemp(prefix="finaudit-agent-workflow-tests-")
 os.environ["FINAUDIT_DATABASE_URL"] = f"sqlite:///{os.path.join(TEST_DB_DIR, 'test.db')}"
@@ -9,9 +13,22 @@ from fastapi.testclient import TestClient  # noqa: E402
 import app.agents.orchestrator as orchestrator_module  # noqa: E402
 from app import llm  # noqa: E402
 from app.agents.orchestrator import MultiAgentOrchestrator  # noqa: E402
+from app.auth import rag_scope_for_user  # noqa: E402
 from app.main import app  # noqa: E402
 
+
+SCOPE = rag_scope_for_user(
+    SimpleNamespace(id=1, username="agent-test-user", role="user", is_active=True),
+    audit_reason="agent workflow tests",
+)
+
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _scoped_rag_store(monkeypatch, scoped_vector_store):
+    """Keep workflow tests on a migrated, owner-scoped temporary RAG store."""
+    monkeypatch.setattr("app.rag._store", scoped_vector_store)
 
 
 def upload_csv(csv_text: str, filename: str) -> dict:
@@ -184,6 +201,7 @@ def test_node_failure_is_recorded_and_downstream_nodes_are_skipped(monkeypatch):
     monkeypatch.setattr(orchestrator_module, "monthly_analysis", fail_analysis)
     result = MultiAgentOrchestrator().run(
         {"task_type": "monthly_analysis", "year": 2035, "month": 2},
+        scope=SCOPE,
         persist=False,
     )
 
@@ -225,7 +243,7 @@ def test_transient_llm_failure_is_retried_once(monkeypatch):
     )
     calls = []
 
-    async def fake_explain(question, evidence=""):
+    async def fake_explain(question, evidence="", *, scope):
         calls.append(question)
         if len(calls) == 1:
             return {
@@ -302,3 +320,23 @@ def test_reconciliation_review_agent_uses_persisted_reconciliation_data(monkeypa
     assert all(item.get("source_type") == "reconciliation_result" for item in result["evidence"] if item.get("kind") != "policy")
     assert result["status"] == "needs_human_review"
     assert result["outputs"]["report"]["conclusion_status"] == "requires_human_review"
+
+
+def test_agent_run_failure_is_generic_for_clients_and_logged_internally(monkeypatch, caplog):
+    secret = "internal-orchestrator-detail-do-not-expose"
+
+    def explode(*args, **kwargs):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr("app.main._orch.run", explode)
+
+    with caplog.at_level(logging.ERROR, logger="app.main"):
+        response = client.post(
+            "/api/agents/run",
+            json={"task_type": "monthly_analysis", "year": 2032, "month": 6},
+        )
+
+    assert response.status_code == 500
+    assert secret not in response.text
+    assert response.json()["detail"] == "Agent workflow failed. Check backend logs for details."
+    assert secret in caplog.text

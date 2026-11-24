@@ -31,6 +31,12 @@ from ..models import (
     InvoiceAuditRun,
     InvestigationRun,
 )
+from ..ownership import (
+    RAG_READ,
+    RagScope,
+    reject_client_rag_scope_input,
+    validate_rag_scope,
+)
 from ..rag import retrieve_context
 
 AGENT_DOCUMENT = "Document Intake Agent"
@@ -57,6 +63,7 @@ class InvoiceWorkflowState(TypedDict, total=False):
     evidence: list[dict[str, Any]]
     missing_evidence: list[str]
     require_human_review: bool
+    rag_scope: RagScope
 
 
 def _now() -> datetime:
@@ -497,7 +504,8 @@ class InvoiceAuditOrchestrator:
                 "What documents and controls should a reviewer check?"
             )
             evidence_text = " ".join(item.get("excerpt") or "" for item in current.get("evidence") or [])
-            policies = retrieve_context(question, evidence_text, top_k=3)
+            scope = validate_rag_scope(current.get("rag_scope"), operation=RAG_READ)
+            policies = retrieve_context(question, evidence_text, scope=scope, top_k=3)
             policy_evidence = [
                 {
                     "kind": "policy",
@@ -505,7 +513,14 @@ class InvoiceAuditOrchestrator:
                     "source_type": "policy",
                     "source_reference": policy["source"],
                     "excerpt": policy["text"],
-                    "metadata": {"score": policy.get("score")},
+                    "metadata": {
+                        "score": policy.get("score"),
+                        "doc_id": policy.get("doc_id"),
+                        "chunk_id": policy.get("chunk_id"),
+                        "source_filename": policy.get("source_filename"),
+                        "page_number": policy.get("page_number"),
+                        "transaction_id": policy.get("transaction_id"),
+                    },
                 }
                 for policy in policies
             ]
@@ -659,7 +674,16 @@ class InvoiceAuditOrchestrator:
     # ------------------------------------------------------------------
     # Execution / persistence
     # ------------------------------------------------------------------
-    def run(self, input_data: dict[str, Any], persist: bool = True) -> dict[str, Any]:
+    def run(
+        self,
+        input_data: dict[str, Any],
+        *,
+        scope: RagScope | None = None,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        """Run one invoice audit with an explicit trusted RAG scope."""
+        reject_client_rag_scope_input(input_data, path="input")
+        validated_scope = validate_rag_scope(scope, operation=RAG_READ)
         started = _now()
         started_perf = time.perf_counter()
         try:
@@ -692,6 +716,7 @@ class InvoiceAuditOrchestrator:
             "evidence": [],
             "missing_evidence": [],
             "require_human_review": False,
+            "rag_scope": validated_scope,
         }
         try:
             result = dict(self.graph.invoke(state))
@@ -700,6 +725,7 @@ class InvoiceAuditOrchestrator:
             result["status"] = "failed"
             result["errors"] = list(result.get("errors") or []) + [str(exc)]
 
+        result.pop("rag_scope", None)
         finished = _now()
         result["started_at"] = started.isoformat()
         result["finished_at"] = finished.isoformat()
