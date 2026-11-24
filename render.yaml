@@ -1,7 +1,8 @@
 # Render Blueprint for the FinAudit AI backend.
 # Deploy via: Render Dashboard → Blueprints → New Blueprint Instance → this repo.
-# Secret values (database URL, inference host) are set in the Render dashboard
-# and are intentionally not stored in source control.
+# Secret values (database URL, JWT signing secret, inference host) are set in
+# the Render dashboard and are intentionally not stored in source control.
+# The backend requires FINAUDIT_JWT_SECRET outside local environments.
 services:
   - type: web
     name: finaudit-api
@@ -11,6 +12,16 @@ services:
     plan: starter
     healthCheckPath: /api/health
     envVars:
+      # Explicitly non-local: missing/weak JWT secrets fail startup and auth.
+      - key: FINAUDIT_ENV
+        value: production
+      # Local demo sessions are always refused in production; keep this explicit.
+      - key: FINAUDIT_LOCAL_DEMO_MODE
+        value: "false"
+      # Generate with: python -c "import secrets; print(secrets.token_urlsafe(48))"
+      # Minimum 32 random characters. Set in the dashboard; never commit it.
+      - key: FINAUDIT_JWT_SECRET
+        sync: false
       # PostgreSQL (e.g. Neon). Set in the dashboard; never commit the value.
       - key: FINAUDIT_DATABASE_URL
         sync: false

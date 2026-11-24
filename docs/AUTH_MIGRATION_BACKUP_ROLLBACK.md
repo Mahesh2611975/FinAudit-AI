@@ -70,7 +70,8 @@ curl http://127.0.0.1:8000/api/health
 
 ```bash
 cd backend
-FINAUDIT_JWT_SECRET='replace-with-strong-secret' \
+# FINAUDIT_JWT_SECRET is read from backend/.env (or the deployment environment).
+# Never inline a real secret in a shell command or source file.
 FINAUDIT_ADMIN_PASSWORD='ReplaceWithStrongPassword!' \
 python -m app.create_admin --username admin --email admin@example.com --full-name "System Administrator"
 ```
@@ -117,7 +118,10 @@ cp backend/data/finaudit.db.bak.<timestamp> backend/data/finaudit.db
 
 ## Security Notes
 
-- Set `FINAUDIT_JWT_SECRET` in non-local environments.
+- Set `FINAUDIT_JWT_SECRET` in every non-local environment. Use at least 32
+  random characters (`python -c "import secrets; print(secrets.token_urlsafe(48))"`);
+  a missing or weak value aborts startup and token operations instead of falling
+  back to a development secret.
 - Access tokens expire by `FINAUDIT_ACCESS_TOKEN_EXPIRE_MINUTES` (default 60).
 - Logout revokes token JTI in `revoked_tokens`.
 - Reviewer identity for approvals/reviews is derived from authenticated user identity, not client-supplied free text.

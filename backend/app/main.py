@@ -30,6 +30,7 @@ from .auth import (
     require_permissions,
     require_roles,
     router as auth_router,
+    validate_jwt_configuration,
 )
 from .invoice_api import router as invoice_router
 from .investigation_api import (
@@ -48,6 +49,11 @@ from .pdf_utils import build_text_pdf
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_FILES = 20
+
+# Fail at startup, before migrations or health checks, when a hosted
+# deployment has no usable JWT signing secret. Token operations also
+# re-check the configuration in case the environment changes later.
+validate_jwt_configuration()
 
 
 def _optional_float(value):

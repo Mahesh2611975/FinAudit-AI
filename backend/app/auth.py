@@ -2,8 +2,9 @@
 
 Security notes:
 - Passwords are hashed with bcrypt; plaintext passwords are never stored.
-- JWTs are signed with FINAUDIT_JWT_SECRET. A missing secret falls back to an
-  insecure development-only secret and emits a warning.
+- JWTs are signed with FINAUDIT_JWT_SECRET. A development-only fallback is
+  allowed solely in local environments; every non-local environment must
+  provide a strong secret or startup/token operations fail closed with a 503.
 - Tokens carry jti, sub (user id), role, and exp. Expired/invalid/revoked
   tokens are rejected.
 - Reviewer identity is derived from the authenticated user, never from
@@ -45,7 +46,19 @@ logger = logging.getLogger(__name__)
 
 JWT_ALGORITHM = os.getenv("FINAUDIT_JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("FINAUDIT_ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+JWT_SECRET_MIN_LENGTH = 32
+# This value is a public, insecure placeholder for local development only.
+# It must never be used to protect a hosted database or a real deployment.
 _DEV_JWT_SECRET = "finaudit-dev-insecure-secret-change-me"
+_WEAK_JWT_SECRETS = frozenset({
+    _DEV_JWT_SECRET,
+    "change-me",
+    "changeme",
+    "secret",
+    "your-secret-key",
+    "replace-with-strong-secret",
+})
+_local_fallback_warned = False
 
 # Local demonstration mode is an explicit, opt-in developer convenience. It
 # never creates users and never relaxes a route policy: the browser receives a
@@ -55,7 +68,12 @@ DEMO_USER_ID = -1
 DEMO_USERNAME = "local-demo"
 DEMO_TOKEN_EXPIRE_MINUTES = max(1, int(os.getenv("FINAUDIT_DEMO_TOKEN_MINUTES", "30")))
 _TRUTHY = {"1", "true", "yes", "on"}
-_LOCAL_DEMO_ENVIRONMENTS = {"local", "dev", "development", "test"}
+_LOCAL_ENVIRONMENTS = {"local", "dev", "development", "test"}
+
+
+def _environment_name() -> str:
+    """Return the normalized environment name; local-first when unset."""
+    return os.getenv("FINAUDIT_ENV", os.getenv("APP_ENV", "local")).strip().lower()
 
 
 def demo_mode_enabled() -> bool:
@@ -68,8 +86,7 @@ def demo_mode_enabled() -> bool:
     enabled = os.getenv("FINAUDIT_LOCAL_DEMO_MODE", "").strip().lower() in _TRUTHY
     if not enabled:
         return False
-    environment = os.getenv("FINAUDIT_ENV", os.getenv("APP_ENV", "local")).strip().lower()
-    return environment in _LOCAL_DEMO_ENVIRONMENTS
+    return _environment_name() in _LOCAL_ENVIRONMENTS
 
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -105,15 +122,78 @@ def dashboard_for_role(role: str) -> str:
     return ROLE_DASHBOARDS.get(str(role), "user-dashboard")
 
 
-def _jwt_secret() -> str:
+class JWTConfigurationError(RuntimeError):
+    """Raised when a non-local deployment has no usable JWT signing secret."""
+
+
+def _jwt_is_local_environment() -> bool:
+    """Return True only for a local environment backed by local storage.
+
+    An unset environment name is local because this is a local-first app. A
+    non-SQLite database URL is treated as a hosted deployment even when the
+    environment name was forgotten, so the development secret cannot silently
+    protect a real database.
+    """
+    if _environment_name() not in _LOCAL_ENVIRONMENTS:
+        return False
+    database_url = os.getenv("FINAUDIT_DATABASE_URL", "").strip().lower()
+    return not database_url or database_url.startswith("sqlite")
+
+
+def validate_jwt_configuration() -> str:
+    """Return a usable signing secret or fail closed outside local development.
+
+    The secret value is never included in logs or error messages.
+    """
+    global _local_fallback_warned
     secret = os.getenv("FINAUDIT_JWT_SECRET", "").strip()
-    if secret:
-        return secret
-    logger.warning(
-        "FINAUDIT_JWT_SECRET is not set; using an insecure development secret. "
-        "Set FINAUDIT_JWT_SECRET before any non-local deployment."
-    )
-    return _DEV_JWT_SECRET
+    environment = _environment_name() or "unset"
+
+    if not secret and _jwt_is_local_environment():
+        if not _local_fallback_warned:
+            logger.warning(
+                "FINAUDIT_JWT_SECRET is not set; using a development-only secret "
+                "because FINAUDIT_ENV=%r is local. Set a strong secret before deploying.",
+                environment,
+            )
+            _local_fallback_warned = True
+        return _DEV_JWT_SECRET
+
+    if not secret:
+        raise JWTConfigurationError(
+            "FINAUDIT_JWT_SECRET is required in non-local environments "
+            f"(FINAUDIT_ENV={environment!r}). Generate one with "
+            "'python -c \"import secrets; print(secrets.token_urlsafe(48))\"' "
+            "and configure it as a deployment secret."
+        )
+
+    if (
+        len(secret) < JWT_SECRET_MIN_LENGTH
+        or secret.lower() in _WEAK_JWT_SECRETS
+        or len(set(secret)) < 4
+    ):
+        raise JWTConfigurationError(
+            "FINAUDIT_JWT_SECRET is too weak for a non-local environment "
+            f"(FINAUDIT_ENV={environment!r}). Use at least {JWT_SECRET_MIN_LENGTH} "
+            "random characters from secrets.token_urlsafe(48); the value is never logged."
+        )
+    return secret
+
+
+def _jwt_secret() -> str:
+    """Return the configured secret, with the local-only development fallback."""
+    return validate_jwt_configuration()
+
+
+def _jwt_secret_for_crypto() -> str:
+    """Convert secret misconfiguration into a safe 503 for request handling."""
+    try:
+        return _jwt_secret()
+    except JWTConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -271,7 +351,7 @@ def create_access_token(user: User, expires_minutes: int | None = None) -> tuple
         "exp": int(expires.timestamp()),
         "type": "access",
     }
-    token = jwt.encode(payload, _jwt_secret(), algorithm=JWT_ALGORITHM)
+    token = jwt.encode(payload, _jwt_secret_for_crypto(), algorithm=JWT_ALGORITHM)
     return token, payload
 
 
@@ -279,7 +359,7 @@ def decode_access_token(token: str) -> dict[str, Any]:
     try:
         payload = jwt.decode(
             token,
-            _jwt_secret(),
+            _jwt_secret_for_crypto(),
             algorithms=[JWT_ALGORITHM],
             options={"require": ["sub", "exp", "jti", "role"]},
         )
@@ -327,7 +407,7 @@ def create_demo_token() -> tuple[str, dict[str, Any]]:
         "type": "demo",
         "demo": True,
     }
-    token = jwt.encode(payload, _jwt_secret(), algorithm=JWT_ALGORITHM)
+    token = jwt.encode(payload, _jwt_secret_for_crypto(), algorithm=JWT_ALGORITHM)
     return token, payload
 
 
@@ -337,7 +417,7 @@ def decode_demo_token(token: str) -> dict[str, Any]:
     try:
         payload = jwt.decode(
             token,
-            _jwt_secret(),
+            _jwt_secret_for_crypto(),
             algorithms=[JWT_ALGORITHM],
             options={"require": ["sub", "exp", "jti", "role", "type"]},
         )
@@ -350,6 +430,23 @@ def decode_demo_token(token: str) -> dict[str, Any]:
     return payload
 
 
+def _looks_like_demo_token(token: str) -> bool:
+    """Inspect claims without trusting them; used only to reject demo tokens.
+
+    This never authenticates anything. It lets a disabled demo principal be
+    rejected as an invalid token before any signing-secret lookup, so demo-mode
+    behaviour is unchanged even when a hosted deployment is misconfigured.
+    """
+    try:
+        payload = jwt.decode(
+            token,
+            options={"verify_signature": False, "verify_exp": False},
+        )
+    except jwt.InvalidTokenError:
+        return False
+    return payload.get("type") == "demo" or bool(payload.get("demo"))
+
+
 def decode_request_token(token: str) -> tuple[dict[str, Any], bool]:
     """Decode a normal access token, falling back to a gated demo token.
 
@@ -357,6 +454,8 @@ def decode_request_token(token: str) -> tuple[dict[str, Any], bool]:
     mode is explicitly enabled. With demo mode disabled this behaves exactly as
     the original access-token path, so production security is unchanged.
     """
+    if not demo_mode_enabled() and _looks_like_demo_token(token):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication token.")
     try:
         return decode_access_token(token), False
     except HTTPException as access_error:

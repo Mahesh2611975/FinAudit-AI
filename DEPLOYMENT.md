@@ -27,10 +27,14 @@ Browser ──HTTPS──> Vercel (React/Vite static build)
 
 Important constraints (read before deploying):
 
-1. **No authentication is implemented.** The API and UI are open to anyone who
-   can reach the URL. Restrict access at the network/edge layer (e.g. Vercel
-   password protection, Render IP allow-list, private networking) or add an auth
-   layer before exposing sensitive financial data.
+1. **Authentication is enabled and enforced.** Sign-in issues signed JWTs and
+   protected API routes use authentication and the configured role-based
+   permission policies. A non-local
+   deployment **must** set a strong `FINAUDIT_JWT_SECRET` (at least 32 random
+   characters). The backend fails at startup if the secret is missing or weak;
+   there is no production fallback to a development secret. Demo sessions are
+   always refused outside local environments. Enforce HTTPS and keep secrets
+   in the hosting dashboards, never in source control.
 2. **Ollama is local by default.** A `127.0.0.1` Ollama on a developer laptop is
    not reachable from Render. Either point `OLLAMA_HOST` at a hosted,
    Ollama-compatible endpoint you control, or leave it unavailable: the app then
@@ -88,11 +92,20 @@ Both must pass. The frontend build output is `frontend/dist`.
 2. Render Dashboard → **Blueprints** → **New Blueprint Instance** → select the repo.
 3. `render.yaml` defines a Docker web service using `backend/Dockerfile`.
 4. Fill in the secret environment variables when prompted:
+   - `FINAUDIT_ENV` — `production` (already set in `render.yaml`). For staging,
+     use `staging`; the same fail-closed JWT rules apply.
+   - `FINAUDIT_JWT_SECRET` — **required**. Generate a unique value with
+     `python -c "import secrets; print(secrets.token_urlsafe(48))"` and paste it
+     into the Render dashboard only. Use a different secret for staging and
+     production. Rotating it signs out all existing sessions.
+   - `FINAUDIT_LOCAL_DEMO_MODE` — `false` (already set in `render.yaml`).
    - `FINAUDIT_DATABASE_URL` — the Neon pooled connection string.
    - `FINAUDIT_CORS_ORIGINS` — your Vercel frontend origin (add after step 5).
    - `OLLAMA_HOST` — your hosted inference endpoint, or leave blank for
      evidence-only mode.
-5. Deploy. Render builds the image and starts uvicorn on port 8000.
+5. Deploy. Render builds the image and starts uvicorn on port 8000. If the JWT
+   secret is missing or too weak, startup aborts with a clear
+   `FINAUDIT_JWT_SECRET` error in the service log and the health check fails.
 6. Health check: `GET https://<your-render-host>/api/health` → `{"status":"healthy"}`.
    Detailed status is at `GET /api/system/health`.
 
@@ -144,7 +157,8 @@ calling the deployment healthy.
 | # | Check | Expected |
 |---|-------|----------|
 | 1 | `GET /api/health` (Render) | `{"status":"healthy"}` |
-| 2 | `GET /api/system/health` | `status: operational`, `database.backend: postgresql`, `database.status: connected`, `configuration.authentication_enabled: false`, no secrets |
+| 2 | `GET /api/system/health` | `status: operational`, `database.backend: postgresql`, `database.status: connected`, `configuration.authentication_enabled: true`, no secrets |
+| 2a | `GET /api/auth/demo/status` | `enabled: false` in production/staging; `POST /api/auth/demo/session` returns 403 |
 | 3 | Open the Vercel URL in a browser | Dashboard renders; no blank page or console errors |
 | 4 | Upload a sample CSV (Transactions/Audit page) | Rows imported; dashboard transaction count increases |
 | 5 | Refresh the page | Counts persist (proves PostgreSQL durability) |
@@ -171,18 +185,32 @@ If AI is unavailable (step 13), confirm the Settings page and assistant pill sho
 # From the repository root
 docker build -f backend/Dockerfile -t finaudit-api .
 docker run --rm -p 8000:8000 \
+  -e FINAUDIT_ENV=local \
   -e FINAUDIT_DATABASE_URL=sqlite:////app/data/finaudit.db \
   finaudit-api
 curl http://127.0.0.1:8000/api/health
 ```
 
-Note: this uses a SQLite file inside the container (ephemeral). It only validates
-the image and startup/migration path, not production durability.
+Note: this uses a SQLite file inside the container (ephemeral) and the explicit
+local environment, where the development-only JWT fallback is permitted. It only
+validates the image and startup/migration path, not production durability. To
+exercise the production configuration locally, also pass
+`-e FINAUDIT_ENV=production -e FINAUDIT_JWT_SECRET=<generated-secret>`; omitting
+the secret must abort startup with a clear error.
 
 ---
 
 ## 8. Troubleshooting
 
+- **`FINAUDIT_JWT_SECRET is required` / `is too weak` at startup:** the backend is
+  correctly failing closed. Set a unique secret of at least 32 random characters
+  (`python -c "import secrets; print(secrets.token_urlsafe(48))"`) in the hosting
+  dashboard, confirm `FINAUDIT_ENV` is `production`/`staging`, then redeploy. Do
+  not set it to a development placeholder or commit the value.
+- **All sign-ins return 503 after a deploy:** the JWT secret was removed or
+  changed while the app was running, or the environment changed to non-local.
+  Restore the dashboard secret and redeploy; existing tokens signed with an old
+  secret are intentionally invalid.
 - **CORS errors in the browser:** `FINAUDIT_CORS_ORIGINS` on Render must exactly
   match the Vercel origin (scheme + host, no trailing slash). Redeploy the backend
   after changing it.

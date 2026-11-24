@@ -87,7 +87,7 @@ python -m app.create_admin --username admin --email admin@example.com --full-nam
 Remove-Item Env:\FINAUDIT_ADMIN_PASSWORD
 ```
 
-Use a unique strong password and keep `FINAUDIT_JWT_SECRET` in `backend/.env` so tokens survive a backend restart; do **not** commit real secrets or passwords. The CLI no longer accepts reuse after the first admin: use the authenticated admin APIs for all later admin provisioning and role changes.
+Use a unique strong password and keep `FINAUDIT_JWT_SECRET` in `backend/.env` so tokens survive a backend restart; do **not** commit real secrets or passwords. Locally, a blank value uses a development-only fallback. In production, staging and other non-local environments the backend refuses to start and rejects token operations unless the secret is set and at least 32 random characters long. The CLI no longer accepts reuse after the first admin: use the authenticated admin APIs for all later admin provisioning and role changes.
 
 After sign-in, the backend-verified role routes to:
 
